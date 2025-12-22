@@ -1,0 +1,10 @@
+[package]
+name = "setu-types"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1.0"
