@@ -1,5 +1,5 @@
 [workspace]
-members = ["consensus","netcore", "setu-validator"]
+members = ["consensus","netcore", "setu-validator", "crates/core-types"]
 resolver = "2"
 
 [workspace.package]
