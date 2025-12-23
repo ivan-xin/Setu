@@ -223,3 +223,75 @@ mod tests {
         assert_eq!(obj.version(), 2);
     }
 }
+
+// Specific object types for common use cases
+
+/// Account object data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountData {
+    pub address: Address,
+    pub balance: u64,
+    pub nonce: u64,
+}
+
+/// Account object
+pub type AccountObject = Object<AccountData>;
+
+/// SBT (Soul-Bound Token) data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SBTData {
+    pub owner: Address,
+    pub token_id: String,
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// SBT object
+pub type SBTObject = Object<SBTData>;
+
+/// Relation graph data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationGraphData {
+    pub owner: Address,
+    pub relations: Vec<(Address, String)>, // (target_address, relation_type)
+}
+
+/// Relation graph object
+pub type RelationGraphObject = Object<RelationGraphData>;
+
+/// Helper function to create an account object
+pub fn create_account(address: Address, initial_balance: u64) -> AccountObject {
+    AccountObject::new_owned(
+        generate_object_id(address.as_bytes()),
+        &address,
+        AccountData {
+            address: address.clone(),
+            balance: initial_balance,
+            nonce: 0,
+        },
+    )
+}
+
+/// Helper function to create an SBT
+pub fn create_sbt(owner: Address, token_id: String) -> SBTObject {
+    SBTObject::new_owned(
+        generate_object_id(token_id.as_bytes()),
+        &owner,
+        SBTData {
+            owner: owner.clone(),
+            token_id,
+            metadata: std::collections::HashMap::new(),
+        },
+    )
+}
+
+/// Helper function to create a relation graph
+pub fn create_relation_graph(owner: Address) -> RelationGraphObject {
+    RelationGraphObject::new_owned(
+        generate_object_id(owner.as_bytes()),
+        &owner,
+        RelationGraphData {
+            owner: owner.clone(),
+            relations: Vec::new(),
+        },
+    )
+}
