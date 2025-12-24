@@ -1,0 +1,31 @@
+[package]
+name = "setu-keys"
+version = "0.1.0"
+authors = ["Hetu Project"]
+license = "Apache-2.0"
+edition = "2021"
+description = "Cryptographic key management for Setu"
+
+[dependencies]
+anyhow = "1.0"
+bip32 = "0.5"
+bip39 = { version = "2.0", features = ["rand"] }
+slip10_ed25519 = "0.1"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+k256 = { version = "0.13", features = ["ecdsa", "serde"] }
+p256 = { version = "0.13", features = ["ecdsa", "serde"] }
+rand = "0.8"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+hex = "0.4"
+base64 = "0.21"
+blake2 = "0.10"
+signature = "2.2"
+zeroize = { version = "1.7", features = ["derive"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["fs", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
