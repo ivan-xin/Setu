@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "types",
-    "crates/vlc",        # VLC Hybrid Logical Clock Library
+    "crates/setu-vlc",        # VLC Hybrid Logical Clock Library
     "crates/core-types",
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
     "consensus",
