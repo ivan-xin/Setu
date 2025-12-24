@@ -1785,6 +1785,7 @@ dependencies = [
  "core-types",
  "setu-core",
  "setu-types",
+ "setu-vlc",
  "tokio",
  "tracing",
  "tracing-subscriber",
