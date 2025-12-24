@@ -27,12 +27,3 @@ target
 /tests
 /Cargo.lock
 docs
-*.md
-examples
-tests
-setu-validator
-setu-solver
-consensus
-netcore
-storage
-/consensus
