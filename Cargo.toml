@@ -8,6 +8,7 @@ members = [
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
     "consensus",
     "setu-validator",
+    "setu-solver",       # Solver node
 ]
 resolver = "2"
 
