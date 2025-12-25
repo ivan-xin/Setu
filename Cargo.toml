@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "types",
+    "storage",                # RocksDB-based object storage
     "crates/setu-vlc",        # VLC Hybrid Logical Clock Library
     "crates/core-types",
     "crates/setu-core",       # Shared core library

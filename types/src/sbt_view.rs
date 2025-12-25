@@ -155,20 +155,21 @@ impl SBTView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sbt::create_personal_sbt, coin::create_coin, relation::create_social_graph};
+    use crate::{sbt::create_personal_sbt, coin::create_coin, relation::create_social_graph, object::generate_object_id};
     
     #[test]
     fn test_sbt_view_creation() {
-        let sbt = create_personal_sbt("alice".to_string());
-        let sbt_id = sbt.metadata.id.clone();
+        let alice_addr = Address::from_str_id("alice");
+        let sbt = create_personal_sbt(alice_addr);
+        let sbt_id = sbt.metadata.id;
         
         let coins = vec![
-            create_coin(sbt_id.clone(), 1000),
-            create_coin(sbt_id.clone(), 500),
+            create_coin(alice_addr, 1000),
+            create_coin(alice_addr, 500),
         ];
         
         let graphs = vec![
-            create_social_graph(sbt_id.clone()),
+            create_social_graph(sbt_id, alice_addr),
         ];
         
         let view = SBTView::new(sbt, coins, graphs);
@@ -176,16 +177,16 @@ mod tests {
         assert_eq!(view.total_balance, 1500);
         assert_eq!(view.coin_count, 2);
         assert_eq!(view.graph_count, 1);
-        assert_eq!(view.address(), &"alice".to_string());
+        assert_eq!(view.address(), &alice_addr);
     }
     
     #[test]
     fn test_has_balance() {
-        let sbt = create_personal_sbt("alice".to_string());
-        let sbt_id = sbt.metadata.id.clone();
+        let alice_addr = Address::from_str_id("alice");
+        let sbt = create_personal_sbt(alice_addr);
         
         let coins = vec![
-            create_coin(sbt_id.clone(), 1000),
+            create_coin(alice_addr, 1000),
         ];
         
         let view = SBTView::new(sbt, coins, vec![]);
@@ -197,13 +198,13 @@ mod tests {
     
     #[test]
     fn test_get_payable_coins() {
-        let sbt = create_personal_sbt("alice".to_string());
-        let sbt_id = sbt.metadata.id.clone();
+        let alice_addr = Address::from_str_id("alice");
+        let sbt = create_personal_sbt(alice_addr);
         
         let coins = vec![
-            create_coin(sbt_id.clone(), 1000),
-            create_coin(sbt_id.clone(), 500),
-            create_coin(sbt_id.clone(), 300),
+            create_coin(alice_addr, 1000),
+            create_coin(alice_addr, 500),
+            create_coin(alice_addr, 300),
         ];
         
         let view = SBTView::new(sbt, coins, vec![]);
@@ -228,11 +229,13 @@ mod tests {
     
     #[test]
     fn test_get_graphs() {
-        let sbt = create_personal_sbt("alice".to_string());
-        let sbt_id = sbt.metadata.id.clone();
+        let alice_addr = Address::from_str_id("alice");
+        let sbt = create_personal_sbt(alice_addr);
+        let sbt_id = sbt.metadata.id;
         
-        let mut social_graph = create_social_graph(sbt_id.clone());
-        social_graph.data.add_relation("sbt_bob".to_string(), "follows".to_string(), 100);
+        let bob_sbt = generate_object_id(b"sbt_bob");
+        let mut social_graph = create_social_graph(sbt_id, alice_addr);
+        social_graph.data.add_relation(bob_sbt, "follows".to_string(), 100);
         
         let graphs = vec![social_graph];
         let view = SBTView::new(sbt, vec![], graphs);

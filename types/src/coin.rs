@@ -6,7 +6,39 @@
 //! - Balance is a value type, not an object
 
 use serde::{Deserialize, Serialize};
-use crate::object::{Object, ObjectId, Address, generate_object_id};
+use crate::object::{Object, Address, generate_object_id};
+
+/// Coin type identifier (e.g., "SUI", "USDC", "SETU")
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CoinType(pub String);
+
+impl CoinType {
+    pub const NATIVE: &'static str = "SETU";
+    
+    pub fn native() -> Self {
+        Self(Self::NATIVE.to_string())
+    }
+    
+    pub fn new(coin_type: impl Into<String>) -> Self {
+        Self(coin_type.into())
+    }
+    
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for CoinType {
+    fn default() -> Self {
+        Self::native()
+    }
+}
+
+impl std::fmt::Display for CoinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Balance is a value type that encapsulates token amount
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +85,9 @@ impl Balance {
 /// Coin object data - represents transferable tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoinData {
+    /// Coin type (e.g., "SETU", "USDC")
+    pub coin_type: CoinType,
+    /// Balance amount
     pub balance: Balance,
 }
 
@@ -60,17 +95,33 @@ pub struct CoinData {
 pub type Coin = Object<CoinData>;
 
 impl Coin {
-    /// Create a new Coin object
+    /// Create a new Coin object with native coin type
     /// 
     /// # Parameters
-    /// - `owner`: Owner of the Coin (usually an SBT's ObjectId)
+    /// - `owner`: Owner of the Coin (usually an SBT's Address)
     /// - `value`: Initial balance
     pub fn new(owner: Address, value: u64) -> Self {
-        let id = generate_object_id(format!("coin:{}:{}", owner, value).as_bytes());
+        Self::new_with_type(owner, value, CoinType::native())
+    }
+    
+    /// Create a new Coin object with specified coin type
+    /// 
+    /// # Parameters
+    /// - `owner`: Owner of the Coin
+    /// - `value`: Initial balance
+    /// - `coin_type`: Type of the coin
+    pub fn new_with_type(owner: Address, value: u64, coin_type: CoinType) -> Self {
+        let id = generate_object_id(format!("coin:{}:{}:{}", owner, coin_type, value).as_bytes());
         let data = CoinData {
+            coin_type,
             balance: Balance::new(value),
         };
-        Object::new_owned(id, &owner, data)
+        Object::new_owned(id, owner, data)
+    }
+    
+    /// Get coin type
+    pub fn coin_type(&self) -> &CoinType {
+        &self.data.coin_type
     }
     
     /// Get balance
@@ -88,7 +139,7 @@ impl Coin {
     /// Returns the newly created Coin object
     pub fn split(&mut self, amount: u64, new_owner: Address) -> Result<Coin, String> {
         let withdrawn = self.data.balance.withdraw(amount)?;
-        let new_coin = Coin::new(new_owner, withdrawn.value());
+        let new_coin = Coin::new_with_type(new_owner, withdrawn.value(), self.data.coin_type.clone());
         self.increment_version();
         Ok(new_coin)
     }
@@ -96,8 +147,14 @@ impl Coin {
     /// Merge another Coin into the current Coin
     /// 
     /// # Parameters
-    /// - `other`: The Coin object to merge
+    /// - `other`: The Coin object to merge (must be same coin type)
     pub fn merge(&mut self, other: Coin) -> Result<(), String> {
+        if self.data.coin_type != other.data.coin_type {
+            return Err(format!(
+                "Cannot merge different coin types: {} vs {}",
+                self.data.coin_type, other.data.coin_type
+            ));
+        }
         self.data.balance.deposit(other.data.balance)?;
         self.increment_version();
         Ok(())
@@ -108,14 +165,18 @@ impl Coin {
     /// # Parameters
     /// - `new_owner`: New owner
     pub fn transfer(&mut self, new_owner: Address) {
-        self.metadata.owner = Some(new_owner);
-        self.increment_version();
+        self.transfer_to(new_owner);
     }
 }
 
-/// Helper function: create Coin
+/// Helper function: create native Coin
 pub fn create_coin(owner: Address, value: u64) -> Coin {
     Coin::new(owner, value)
+}
+
+/// Helper function: create Coin with specific type
+pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String>) -> Coin {
+    Coin::new_with_type(owner, value, CoinType::new(coin_type))
 }
 
 #[cfg(test)]
@@ -148,59 +209,81 @@ mod tests {
     
     #[test]
     fn test_coin_creation() {
-        let owner = Address::from("sbt_alice");
-        let coin = Coin::new(owner.clone(), 1000);
+        let owner = Address::from_str_id("sbt_alice");
+        let coin = Coin::new(owner, 1000);
         
         assert_eq!(coin.value(), 1000);
         assert_eq!(coin.metadata.owner.as_ref().unwrap(), &owner);
-        assert_eq!(coin.metadata.version, 1); // Initial version is 1
+        assert_eq!(coin.metadata.version, 1);
+        assert_eq!(coin.coin_type().as_str(), CoinType::NATIVE);
+    }
+    
+    #[test]
+    fn test_coin_with_type() {
+        let owner = Address::from_str_id("sbt_alice");
+        let coin = Coin::new_with_type(owner, 1000, CoinType::new("USDC"));
+        
+        assert_eq!(coin.value(), 1000);
+        assert_eq!(coin.coin_type().as_str(), "USDC");
     }
     
     #[test]
     fn test_coin_split() {
-        let owner = Address::from("sbt_alice");
-        let mut coin = Coin::new(owner.clone(), 1000);
+        let owner = Address::from_str_id("sbt_alice");
+        let mut coin = Coin::new(owner, 1000);
         
-        let new_owner = Address::from("sbt_bob");
-        let new_coin = coin.split(300, new_owner.clone()).unwrap();
+        let new_owner = Address::from_str_id("sbt_bob");
+        let new_coin = coin.split(300, new_owner).unwrap();
         
         assert_eq!(coin.value(), 700);
         assert_eq!(new_coin.value(), 300);
-        assert_eq!(coin.metadata.version, 2); // Version incremented after operation
-        assert_eq!(new_coin.metadata.version, 1); // Newly created object has version 1
+        assert_eq!(coin.metadata.version, 2);
+        assert_eq!(new_coin.metadata.version, 1);
         assert_eq!(new_coin.metadata.owner.as_ref().unwrap(), &new_owner);
+        // Split should preserve coin type
+        assert_eq!(new_coin.coin_type(), coin.coin_type());
     }
     
     #[test]
     fn test_coin_split_insufficient() {
-        let owner = Address::from("sbt_alice");
-        let mut coin = Coin::new(owner.clone(), 100);
+        let owner = Address::from_str_id("sbt_alice");
+        let mut coin = Coin::new(owner, 100);
         
-        let result = coin.split(200, Address::from("sbt_bob"));
+        let result = coin.split(200, Address::from_str_id("sbt_bob"));
         assert!(result.is_err());
     }
     
     #[test]
     fn test_coin_merge() {
-        let owner = Address::from("sbt_alice");
-        let mut coin1 = Coin::new(owner.clone(), 1000);
-        let coin2 = Coin::new(owner.clone(), 500);
+        let owner = Address::from_str_id("sbt_alice");
+        let mut coin1 = Coin::new(owner, 1000);
+        let coin2 = Coin::new(owner, 500);
         
         coin1.merge(coin2).unwrap();
         
         assert_eq!(coin1.value(), 1500);
-        assert_eq!(coin1.metadata.version, 2); // Version incremented after operation
+        assert_eq!(coin1.metadata.version, 2);
+    }
+    
+    #[test]
+    fn test_coin_merge_different_types() {
+        let owner = Address::from_str_id("sbt_alice");
+        let mut coin1 = Coin::new(owner, 1000);
+        let coin2 = Coin::new_with_type(owner, 500, CoinType::new("USDC"));
+        
+        // Cannot merge different coin types
+        assert!(coin1.merge(coin2).is_err());
     }
     
     #[test]
     fn test_coin_transfer() {
-        let owner = Address::from("sbt_alice");
-        let mut coin = Coin::new(owner.clone(), 1000);
+        let owner = Address::from_str_id("sbt_alice");
+        let mut coin = Coin::new(owner, 1000);
         
-        let new_owner = Address::from("sbt_bob");
-        coin.transfer(new_owner.clone());
+        let new_owner = Address::from_str_id("sbt_bob");
+        coin.transfer(new_owner);
         
         assert_eq!(coin.metadata.owner.as_ref().unwrap(), &new_owner);
-        assert_eq!(coin.metadata.version, 2); // Version incremented after operation
+        assert_eq!(coin.metadata.version, 2);
     }
 }

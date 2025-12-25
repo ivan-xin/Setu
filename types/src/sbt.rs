@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::object::{Object, ObjectId, Address, generate_object_id};
+use crate::object::{Object, Address, generate_object_id};
 
 /// Credential type
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,8 +164,8 @@ impl SBTData {
 /// Helper function to create SBT object
 pub fn create_sbt(owner: Address, identity_type: String) -> SBT {
     let id = generate_object_id(format!("sbt:{}:{}", owner, identity_type).as_bytes());
-    let data = SBTData::new(owner.clone(), identity_type);
-    Object::new_owned(id, &owner, data)
+    let data = SBTData::new(owner, identity_type);
+    Object::new_owned(id, owner, data)
 }
 
 /// Create personal SBT
@@ -189,8 +189,9 @@ mod tests {
 
     #[test]
     fn test_create_sbt() {
-        let sbt = create_personal_sbt("alice".to_string());
-        assert_eq!(sbt.data.owner, "alice");
+        let owner = Address::from_str_id("alice");
+        let sbt = create_personal_sbt(owner);
+        assert_eq!(sbt.data.owner, owner);
         assert_eq!(sbt.data.identity_type, "personal");
         assert!(!sbt.data.transferable);
         assert!(sbt.is_owned());
@@ -198,7 +199,8 @@ mod tests {
 
     #[test]
     fn test_sbt_attributes() {
-        let mut data = SBTData::new("alice".to_string(), "personal".to_string());
+        let owner = Address::from_str_id("alice");
+        let mut data = SBTData::new(owner, "personal".to_string());
         data.set_display_name("Alice".to_string());
         data.set_attribute("twitter".to_string(), "@alice".to_string());
 
@@ -208,7 +210,8 @@ mod tests {
 
     #[test]
     fn test_reputation() {
-        let mut data = SBTData::new("alice".to_string(), "personal".to_string());
+        let owner = Address::from_str_id("alice");
+        let mut data = SBTData::new(owner, "personal".to_string());
         data.add_reputation(100);
         assert_eq!(data.reputation_score, 100);
 
@@ -222,10 +225,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-            
+        
+        let issuer = Address::from_str_id("issuer");
         let cred = Credential {
             credential_type: "achievement".to_string(),
-            issuer: "issuer".to_string(),
+            issuer,
             issued_at: now,
             expires_at: None,
             data: [("name".to_string(), "First Transaction".to_string())]
@@ -235,16 +239,17 @@ mod tests {
         };
 
         assert_eq!(cred.credential_type, "achievement");
-        assert_eq!(cred.issuer, "issuer");
     }
     
     #[test]
     fn test_add_credential() {
-        let mut data = SBTData::new("alice".to_string(), "personal".to_string());
+        let owner = Address::from_str_id("alice");
+        let mut data = SBTData::new(owner, "personal".to_string());
         
+        let issuer = Address::from_str_id("kyc_provider");
         let cred = Credential {
             credential_type: "kyc".to_string(),
-            issuer: "kyc_provider".to_string(),
+            issuer,
             issued_at: 1000,
             expires_at: Some(2000),
             data: HashMap::new(),

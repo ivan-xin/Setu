@@ -33,6 +33,9 @@ pub struct RelationGraphData {
     /// Owner (SBT's ID)
     pub owner_sbt: ObjectId,
     
+    /// Owner address (for convenience)
+    pub owner_address: Address,
+    
     /// Graph type/name
     pub graph_type: String,
     
@@ -51,7 +54,7 @@ pub type RelationGraph = Object<RelationGraphData>;
 
 impl RelationGraphData {
     /// Create a new relationship graph
-    pub fn new(owner_sbt: ObjectId, graph_type: String) -> Self {
+    pub fn new(owner_sbt: ObjectId, owner_address: Address, graph_type: String) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -59,6 +62,7 @@ impl RelationGraphData {
         
         Self {
             owner_sbt,
+            owner_address,
             graph_type,
             relations: Vec::new(),
             created_at: now,
@@ -152,25 +156,24 @@ impl RelationGraphData {
 
 impl RelationGraph {
     /// Create a new relationship graph object
-    pub fn new(owner_sbt: ObjectId, graph_type: String) -> Self {
+    pub fn new(owner_sbt: ObjectId, owner_address: Address, graph_type: String) -> Self {
         let id = generate_object_id(
             format!("graph:{}:{}", owner_sbt, graph_type).as_bytes()
         );
-        let data = RelationGraphData::new(owner_sbt.clone(), graph_type);
+        let data = RelationGraphData::new(owner_sbt, owner_address, graph_type);
         
-        // RelationGraph's owner is the SBT's ID (in string form)
-        Object::new_owned(id, &owner_sbt, data)
+        Object::new_owned(id, owner_address, data)
     }
 }
 
 /// Helper function: create social relationship graph
-pub fn create_social_graph(owner_sbt: ObjectId) -> RelationGraph {
-    RelationGraph::new(owner_sbt, "social".to_string())
+pub fn create_social_graph(owner_sbt: ObjectId, owner_address: Address) -> RelationGraph {
+    RelationGraph::new(owner_sbt, owner_address, "social".to_string())
 }
 
 /// Helper function: create professional relationship graph
-pub fn create_professional_graph(owner_sbt: ObjectId) -> RelationGraph {
-    RelationGraph::new(owner_sbt, "professional".to_string())
+pub fn create_professional_graph(owner_sbt: ObjectId, owner_address: Address) -> RelationGraph {
+    RelationGraph::new(owner_sbt, owner_address, "professional".to_string())
 }
 
 #[cfg(test)]
@@ -179,8 +182,9 @@ mod tests {
     
     #[test]
     fn test_create_relation_graph() {
-        let owner_sbt = "sbt_alice".to_string();
-        let graph = create_social_graph(owner_sbt.clone());
+        let owner_sbt = generate_object_id(b"sbt_alice");
+        let owner_address = Address::from_str_id("alice");
+        let graph = create_social_graph(owner_sbt, owner_address);
         
         assert_eq!(graph.data.owner_sbt, owner_sbt);
         assert_eq!(graph.data.graph_type, "social");
@@ -189,10 +193,15 @@ mod tests {
     
     #[test]
     fn test_add_relation() {
-        let mut data = RelationGraphData::new("sbt_alice".to_string(), "social".to_string());
+        let owner_sbt = generate_object_id(b"sbt_alice");
+        let owner_address = Address::from_str_id("alice");
+        let mut data = RelationGraphData::new(owner_sbt, owner_address, "social".to_string());
         
-        data.add_relation("sbt_bob".to_string(), "follows".to_string(), 100);
-        data.add_relation("sbt_charlie".to_string(), "trusts".to_string(), 80);
+        let bob_sbt = generate_object_id(b"sbt_bob");
+        let charlie_sbt = generate_object_id(b"sbt_charlie");
+        
+        data.add_relation(bob_sbt, "follows".to_string(), 100);
+        data.add_relation(charlie_sbt, "trusts".to_string(), 80);
         
         assert_eq!(data.relation_count(), 2);
         assert_eq!(data.relation_count_by_type("follows"), 1);
@@ -201,26 +210,37 @@ mod tests {
     
     #[test]
     fn test_remove_relation() {
-        let mut data = RelationGraphData::new("sbt_alice".to_string(), "social".to_string());
+        let owner_sbt = generate_object_id(b"sbt_alice");
+        let owner_address = Address::from_str_id("alice");
+        let mut data = RelationGraphData::new(owner_sbt, owner_address, "social".to_string());
         
-        data.add_relation("sbt_bob".to_string(), "follows".to_string(), 100);
-        data.add_relation("sbt_charlie".to_string(), "trusts".to_string(), 80);
+        let bob_sbt = generate_object_id(b"sbt_bob");
+        let charlie_sbt = generate_object_id(b"sbt_charlie");
         
-        let removed = data.remove_relation(&"sbt_bob".to_string(), "follows");
+        data.add_relation(bob_sbt, "follows".to_string(), 100);
+        data.add_relation(charlie_sbt, "trusts".to_string(), 80);
+        
+        let removed = data.remove_relation(&bob_sbt, "follows");
         assert!(removed);
         assert_eq!(data.relation_count(), 1);
         
-        let not_removed = data.remove_relation(&"sbt_bob".to_string(), "follows");
+        let not_removed = data.remove_relation(&bob_sbt, "follows");
         assert!(!not_removed);
     }
     
     #[test]
     fn test_get_relations_by_type() {
-        let mut data = RelationGraphData::new("sbt_alice".to_string(), "social".to_string());
+        let owner_sbt = generate_object_id(b"sbt_alice");
+        let owner_address = Address::from_str_id("alice");
+        let mut data = RelationGraphData::new(owner_sbt, owner_address, "social".to_string());
         
-        data.add_relation("sbt_bob".to_string(), "follows".to_string(), 100);
-        data.add_relation("sbt_charlie".to_string(), "follows".to_string(), 90);
-        data.add_relation("sbt_dave".to_string(), "trusts".to_string(), 80);
+        let bob_sbt = generate_object_id(b"sbt_bob");
+        let charlie_sbt = generate_object_id(b"sbt_charlie");
+        let dave_sbt = generate_object_id(b"sbt_dave");
+        
+        data.add_relation(bob_sbt, "follows".to_string(), 100);
+        data.add_relation(charlie_sbt, "follows".to_string(), 90);
+        data.add_relation(dave_sbt, "trusts".to_string(), 80);
         
         let follows = data.get_relations_by_type("follows");
         assert_eq!(follows.len(), 2);
@@ -231,14 +251,17 @@ mod tests {
     
     #[test]
     fn test_update_weight() {
-        let mut data = RelationGraphData::new("sbt_alice".to_string(), "social".to_string());
+        let owner_sbt = generate_object_id(b"sbt_alice");
+        let owner_address = Address::from_str_id("alice");
+        let mut data = RelationGraphData::new(owner_sbt, owner_address, "social".to_string());
         
-        data.add_relation("sbt_bob".to_string(), "follows".to_string(), 100);
+        let bob_sbt = generate_object_id(b"sbt_bob");
+        data.add_relation(bob_sbt, "follows".to_string(), 100);
         
-        let updated = data.update_weight(&"sbt_bob".to_string(), "follows", 150);
+        let updated = data.update_weight(&bob_sbt, "follows", 150);
         assert!(updated);
         
-        let relation = data.get_relation(&"sbt_bob".to_string(), "follows").unwrap();
+        let relation = data.get_relation(&bob_sbt, "follows").unwrap();
         assert_eq!(relation.weight, 150);
     }
 }

@@ -4,16 +4,11 @@ pub mod consensus;
 pub mod node;
 pub mod object;
 
-// ========== New Object Model ==========
-pub mod coin;        // New: Coin object
-pub mod sbt;         // Refactored: SBT object
-pub mod relation;    // Refactored: RelationGraph object
-pub mod sbt_view;    // New: SBT aggregated view
-
-// ========== Deprecated (Backward Compatibility) ==========
-// TODO: If Account backward compatibility is needed, implement a simplified account module
-// #[deprecated(note = "Account concept removed. Use SBT as identity instead.")]
-// pub mod account;
+// ========== Object Model ==========
+pub mod coin;           // Coin object (transferable asset)
+pub mod profile;        // Profile & Credential (identity)
+pub mod relation;       // RelationGraph object (social)
+pub mod account_view;   // Account aggregated view
 
 // Export commonly used types
 pub use event::{Event, EventId, EventStatus, EventType, Transfer};
@@ -23,14 +18,18 @@ pub use node::*;
 // Re-export VLC types from setu-vlc
 pub use setu_vlc::{VectorClock, VLCSnapshot};
 
-// ========== New Object Model Exports ==========
-pub use object::{Object, ObjectId, Address, ObjectType, ObjectMetadata, Ownership};
+// ========== Object Model Exports ==========
+pub use object::{Object, ObjectId, Address, ObjectDigest, ObjectType, ObjectMetadata, Ownership, generate_object_id};
 
 // Coin related
-pub use coin::{Coin, Balance, create_coin};
+pub use coin::{Coin, CoinType, CoinData, Balance, create_coin, create_typed_coin};
 
-// SBT related
-pub use sbt::{SBT, SBTData, Credential, create_sbt, create_personal_sbt, create_organization_sbt};
+// Profile & Credential related
+pub use profile::{
+    Profile, ProfileData,
+    Credential, CredentialData, CredentialStatus,
+    create_profile, create_kyc_credential, create_membership_credential, create_achievement_credential,
+};
 
 // RelationGraph related
 pub use relation::{
@@ -39,21 +38,7 @@ pub use relation::{
 };
 
 // Aggregated views
-pub use sbt_view::SBTView;
-
-// ========== Deprecated Types (Backward Compatibility) - Temporarily Commented ==========
-// TODO: If backward compatibility is needed, implement a simplified account module
-// #[deprecated(note = "Use SBT instead of Account")]
-// pub use account::{AccountData, create_account};
-//
-// #[deprecated(note = "Use SBT directly")]
-// pub type AccountObject = account::Account;
-//
-// #[deprecated(note = "Use SBT directly")]
-// pub type SBTObject = SBT;
-//
-// #[deprecated(note = "Use RelationGraph directly")]
-// pub type RelationGraphObject = RelationGraph;
+pub use account_view::AccountView;
 
 // Error types
 pub type SetuResult<T> = Result<T, SetuError>;
@@ -75,6 +60,3 @@ pub enum SetuError {
     #[error("Other error: {0}")]
     Other(String),
 }
-// pub use account::*;
-// pub use sbt::*;
-// pub use relation::*;

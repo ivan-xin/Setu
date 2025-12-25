@@ -8,4 +8,6 @@ serde = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "1.0"
+bincode = "2.0"
+bcs = "0.1"
 setu-vlc = { path = "../crates/setu-vlc" }
