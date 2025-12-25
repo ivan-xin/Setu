@@ -1,0 +1,229 @@
+use setu_types::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, SetuResult};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Debug)]
+pub struct AnchorStore {
+    anchors: Arc<RwLock<HashMap<AnchorId, Anchor>>>,
+    chain: Arc<RwLock<Vec<AnchorId>>>,
+}
+
+impl AnchorStore {
+    pub fn new() -> Self {
+        Self {
+            anchors: Arc::new(RwLock::new(HashMap::new())),
+            chain: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    pub async fn store(&self, anchor: Anchor) -> SetuResult<()> {
+        let anchor_id = anchor.id.clone();
+
+        let mut anchors = self.anchors.write().await;
+        anchors.insert(anchor_id.clone(), anchor);
+
+        let mut chain = self.chain.write().await;
+        chain.push(anchor_id);
+
+        Ok(())
+    }
+
+    pub async fn get(&self, anchor_id: &AnchorId) -> Option<Anchor> {
+        let anchors = self.anchors.read().await;
+        anchors.get(anchor_id).cloned()
+    }
+
+    pub async fn get_latest(&self) -> Option<Anchor> {
+        let chain = self.chain.read().await;
+        let anchors = self.anchors.read().await;
+
+        chain.last().and_then(|id| anchors.get(id).cloned())
+    }
+
+    pub async fn get_by_depth(&self, depth: u64) -> Option<Anchor> {
+        let anchors = self.anchors.read().await;
+        anchors.values().find(|a| a.depth == depth).cloned()
+    }
+
+    pub async fn count(&self) -> usize {
+        self.anchors.read().await.len()
+    }
+
+    pub async fn get_chain(&self) -> Vec<AnchorId> {
+        self.chain.read().await.clone()
+    }
+}
+
+impl Clone for AnchorStore {
+    fn clone(&self) -> Self {
+        Self {
+            anchors: Arc::clone(&self.anchors),
+            chain: Arc::clone(&self.chain),
+        }
+    }
+}
+
+impl Default for AnchorStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub struct CFStore {
+    frames: Arc<RwLock<HashMap<CFId, ConsensusFrame>>>,
+    pending: Arc<RwLock<Vec<CFId>>>,
+    finalized: Arc<RwLock<Vec<CFId>>>,
+}
+
+impl CFStore {
+    pub fn new() -> Self {
+        Self {
+            frames: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(RwLock::new(Vec::new())),
+            finalized: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    pub async fn store(&self, cf: ConsensusFrame) -> SetuResult<()> {
+        let cf_id = cf.id.clone();
+        let is_finalized = cf.status == CFStatus::Finalized;
+
+        let mut frames = self.frames.write().await;
+        frames.insert(cf_id.clone(), cf);
+
+        if is_finalized {
+            let mut finalized = self.finalized.write().await;
+            finalized.push(cf_id);
+        } else {
+            let mut pending = self.pending.write().await;
+            pending.push(cf_id);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get(&self, cf_id: &CFId) -> Option<ConsensusFrame> {
+        let frames = self.frames.read().await;
+        frames.get(cf_id).cloned()
+    }
+
+    pub async fn mark_finalized(&self, cf_id: &CFId) {
+        {
+            let mut frames = self.frames.write().await;
+            if let Some(cf) = frames.get_mut(cf_id) {
+                cf.finalize();
+            }
+        }
+
+        let mut pending = self.pending.write().await;
+        pending.retain(|id| id != cf_id);
+
+        let mut finalized = self.finalized.write().await;
+        finalized.push(cf_id.clone());
+    }
+
+    pub async fn get_pending(&self) -> Vec<ConsensusFrame> {
+        let pending = self.pending.read().await;
+        let frames = self.frames.read().await;
+
+        pending
+            .iter()
+            .filter_map(|id| frames.get(id).cloned())
+            .collect()
+    }
+
+    pub async fn get_finalized(&self) -> Vec<ConsensusFrame> {
+        let finalized = self.finalized.read().await;
+        let frames = self.frames.read().await;
+
+        finalized
+            .iter()
+            .filter_map(|id| frames.get(id).cloned())
+            .collect()
+    }
+
+    pub async fn latest_finalized(&self) -> Option<ConsensusFrame> {
+        let finalized = self.finalized.read().await;
+        let frames = self.frames.read().await;
+
+        finalized.last().and_then(|id| frames.get(id).cloned())
+    }
+
+    pub async fn finalized_count(&self) -> usize {
+        self.finalized.read().await.len()
+    }
+
+    pub async fn pending_count(&self) -> usize {
+        self.pending.read().await.len()
+    }
+}
+
+impl Clone for CFStore {
+    fn clone(&self) -> Self {
+        Self {
+            frames: Arc::clone(&self.frames),
+            pending: Arc::clone(&self.pending),
+            finalized: Arc::clone(&self.finalized),
+        }
+    }
+}
+
+impl Default for CFStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use setu_types::{VectorClock, VLCSnapshot};
+
+    fn create_anchor(depth: u64) -> Anchor {
+        Anchor::new(
+            vec!["event1".to_string()],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: depth * 10,
+                physical_time: depth * 10000,
+            },
+            format!("state_root_{}", depth),
+            None,
+            depth,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_anchor_store() {
+        let store = AnchorStore::new();
+        
+        let anchor1 = create_anchor(0);
+        let anchor2 = create_anchor(1);
+
+        store.store(anchor1).await.unwrap();
+        store.store(anchor2.clone()).await.unwrap();
+
+        assert_eq!(store.count().await, 2);
+        
+        let latest = store.get_latest().await.unwrap();
+        assert_eq!(latest.depth, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cf_store() {
+        let store = CFStore::new();
+        
+        let anchor = create_anchor(0);
+        let cf = ConsensusFrame::new(anchor, "validator1".to_string());
+        let cf_id = cf.id.clone();
+
+        store.store(cf).await.unwrap();
+        assert_eq!(store.pending_count().await, 1);
+
+        store.mark_finalized(&cf_id).await;
+        assert_eq!(store.pending_count().await, 0);
+        assert_eq!(store.finalized_count().await, 1);
+    }
+}
