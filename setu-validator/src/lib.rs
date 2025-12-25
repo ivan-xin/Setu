@@ -6,12 +6,20 @@
 //! - Maintaining the global Foldgraph
 //! - Coordinating consensus
 
+mod verifier;
+mod dag;
+mod sampling;
+
+pub use verifier::Verifier;
+pub use dag::{DagManager, DagNode, DagStats};
+pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
+
 use setu_core::{NodeConfig, ShardManager};
 use setu_types::event::Event;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 /// Event verification error
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +50,12 @@ pub struct Validator {
     event_rx: mpsc::UnboundedReceiver<Event>,
     /// Store of verified events (event_id -> event)
     verified_events: HashMap<String, Event>,
+    /// Verifier for detailed event verification
+    verifier: Verifier,
+    /// DAG manager for maintaining event graph
+    dag_manager: DagManager,
+    /// Sampling verifier for probabilistic verification
+    sampling_verifier: SamplingVerifier,
 }
 
 impl Validator {
@@ -56,12 +70,21 @@ impl Validator {
         );
         
         let shard_manager = Arc::new(ShardManager::new());
+        let verifier = Verifier::new(config.node_id.clone());
+        let dag_manager = DagManager::new(config.node_id.clone());
+        let sampling_verifier = SamplingVerifier::new(
+            config.node_id.clone(),
+            SamplingConfig::default(),
+        );
         
         Self {
             config,
             shard_manager,
             event_rx,
             verified_events: HashMap::new(),
+            verifier,
+            dag_manager,
+            sampling_verifier,
         }
     }
     
@@ -82,20 +105,31 @@ impl Validator {
                 "Received event"
             );
             
-            // Verify the event
-            match self.verify_event(&event).await {
+            // Verify the event (comprehensive verification)
+            match self.verify_event_comprehensive(&event).await {
                 Ok(()) => {
                     info!(
                         event_id = %event.id,
                         "Event verified successfully"
                     );
                     
+                    // Add to DAG
+                    if let Err(e) = self.add_to_dag(event.clone()).await {
+                        error!(
+                            event_id = %event.id,
+                            error = %e,
+                            "Failed to add event to DAG"
+                        );
+                        continue;
+                    }
+                    
                     // Store the verified event
                     self.verified_events.insert(event.id.clone(), event);
                     
                     info!(
                         total_verified = self.verified_events.len(),
-                        "Event added to verified store"
+                        dag_size = self.dag_manager.size(),
+                        "Event added to verified store and DAG"
                     );
                 }
                 Err(e) => {
@@ -111,7 +145,7 @@ impl Validator {
         info!("Validator stopped");
     }
     
-    /// Verify an event
+    /// Verify an event (legacy method, kept for compatibility)
     async fn verify_event(&self, event: &Event) -> Result<(), ValidationError> {
         info!("Verifying event: {}", event.id);
         
@@ -162,6 +196,109 @@ impl Validator {
         Ok(())
     }
     
+    /// Comprehensive event verification using new verifier
+    async fn verify_event_comprehensive(&self, event: &Event) -> Result<(), ValidationError> {
+        info!(
+            event_id = %event.id,
+            "Starting comprehensive verification pipeline"
+        );
+        
+        // Step 1: Quick check
+        self.quick_check(event).await?;
+        debug!(
+            event_id = %event.id,
+            "Quick check passed"
+        );
+        
+        // Step 2: Verify VLC
+        self.verify_vlc(event).await?;
+        debug!(
+            event_id = %event.id,
+            "VLC verification passed"
+        );
+        
+        // Step 3: Verify TEE proof
+        self.verify_tee_proof(event).await?;
+        debug!(
+            event_id = %event.id,
+            "TEE proof verification passed"
+        );
+        
+        // Step 4: Verify parents
+        self.verify_parents(event).await?;
+        debug!(
+            event_id = %event.id,
+            "Parent verification passed"
+        );
+        
+        // Step 5: Sampling verification (probabilistic)
+        if self.sampling_verifier.should_sample(event) {
+            self.sampling_verification(event).await?;
+            debug!(
+                event_id = %event.id,
+                "Sampling verification passed"
+            );
+        }
+        
+        info!(
+            event_id = %event.id,
+            "Comprehensive verification completed successfully"
+        );
+        
+        Ok(())
+    }
+    
+    /// Quick check of event format and basic fields
+    async fn quick_check(&self, event: &Event) -> Result<(), ValidationError> {
+        self.verifier.quick_check(event).await
+    }
+    
+    /// Verify VLC structure
+    async fn verify_vlc(&self, event: &Event) -> Result<(), ValidationError> {
+        self.verifier.verify_vlc(event).await
+    }
+    
+    /// Verify TEE proof
+    async fn verify_tee_proof(&self, event: &Event) -> Result<(), ValidationError> {
+        self.verifier.verify_tee_proof(event).await
+    }
+    
+    /// Verify parent events
+    async fn verify_parents(&self, event: &Event) -> Result<(), ValidationError> {
+        self.verifier.verify_parents(event, &self.verified_events).await
+    }
+    
+    /// Sampling verification
+    async fn sampling_verification(&self, event: &Event) -> Result<(), ValidationError> {
+        debug!(
+            event_id = %event.id,
+            "Performing sampling verification"
+        );
+        
+        match self.sampling_verifier.verify_by_sampling(event).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ValidationError::ExecutionFailed(
+                "Sampling verification failed".to_string()
+            )),
+            Err(e) => Err(ValidationError::ExecutionFailed(
+                format!("Sampling error: {}", e)
+            )),
+        }
+    }
+    
+    /// Add event to DAG
+    async fn add_to_dag(&mut self, event: Event) -> Result<(), ValidationError> {
+        debug!(
+            event_id = %event.id,
+            "Adding event to DAG"
+        );
+        
+        self.dag_manager.add_event(event).await
+            .map_err(|e| ValidationError::InvalidCreator(
+                format!("Failed to add to DAG: {}", e)
+            ))
+    }
+    
     /// Get node ID
     pub fn node_id(&self) -> &str {
         &self.config.node_id
@@ -175,6 +312,16 @@ impl Validator {
     /// Check if an event has been verified
     pub fn is_verified(&self, event_id: &str) -> bool {
         self.verified_events.contains_key(event_id)
+    }
+    
+    /// Get DAG statistics
+    pub fn dag_stats(&self) -> DagStats {
+        self.dag_manager.stats()
+    }
+    
+    /// Get sampling statistics
+    pub fn sampling_stats(&self) -> SamplingStats {
+        self.sampling_verifier.stats()
     }
 }
 
