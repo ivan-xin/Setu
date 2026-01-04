@@ -283,14 +283,8 @@ impl Router {
             "Added to pending queue"
         );
         
-        // Step 3: Route to solver
-        let solver_id = if self.config.enable_resource_routing {
-            // Resource-based routing
-            self.route_by_resource(&transfer)?
-        } else {
-            // Load balancing
-            self.load_balancer.select_solver()?
-        };
+        // Step 3: Route to solver using layered strategy
+        let solver_id = self.route_transfer(&transfer)?;
         
         debug!(
             transfer_id = %transfer.id,
@@ -311,6 +305,119 @@ impl Router {
         );
         
         Ok(())
+    }
+    
+    /// Route transfer using layered strategy
+    fn route_transfer(&self, transfer: &Transfer) -> anyhow::Result<String> {
+        match self.config.routing_strategy {
+            RoutingStrategy::ManualFirst => {
+                // Priority 1: Manual solver selection
+                if let Some(solver_id) = &transfer.preferred_solver {
+                    if self.solver_registry.is_available(solver_id) {
+                        debug!(
+                            transfer_id = %transfer.id,
+                            solver_id = %solver_id,
+                            "Using manually specified solver"
+                        );
+                        return Ok(solver_id.clone());
+                    } else {
+                        warn!(
+                            transfer_id = %transfer.id,
+                            solver_id = %solver_id,
+                            "Preferred solver not available, falling back"
+                        );
+                    }
+                }
+                
+                // Priority 2: Shard-based routing
+                if let Some(shard_id) = &transfer.shard_id {
+                    if let Ok(solver_id) = self.route_by_shard(shard_id) {
+                        debug!(
+                            transfer_id = %transfer.id,
+                            shard_id = %shard_id,
+                            solver_id = %solver_id,
+                            "Using shard-based routing"
+                        );
+                        return Ok(solver_id);
+                    }
+                }
+                
+                // Priority 3: Resource affinity routing
+                if self.config.enable_resource_routing {
+                    if let Ok(solver_id) = self.route_by_resource(transfer) {
+                        debug!(
+                            transfer_id = %transfer.id,
+                            solver_id = %solver_id,
+                            "Using resource affinity routing"
+                        );
+                        return Ok(solver_id);
+                    }
+                }
+                
+                // Priority 4: Load balancing
+                debug!(
+                    transfer_id = %transfer.id,
+                    "Using load balancing"
+                );
+                Ok(self.load_balancer.select_solver()?)
+            }
+            
+            RoutingStrategy::ShardFirst => {
+                // Priority 1: Shard-based routing
+                if let Some(shard_id) = &transfer.shard_id {
+                    if let Ok(solver_id) = self.route_by_shard(shard_id) {
+                        return Ok(solver_id);
+                    }
+                }
+                
+                // Priority 2: Resource affinity routing
+                if self.config.enable_resource_routing {
+                    if let Ok(solver_id) = self.route_by_resource(transfer) {
+                        return Ok(solver_id);
+                    }
+                }
+                
+                // Priority 3: Load balancing
+                Ok(self.load_balancer.select_solver()?)
+            }
+            
+            RoutingStrategy::ResourceAffinityFirst => {
+                // Priority 1: Resource affinity routing
+                if self.config.enable_resource_routing {
+                    if let Ok(solver_id) = self.route_by_resource(transfer) {
+                        return Ok(solver_id);
+                    }
+                }
+                
+                // Priority 2: Load balancing
+                Ok(self.load_balancer.select_solver()?)
+            }
+            
+            RoutingStrategy::LoadBalanceOnly => {
+                // Only use load balancing
+                Ok(self.load_balancer.select_solver()?)
+            }
+        }
+    }
+    
+    /// Route by shard ID
+    fn route_by_shard(&self, shard_id: &str) -> anyhow::Result<String> {
+        let solvers = self.solver_registry.find_by_shard(shard_id);
+        
+        if solvers.is_empty() {
+            return Err(anyhow::anyhow!("No solvers available for shard: {}", shard_id));
+        }
+        
+        // Select least loaded solver in the shard
+        let solver_id = solvers
+            .iter()
+            .filter_map(|id| self.solver_registry.get(id))
+            .filter(|info| info.is_available())
+            .min_by_key(|info| info.current_load)
+            .map(|info| info.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("No available solvers in shard: {}", shard_id))?;
+        
+        Ok(solver_id)
     }
     
     /// Route transfer based on resource affinity
