@@ -42,3 +42,6 @@ indicatif = "0.17"
 # Config
 dirs = "5.0"
 
+# UUID
+uuid = { version = "1.0", features = ["v4"] }
+

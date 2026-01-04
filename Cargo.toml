@@ -8,12 +8,12 @@ members = [
     "crates/setu-core",       # Shared core library
     "crates/setu-keys",       # Cryptographic key management
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
-    "crates/setu-router",     # Transaction routing module
     "consensus",
     "setu-validator",
     "setu-solver",       # Solver node
     "setu-router",       # Router node
     "setu-rpc",          # RPC layer
+    "setu-cli",          # CLI tool
 ]
 resolver = "2"
 
