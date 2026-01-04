@@ -23,7 +23,7 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
     
     tokio::time::sleep(Duration::from_millis(500)).await;
     
-    // Transfer 1: alice -> bob
+    // Transfer 1: alice -> bob (normal routing)
     let mut vlc1 = Vlc::new();
     vlc1.entries.insert("relay-1".to_string(), 1);
     let transfer1 = Transfer {
@@ -35,13 +35,15 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
         resources: vec!["alice".to_string()],
         vlc: vlc1,
         power: 100,
+        preferred_solver: None,
+        shard_id: None,
     };
     info!("🟢 Relay: Sending transfer tx-001 (alice -> bob, 1000)");
     transfer_tx.send(transfer1).unwrap();
     
     tokio::time::sleep(Duration::from_millis(300)).await;
     
-    // Transfer 2: charlie -> dave
+    // Transfer 2: charlie -> dave (with shard routing)
     let mut vlc2 = Vlc::new();
     vlc2.entries.insert("relay-1".to_string(), 2);
     let transfer2 = Transfer {
@@ -53,13 +55,15 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
         resources: vec!["charlie".to_string()],
         vlc: vlc2,
         power: 200,
+        preferred_solver: None,
+        shard_id: Some("shard-1".to_string()),
     };
-    info!("🟢 Relay: Sending transfer tx-002 (charlie -> dave, 2000)");
+    info!("🟢 Relay: Sending transfer tx-002 (charlie -> dave, 2000, shard-1)");
     transfer_tx.send(transfer2).unwrap();
     
     tokio::time::sleep(Duration::from_millis(300)).await;
     
-    // Transfer 3: bob -> alice (dependent on tx-001)
+    // Transfer 3: bob -> alice (with manual solver selection)
     let mut vlc3 = Vlc::new();
     vlc3.entries.insert("relay-1".to_string(), 3);
     let transfer3 = Transfer {
@@ -71,8 +75,10 @@ async fn simulate_relay(transfer_tx: mpsc::UnboundedSender<Transfer>) {
         resources: vec!["bob".to_string()],
         vlc: vlc3,
         power: 150,
+        preferred_solver: Some("solver-1".to_string()),
+        shard_id: None,
     };
-    info!("🟢 Relay: Sending transfer tx-003 (bob -> alice, 500)");
+    info!("🟢 Relay: Sending transfer tx-003 (bob -> alice, 500, manual solver-1)");
     transfer_tx.send(transfer3).unwrap();
     
     info!("🟢 Relay: All transfers sent");
@@ -90,11 +96,17 @@ async fn main() -> anyhow::Result<()> {
     info!("Architecture:");
     info!("  🟢 Relay (simulated)");
     info!("       ↓ Transfer Intent");
-    info!("  🔴 Router (Quick Check + Load Balance)");
+    info!("  🔴 Router (Layered Routing Strategy)");
     info!("       ↓ Transfer");
     info!("  🔵 Solver (Execute + Create Event)");
     info!("       ↓ Event");
     info!("  🟣 Validator (Verify + DAG)");
+    info!("================================================");
+    info!("Routing Features:");
+    info!("  ✅ Manual solver selection (preferred_solver)");
+    info!("  ✅ Shard-based routing (shard_id)");
+    info!("  ✅ Resource affinity routing");
+    info!("  ✅ Load balancing fallback");
     info!("================================================");
 
     // ============================================
@@ -236,4 +248,9 @@ async fn main() -> anyhow::Result<()> {
     
     Ok(())
 }
+
+
+
+
+
 
