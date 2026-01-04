@@ -32,7 +32,8 @@ async fn main() -> anyhow::Result<()> {
         load_balancing_strategy: LoadBalancingStrategy::RoundRobin,
         quick_check_timeout_ms: 100,
         enable_resource_routing: true,
-        routing_strategy: setu_router::RoutingStrategy::ResourceAffinityFirst,
+        // Use consistent hash for deterministic routing
+        routing_strategy: setu_router::RoutingStrategy::ConsistentHash { virtual_nodes: 150 },
     };
 
     // Create router

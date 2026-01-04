@@ -6,16 +6,42 @@
 //! - Routing transfers to appropriate Solvers
 //! - Load balancing across Solvers
 //! - Managing pending queue
+//!
+//! # Routing Strategies
+//!
+//! The router supports multiple routing strategies:
+//!
+//! - **ConsistentHash**: Deterministic routing based on resource keys (cache-friendly)
+//! - **ManualFirst**: Manual > Shard > Resource > Load balancing
+//! - **ShardFirst**: Shard > Resource > Load balancing
+//! - **ResourceAffinityFirst**: Resource > Load balancing
+//! - **LoadBalanceOnly**: Pure load balancing
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use setu_router::{Router, RouterConfig, RoutingStrategy};
+//!
+//! let config = RouterConfig {
+//!     routing_strategy: RoutingStrategy::ConsistentHash { virtual_nodes: 150 },
+//!     ..Default::default()
+//! };
+//! let router = Router::new(config, transfer_rx);
+//! ```
 
 mod quick_check;
 mod load_balancer;
 mod pending_queue;
 mod solver_registry;
+mod consistent_hash;
+mod shard;
 
 pub use quick_check::{QuickChecker, QuickCheckError};
 pub use load_balancer::{LoadBalancer, LoadBalancingStrategy};
 pub use pending_queue::{PendingQueue, PendingTransfer};
 pub use solver_registry::{SolverRegistry, SolverInfo, SolverStatus};
+pub use consistent_hash::ConsistentHashStrategy;
+pub use shard::{ShardConfig, ShardId, ShardRouter, SingleShardRouter, MultiShardRouter, DEFAULT_SHARD_ID};
 
 use core_types::Transfer;
 use std::sync::Arc;
@@ -23,8 +49,16 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, debug};
 
 /// Routing strategy for transfer routing
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RoutingStrategy {
+    /// Consistent hash routing (deterministic, cache-friendly)
+    /// Same resource always routes to the same solver
+    /// Borrowed from colleague's implementation
+    ConsistentHash {
+        /// Number of virtual nodes per solver (default: 150)
+        virtual_nodes: u32,
+    },
+    
     /// Priority 1: Manual solver selection (preferred_solver)
     /// Priority 2: Shard-based routing (shard_id)
     /// Priority 3: Resource affinity routing (resources)
@@ -46,7 +80,8 @@ pub enum RoutingStrategy {
 
 impl Default for RoutingStrategy {
     fn default() -> Self {
-        Self::ManualFirst
+        // Default to consistent hash for better cache locality
+        Self::ConsistentHash { virtual_nodes: 150 }
     }
 }
 
@@ -126,6 +161,9 @@ pub struct Router {
     /// Solver registry
     solver_registry: Arc<SolverRegistry>,
     
+    /// Consistent hash strategy (optional, based on config)
+    consistent_hash: Option<ConsistentHashStrategy>,
+    
     /// Statistics
     stats: Arc<parking_lot::RwLock<RouterStats>>,
 }
@@ -138,6 +176,7 @@ impl Router {
     ) -> Self {
         info!(
             node_id = %config.node_id,
+            routing_strategy = ?config.routing_strategy,
             "Creating router node"
         );
         
@@ -145,6 +184,18 @@ impl Router {
         let load_balancer = LoadBalancer::new(config.load_balancing_strategy);
         let pending_queue = PendingQueue::new(config.max_pending_queue_size);
         let solver_registry = Arc::new(SolverRegistry::new());
+        
+        // Create consistent hash strategy if configured
+        let consistent_hash = match &config.routing_strategy {
+            RoutingStrategy::ConsistentHash { virtual_nodes } => {
+                info!(
+                    virtual_nodes = virtual_nodes,
+                    "Using ConsistentHash routing strategy"
+                );
+                Some(ConsistentHashStrategy::with_virtual_nodes(*virtual_nodes))
+            }
+            _ => None,
+        };
         
         Self {
             config,
@@ -154,6 +205,7 @@ impl Router {
             load_balancer,
             pending_queue,
             solver_registry,
+            consistent_hash,
             stats: Arc::new(parking_lot::RwLock::new(RouterStats::default())),
         }
     }
@@ -309,7 +361,52 @@ impl Router {
     
     /// Route transfer using layered strategy
     fn route_transfer(&self, transfer: &Transfer) -> anyhow::Result<String> {
-        match self.config.routing_strategy {
+        match &self.config.routing_strategy {
+            // Consistent Hash Strategy (borrowed from colleague)
+            RoutingStrategy::ConsistentHash { .. } => {
+                // Priority 1: Manual solver selection (still respected)
+                if let Some(solver_id) = &transfer.preferred_solver {
+                    if let Some(solver_info) = self.solver_registry.get(solver_id) {
+                        if solver_info.is_available() {
+                            debug!(
+                                transfer_id = %transfer.id,
+                                solver_id = %solver_id,
+                                "Using manually specified solver"
+                            );
+                            return Ok(solver_id.clone());
+                        }
+                    }
+                }
+                
+                // Priority 2: Consistent hash based on resources
+                if let Some(consistent_hash) = &self.consistent_hash {
+                    let routing_key = self.get_routing_key(transfer);
+                    let available_solvers = self.load_balancer.get_solvers();
+                    
+                    if let Some(solver_id) = consistent_hash.select(&available_solvers, &routing_key) {
+                        // Verify solver is available
+                        if let Some(solver_info) = self.solver_registry.get(&solver_id) {
+                            if solver_info.is_available() {
+                                debug!(
+                                    transfer_id = %transfer.id,
+                                    solver_id = %solver_id,
+                                    routing_key = %routing_key,
+                                    "Using consistent hash routing"
+                                );
+                                return Ok(solver_id);
+                            }
+                        }
+                    }
+                }
+                
+                // Fallback to load balancing
+                debug!(
+                    transfer_id = %transfer.id,
+                    "Consistent hash fallback to load balancing"
+                );
+                Ok(self.load_balancer.select_solver()?)
+            }
+            
             RoutingStrategy::ManualFirst => {
                 // Priority 1: Manual solver selection
                 if let Some(solver_id) = &transfer.preferred_solver {
@@ -400,6 +497,14 @@ impl Router {
                 Ok(self.load_balancer.select_solver()?)
             }
         }
+    }
+    
+    /// Get routing key from transfer (for consistent hash)
+    fn get_routing_key(&self, transfer: &Transfer) -> String {
+        // Priority: first resource > transfer id
+        transfer.resources.first()
+            .cloned()
+            .unwrap_or_else(|| transfer.id.clone())
     }
     
     /// Route by shard ID
