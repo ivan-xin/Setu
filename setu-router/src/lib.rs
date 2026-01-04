@@ -22,6 +22,34 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn, debug};
 
+/// Routing strategy for transfer routing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingStrategy {
+    /// Priority 1: Manual solver selection (preferred_solver)
+    /// Priority 2: Shard-based routing (shard_id)
+    /// Priority 3: Resource affinity routing (resources)
+    /// Priority 4: Load balancing
+    ManualFirst,
+    
+    /// Priority 1: Shard-based routing (shard_id)
+    /// Priority 2: Resource affinity routing (resources)
+    /// Priority 3: Load balancing
+    ShardFirst,
+    
+    /// Priority 1: Resource affinity routing (resources)
+    /// Priority 2: Load balancing
+    ResourceAffinityFirst,
+    
+    /// Only use load balancing (ignore manual/shard/resource)
+    LoadBalanceOnly,
+}
+
+impl Default for RoutingStrategy {
+    fn default() -> Self {
+        Self::ManualFirst
+    }
+}
+
 /// Router configuration
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -39,6 +67,9 @@ pub struct RouterConfig {
     
     /// Enable resource-based routing
     pub enable_resource_routing: bool,
+    
+    /// Routing strategy (priority order)
+    pub routing_strategy: RoutingStrategy,
 }
 
 impl Default for RouterConfig {
@@ -49,6 +80,7 @@ impl Default for RouterConfig {
             load_balancing_strategy: LoadBalancingStrategy::RoundRobin,
             quick_check_timeout_ms: 100,
             enable_resource_routing: true,
+            routing_strategy: RoutingStrategy::ManualFirst,
         }
     }
 }
