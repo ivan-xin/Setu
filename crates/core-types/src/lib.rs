@@ -59,6 +59,11 @@ pub struct Transfer {
     pub vlc: Vlc,
     /// Power/work score used for tie-breaks.
     pub power: u64,
+    
+    /// Optional: Preferred solver ID for manual routing
+    pub preferred_solver: Option<String>,
+    /// Optional: Shard ID for shard-based routing
+    pub shard_id: Option<String>,
 }
 
 /// Snapshot of an object's version, roughly mirroring `object_versions` table.
