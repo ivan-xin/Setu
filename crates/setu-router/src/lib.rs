@@ -29,12 +29,17 @@ mod shard;
 mod solver;
 mod router;
 mod strategy;
+mod subnet_shard;
 
 pub use error::RouterError;
 pub use shard::{ShardConfig, ShardId, ShardRouter, SingleShardRouter, DEFAULT_SHARD_ID};
 pub use solver::{SolverInfo, SolverId, SolverRegistry, SolverStatus};
 pub use router::{Router, RouterConfig, RoutingDecision};
 pub use strategy::{RoutingStrategy, ConsistentHashStrategy, LoadBalancedStrategy};
+pub use subnet_shard::{
+    SubnetShardRouter, SubnetShardStrategy, CrossSubnetRoutingDecision,
+    ShardLoadMetrics, DEFAULT_SHARD_COUNT,
+};
 
 #[cfg(test)]
 mod tests;
