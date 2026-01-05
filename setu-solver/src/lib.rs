@@ -5,14 +5,17 @@
 //! - Executing computations
 //! - Generating events
 //! - Broadcasting to the network
+//! - Registering with Validator
 
 mod executor;
 mod dependency;
 mod tee;
+mod network_client;
 
 pub use executor::Executor;
 pub use dependency::{DependencyTracker, DependencyStats};
 pub use tee::{TeeEnvironment, TeeProof, EnclaveInfo};
+pub use network_client::{SolverNetworkClient, SolverNetworkConfig};
 
 use core_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
