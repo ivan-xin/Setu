@@ -1,0 +1,271 @@
+//! RPC message types for Setu network communication
+//!
+//! This module defines all request/response types used in RPC communication.
+
+use serde::{Deserialize, Serialize};
+
+// ============================================
+// Message Type Discriminator
+// ============================================
+
+/// Message type for routing RPC requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum MessageType {
+    // Registration messages (0x1x)
+    RegisterSolver = 0x10,
+    RegisterValidator = 0x11,
+    Unregister = 0x12,
+    Heartbeat = 0x13,
+    
+    // Query messages (0x2x)
+    GetSolverList = 0x20,
+    GetValidatorList = 0x21,
+    GetNodeStatus = 0x22,
+    
+    // Transfer messages (0x3x)
+    SubmitTransfer = 0x30,
+    TransferResult = 0x31,
+    
+    // Event messages (0x4x)
+    SubmitEvent = 0x40,
+    EventResult = 0x41,
+}
+
+// ============================================
+// Registration Request/Response Types
+// ============================================
+
+/// Request to register a solver with the validator
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSolverRequest {
+    /// Unique solver identifier
+    pub solver_id: String,
+    /// Network address (IP or hostname)
+    pub address: String,
+    /// Port number
+    pub port: u16,
+    /// Maximum capacity (concurrent transfers)
+    pub capacity: u32,
+    /// Optional shard assignment
+    pub shard_id: Option<String>,
+    /// Resource types this solver can handle
+    pub resources: Vec<String>,
+    /// Solver's public key for authentication
+    pub public_key: Option<Vec<u8>>,
+}
+
+/// Response to solver registration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSolverResponse {
+    /// Whether registration was successful
+    pub success: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Assigned solver ID (may differ from requested)
+    pub assigned_id: Option<String>,
+}
+
+/// Request to register a validator
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterValidatorRequest {
+    /// Unique validator identifier
+    pub validator_id: String,
+    /// Network address
+    pub address: String,
+    /// Port number
+    pub port: u16,
+    /// Validator's public key
+    pub public_key: Option<Vec<u8>>,
+    /// Stake amount (for PoS)
+    pub stake: Option<u64>,
+}
+
+/// Response to validator registration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterValidatorResponse {
+    /// Whether registration was successful
+    pub success: bool,
+    /// Human-readable message
+    pub message: String,
+}
+
+/// Request to unregister a node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterRequest {
+    /// Node ID to unregister
+    pub node_id: String,
+    /// Node type (solver or validator)
+    pub node_type: NodeType,
+}
+
+/// Response to unregister request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Heartbeat request to keep registration alive
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    /// Node ID
+    pub node_id: String,
+    /// Current load (for solvers)
+    pub current_load: Option<u32>,
+    /// Timestamp
+    pub timestamp: u64,
+}
+
+/// Heartbeat response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatResponse {
+    /// Whether heartbeat was acknowledged
+    pub acknowledged: bool,
+    /// Server timestamp
+    pub server_timestamp: u64,
+}
+
+// ============================================
+// Query Request/Response Types
+// ============================================
+
+/// Request to get list of registered solvers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSolverListRequest {
+    /// Optional filter by shard
+    pub shard_id: Option<String>,
+    /// Optional filter by status
+    pub status_filter: Option<String>,
+}
+
+/// Solver info in list response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverListItem {
+    pub solver_id: String,
+    pub address: String,
+    pub port: u16,
+    pub capacity: u32,
+    pub current_load: u32,
+    pub status: String,
+    pub shard_id: Option<String>,
+}
+
+/// Response with solver list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSolverListResponse {
+    pub solvers: Vec<SolverListItem>,
+}
+
+/// Request to get list of validators
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetValidatorListRequest {
+    /// Optional filter by status
+    pub status_filter: Option<String>,
+}
+
+/// Validator info in list response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorListItem {
+    pub validator_id: String,
+    pub address: String,
+    pub port: u16,
+    pub status: String,
+}
+
+/// Response with validator list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetValidatorListResponse {
+    pub validators: Vec<ValidatorListItem>,
+}
+
+/// Request to get node status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetNodeStatusRequest {
+    pub node_id: String,
+}
+
+/// Response with node status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetNodeStatusResponse {
+    pub found: bool,
+    pub node_id: String,
+    pub node_type: Option<NodeType>,
+    pub status: Option<String>,
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    pub uptime_seconds: Option<u64>,
+}
+
+// ============================================
+// Common Types
+// ============================================
+
+/// Node type enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeType {
+    Solver,
+    Validator,
+}
+
+impl std::fmt::Display for NodeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeType::Solver => write!(f, "solver"),
+            NodeType::Validator => write!(f, "validator"),
+        }
+    }
+}
+
+// ============================================
+// Wrapper for all RPC messages
+// ============================================
+
+/// Wrapper enum for all RPC request types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcRequest {
+    RegisterSolver(RegisterSolverRequest),
+    RegisterValidator(RegisterValidatorRequest),
+    Unregister(UnregisterRequest),
+    Heartbeat(HeartbeatRequest),
+    GetSolverList(GetSolverListRequest),
+    GetValidatorList(GetValidatorListRequest),
+    GetNodeStatus(GetNodeStatusRequest),
+}
+
+/// Wrapper enum for all RPC response types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcResponse {
+    RegisterSolver(RegisterSolverResponse),
+    RegisterValidator(RegisterValidatorResponse),
+    Unregister(UnregisterResponse),
+    Heartbeat(HeartbeatResponse),
+    GetSolverList(GetSolverListResponse),
+    GetValidatorList(GetValidatorListResponse),
+    GetNodeStatus(GetNodeStatusResponse),
+    Error(String),
+}
+
+impl RpcRequest {
+    /// Serialize request to bytes
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
+    }
+    
+    /// Deserialize request from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+impl RpcResponse {
+    /// Serialize response to bytes
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
+    }
+    
+    /// Deserialize response from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
