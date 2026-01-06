@@ -5,37 +5,37 @@ use setu_types::{Object, ObjectId, Address, CoinData};
 use crate::error::RuntimeResult;
 
 /// State storage trait
-/// 未来可以替换为持久化存储或 Move VM 的状态管理
+/// Can be replaced with persistent storage or Move VM state management in the future
 pub trait StateStore {
-    /// 读取对象
+    /// Read object
     fn get_object(&self, object_id: &ObjectId) -> RuntimeResult<Option<Object<CoinData>>>;
     
-    /// 写入对象
+    /// Write object
     fn set_object(&mut self, object_id: ObjectId, object: Object<CoinData>) -> RuntimeResult<()>;
     
-    /// 删除对象
+    /// Delete object
     fn delete_object(&mut self, object_id: &ObjectId) -> RuntimeResult<()>;
     
-    /// 获取地址拥有的所有对象
+    /// Get all objects owned by an address
     fn get_owned_objects(&self, owner: &Address) -> RuntimeResult<Vec<ObjectId>>;
     
-    /// 检查对象是否存在
+    /// Check if object exists
     fn exists(&self, object_id: &ObjectId) -> bool {
         self.get_object(object_id).ok().flatten().is_some()
     }
 }
 
-/// 内存状态存储（用于测试和简单场景）
+/// In-memory state storage (used for testing and simple scenarios)
 #[derive(Debug, Clone)]
 pub struct InMemoryStateStore {
-    /// 对象存储: ObjectId -> Object
+    /// Object storage: ObjectId -> Object
     objects: HashMap<ObjectId, Object<CoinData>>,
-    /// 所有权索引: Address -> Vec<ObjectId>
+    /// Ownership index: Address -> Vec<ObjectId>
     ownership_index: HashMap<Address, Vec<ObjectId>>,
 }
 
 impl InMemoryStateStore {
-    /// 创建新的内存状态存储
+    /// Create new in-memory state storage
     pub fn new() -> Self {
         Self {
             objects: HashMap::new(),
@@ -43,28 +43,28 @@ impl InMemoryStateStore {
         }
     }
     
-    /// 更新所有权索引
+    /// Update ownership index
     fn update_ownership_index(&mut self, object_id: ObjectId, new_owner: &Address) {
-        // 从旧所有者的索引中移除
+        // Remove from the old owner's index
         for objects in self.ownership_index.values_mut() {
             objects.retain(|id| id != &object_id);
         }
         
-        // 添加到新所有者的索引
+        // Add to the new owner's index
         self.ownership_index
             .entry(new_owner.clone())
             .or_insert_with(Vec::new)
             .push(object_id);
     }
     
-    /// 从所有权索引中移除对象
+    /// Remove object from ownership index
     fn remove_from_ownership_index(&mut self, object_id: &ObjectId) {
         for objects in self.ownership_index.values_mut() {
             objects.retain(|id| id != object_id);
         }
     }
     
-    /// 获取总余额（用于测试）
+    /// Get total balance (used for testing)
     pub fn get_total_balance(&self, owner: &Address) -> u64 {
         self.get_owned_objects(owner)
             .unwrap_or_default()
@@ -87,12 +87,12 @@ impl StateStore for InMemoryStateStore {
     }
     
     fn set_object(&mut self, object_id: ObjectId, object: Object<CoinData>) -> RuntimeResult<()> {
-        // 更新所有权索引
+        // Update ownership index
         if let Some(owner) = &object.metadata.owner {
             self.update_ownership_index(object_id, owner);
         }
         
-        // 存储对象
+        // Store object
         self.objects.insert(object_id, object);
         Ok(())
     }
@@ -123,19 +123,19 @@ mod tests {
         let coin = setu_types::create_coin(owner.clone(), 1000);
         let coin_id = *coin.id();
         
-        // 设置对象
+        // Set object
         store.set_object(coin_id, coin.clone()).unwrap();
         
-        // 读取对象
+        // Read object
         let retrieved = store.get_object(&coin_id).unwrap().unwrap();
         assert_eq!(retrieved.id(), &coin_id);
         
-        // 检查所有权索引
+        // Check ownership index
         let owned = store.get_owned_objects(&owner).unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0], coin_id);
         
-        // 删除对象
+        // Delete object
         store.delete_object(&coin_id).unwrap();
         assert!(store.get_object(&coin_id).unwrap().is_none());
         

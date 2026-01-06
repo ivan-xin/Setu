@@ -1,4 +1,4 @@
-//! Runtime executor - 简单的状态转换执行器
+//! Runtime executor - Simple State Transition Executor
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
@@ -9,60 +9,60 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::state::StateStore;
 use crate::transaction::{Transaction, TransactionType, TransferTx, QueryTx, QueryType};
 
-/// 执行上下文
+/// Execution context
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
-    /// 执行者（通常是 solver）
+    /// Executor (usually the solver)
     pub executor_id: String,
-    /// 执行时间戳
+    /// Execution timestamp
     pub timestamp: u64,
-    /// 是否在 TEE 中执行（未来实现）
+    /// Whether executed in TEE (future implementation)
     pub in_tee: bool,
 }
 
-/// 执行输出
+/// Execution output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionOutput {
-    /// 是否成功
+    /// Whether the execution was successful
     pub success: bool,
-    /// 执行消息
+    /// Execution message
     pub message: Option<String>,
-    /// 状态变更列表
+    /// List of state changes
     pub state_changes: Vec<StateChange>,
-    /// 生成的新对象（如果有）
+    /// Newly created objects (if any)
     pub created_objects: Vec<ObjectId>,
-    /// 删除的对象（如果有）
+    /// Deleted objects (if any)
     pub deleted_objects: Vec<ObjectId>,
-    /// 查询结果（对于只读查询）
+    /// Query result (for read-only queries)
     pub query_result: Option<serde_json::Value>,
 }
 
-/// 状态变更记录
+/// State change record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateChange {
-    /// 变更类型
+    /// Change type
     pub change_type: StateChangeType,
-    /// 对象 ID
+    /// Object ID
     pub object_id: ObjectId,
-    /// 旧状态（序列化的对象数据）
+    /// Old state (serialized object data)
     pub old_state: Option<Vec<u8>>,
-    /// 新状态（序列化的对象数据）
+    /// New state (serialized object data)
     pub new_state: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StateChangeType {
-    /// 对象创建
+    /// Object creation
     Create,
-    /// 对象修改
+    /// Object modification
     Update,
-    /// 对象删除
+    /// Object deletion
     Delete,
 }
 
-/// Runtime 执行器
+/// Runtime executor
 pub struct RuntimeExecutor<S: StateStore> {
-    /// 状态存储
+    /// State storage
     state: S,
 }
 
