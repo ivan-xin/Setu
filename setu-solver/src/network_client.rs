@@ -5,16 +5,33 @@
 //! - Send heartbeats
 //! - Submit events to Validator
 
+use serde::{Serialize, Deserialize};
 use setu_rpc::{
     RegisterSolverRequest, RegisterSolverResponse,
     HeartbeatRequest, HeartbeatResponse,
     HttpRegistrationClient,
-    Result as RpcResult,
+    Result as RpcResult, RpcError,
 };
+use setu_types::event::Event;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn, error, debug};
+
+/// Submit Event Request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitEventRequest {
+    pub event: Event,
+}
+
+/// Submit Event Response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitEventResponse {
+    pub success: bool,
+    pub message: String,
+    pub event_id: Option<String>,
+    pub vlc_time: Option<u64>,
+}
 
 /// Solver network client configuration
 #[derive(Debug, Clone)]
@@ -178,6 +195,68 @@ impl SolverNetworkClient {
             .map_err(|e| setu_rpc::RpcError::Serialization(e.to_string()))?;
         
         Ok(response)
+    }
+    
+    /// Submit an event to the validator
+    pub async fn submit_event(&self, event: Event) -> RpcResult<SubmitEventResponse> {
+        info!(
+            solver_id = %self.config.solver_id,
+            event_id = %event.id,
+            event_type = %event.event_type.name(),
+            "Submitting event to validator"
+        );
+        
+        let request = SubmitEventRequest { event };
+        
+        let url = format!(
+            "http://{}:{}/api/v1/event",
+            self.config.validator_address,
+            self.config.validator_port
+        );
+        
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            error!(
+                status = %status,
+                body = %body,
+                "Failed to submit event"
+            );
+            return Err(RpcError::Network(format!("HTTP error: {} - {}", status, body)));
+        }
+        
+        let response: SubmitEventResponse = response
+            .json()
+            .await
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        
+        if response.success {
+            info!(
+                event_id = ?response.event_id,
+                vlc_time = ?response.vlc_time,
+                "Event submitted successfully"
+            );
+        } else {
+            warn!(
+                message = %response.message,
+                "Event submission failed"
+            );
+        }
+        
+        Ok(response)
+    }
+    
+    /// Get validator base URL
+    pub fn validator_url(&self) -> String {
+        format!("http://{}:{}", self.config.validator_address, self.config.validator_port)
     }
     
     /// Start the heartbeat loop

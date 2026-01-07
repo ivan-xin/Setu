@@ -10,7 +10,7 @@
 use core_types::{Transfer, TransferType, Vlc};
 use setu_core::NodeConfig;
 use setu_solver::{Solver, SolverNetworkClient, SolverNetworkConfig};
-use setu_types::event::{Event, EventType, ExecutionResult, StateChange};
+use setu_types::event::{Event, EventType, EventPayload, ExecutionResult, StateChange, SolverRegistration};
 use setu_vlc::{VLCSnapshot, VectorClock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,8 +208,9 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_client.start_heartbeat_loop().await;
     });
 
-    // Spawn event sender (sends events back to validator)
+    // Spawn event sender (sends events back to validator via HTTP)
     let solver_id = config.solver_id.clone();
+    let event_client = network_client.clone();
     let event_handle = tokio::spawn(async move {
         info!("[EVENT_TX] Event sender ready, waiting for execution results...");
         while let Some(event) = event_rx.recv().await {
@@ -222,8 +223,27 @@ async fn main() -> anyhow::Result<()> {
             info!("║  Status:     {:^44} ║", format!("{:?}", event.status));
             info!("╚════════════════════════════════════════════════════════════╝");
             
-            // TODO: Send event to validator via HTTP/RPC
-            info!("[EVENT_TX] Event ready to send to validator (HTTP forwarding not implemented)");
+            // Send event to validator via HTTP
+            info!("[EVENT_TX] Sending event to Validator...");
+            match event_client.submit_event(event.clone()).await {
+                Ok(response) => {
+                    if response.success {
+                        info!("╔════════════════════════════════════════════════════════════╗");
+                        info!("║              Event Accepted by Validator                   ║");
+                        info!("╠════════════════════════════════════════════════════════════╣");
+                        info!("║  Event ID:   {:^44} ║", response.event_id.as_deref().unwrap_or("N/A"));
+                        info!("║  VLC Time:   {:^44} ║", response.vlc_time.map(|v| v.to_string()).unwrap_or("N/A".to_string()));
+                        info!("║  Message:    {:^44} ║", &response.message[..44.min(response.message.len())]);
+                        info!("╚════════════════════════════════════════════════════════════╝");
+                    } else {
+                        error!("[EVENT_TX] Event rejected by Validator: {}", response.message);
+                    }
+                }
+                Err(e) => {
+                    error!("[EVENT_TX] Failed to send event to Validator: {}", e);
+                    error!("[EVENT_TX] Event {} will be retried later (not implemented)", event.id);
+                }
+            }
         }
     });
 

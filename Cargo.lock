@@ -2899,6 +2899,8 @@ dependencies = [
  "anyhow",
  "core-types",
  "reqwest",
+ "serde",
+ "serde_json",
  "setu-core",
  "setu-rpc",
  "setu-types",

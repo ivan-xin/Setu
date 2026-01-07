@@ -164,6 +164,8 @@ async fn main() -> anyhow::Result<()> {
     info!("║    GET  /api/v1/validators         - List validators       ║");
     info!("║    GET  /api/v1/health             - Health check          ║");
     info!("║    POST /api/v1/transfer           - Submit transfer       ║");
+    info!("║    POST /api/v1/event              - Submit event (Solver) ║");
+    info!("║    GET  /api/v1/events             - List events           ║");
     info!("╚════════════════════════════════════════════════════════════╝");
 
     // Run validator (this will block)

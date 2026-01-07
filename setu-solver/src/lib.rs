@@ -15,7 +15,7 @@ mod network_client;
 pub use executor::Executor;
 pub use dependency::{DependencyTracker, DependencyStats};
 pub use tee::{TeeEnvironment, TeeProof, EnclaveInfo};
-pub use network_client::{SolverNetworkClient, SolverNetworkConfig};
+pub use network_client::{SolverNetworkClient, SolverNetworkConfig, SubmitEventRequest, SubmitEventResponse};
 
 use core_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
