@@ -223,7 +223,7 @@ impl Validator {
             }
         } else {
             // Run with event handling only (legacy mode)
-            while let Some(event) = self.event_rx.recv().await {
+        while let Some(event) = self.event_rx.recv().await {
                 self.handle_event(event).await;
             }
         }
@@ -233,48 +233,48 @@ impl Validator {
     
     /// Handle an incoming event
     async fn handle_event(&mut self, event: Event) {
-        info!(
-            event_id = %event.id,
-            creator = %event.creator,
-            event_type = ?event.event_type,
-            "Received event"
-        );
-        
-        // Verify the event (comprehensive verification)
-        match self.verify_event_comprehensive(&event).await {
-            Ok(()) => {
-                info!(
-                    event_id = %event.id,
-                    "Event verified successfully"
-                );
-                
-                // Add to DAG (synchronous operation)
-                if let Err(e) = self.add_to_dag(event.clone()) {
-                    error!(
+            info!(
+                event_id = %event.id,
+                creator = %event.creator,
+                event_type = ?event.event_type,
+                "Received event"
+            );
+            
+            // Verify the event (comprehensive verification)
+            match self.verify_event_comprehensive(&event).await {
+                Ok(()) => {
+                    info!(
+                        event_id = %event.id,
+                        "Event verified successfully"
+                    );
+                    
+                    // Add to DAG (synchronous operation)
+                    if let Err(e) = self.add_to_dag(event.clone()) {
+                        error!(
+                            event_id = %event.id,
+                            error = %e,
+                            "Failed to add event to DAG"
+                        );
+                    return;
+                    }
+                    
+                    // Store the verified event
+                    self.verified_events.insert(event.id.clone(), event);
+                    
+                    info!(
+                        total_verified = self.verified_events.len(),
+                        dag_size = self.dag_manager.size(),
+                        "Event added to verified store and DAG"
+                    );
+                }
+                Err(e) => {
+                    warn!(
                         event_id = %event.id,
                         error = %e,
-                        "Failed to add event to DAG"
+                        "Event verification failed"
                     );
-                    return;
                 }
-                
-                // Store the verified event
-                self.verified_events.insert(event.id.clone(), event);
-                
-                info!(
-                    total_verified = self.verified_events.len(),
-                    dag_size = self.dag_manager.size(),
-                    "Event added to verified store and DAG"
-                );
             }
-            Err(e) => {
-                warn!(
-                    event_id = %event.id,
-                    error = %e,
-                    "Event verification failed"
-                );
-            }
-        }
     }
     
     /// Verify an event (legacy method, kept for compatibility)

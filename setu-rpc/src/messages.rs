@@ -198,6 +198,81 @@ pub struct GetNodeStatusResponse {
 }
 
 // ============================================
+// Transfer Request/Response Types
+// ============================================
+
+/// Request to submit a transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransferRequest {
+    /// Sender address
+    pub from: String,
+    /// Receiver address
+    pub to: String,
+    /// Amount to transfer
+    pub amount: i128,
+    /// Transfer type (flux, instant, etc.)
+    pub transfer_type: String,
+    /// Optional preferred solver
+    pub preferred_solver: Option<String>,
+    /// Optional shard assignment
+    pub shard_id: Option<String>,
+    /// Resources involved in this transfer
+    pub resources: Vec<String>,
+}
+
+/// Response to transfer submission
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransferResponse {
+    /// Whether submission was successful
+    pub success: bool,
+    /// Human-readable message
+    pub message: String,
+    /// Assigned transfer ID
+    pub transfer_id: Option<String>,
+    /// Assigned solver ID
+    pub solver_id: Option<String>,
+    /// Processing steps (for debugging/visualization)
+    pub processing_steps: Vec<ProcessingStep>,
+}
+
+/// A processing step in the transfer pipeline
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingStep {
+    /// Step name
+    pub step: String,
+    /// Step status
+    pub status: String,
+    /// Additional details
+    pub details: Option<String>,
+    /// Timestamp
+    pub timestamp: u64,
+}
+
+/// Request to get transfer status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTransferStatusRequest {
+    /// Transfer ID to query
+    pub transfer_id: String,
+}
+
+/// Response with transfer status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTransferStatusResponse {
+    /// Whether transfer was found
+    pub found: bool,
+    /// Transfer ID
+    pub transfer_id: String,
+    /// Current status
+    pub status: Option<String>,
+    /// Assigned solver
+    pub solver_id: Option<String>,
+    /// Event ID (if completed)
+    pub event_id: Option<String>,
+    /// Processing steps
+    pub processing_steps: Vec<ProcessingStep>,
+}
+
+// ============================================
 // Common Types
 // ============================================
 

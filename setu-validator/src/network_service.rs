@@ -9,7 +9,7 @@ use axum::{
     Router, Json,
     extract::State,
 };
-use core_types::Transfer;
+use core_types::{Transfer, TransferType, Vlc};
 use parking_lot::RwLock;
 use setu_rpc::{
     RegisterSolverRequest, RegisterSolverResponse,
@@ -19,15 +19,19 @@ use setu_rpc::{
     GetSolverListRequest, GetSolverListResponse,
     GetValidatorListRequest, GetValidatorListResponse,
     GetNodeStatusRequest, GetNodeStatusResponse,
+    SubmitTransferRequest, SubmitTransferResponse,
+    GetTransferStatusRequest, GetTransferStatusResponse,
+    ProcessingStep,
     SolverListItem, ValidatorListItem, NodeType,
     RegistrationHandler,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 
 /// Validator info for registration
 #[derive(Debug, Clone)]
@@ -64,6 +68,7 @@ impl Default for NetworkServiceConfig {
 /// - Validator registration  
 /// - Heartbeat
 /// - Status queries
+/// - Transfer submission
 pub struct ValidatorNetworkService {
     /// Validator ID
     validator_id: String,
@@ -77,11 +82,31 @@ pub struct ValidatorNetworkService {
     /// Solver channels for sending transfers
     solver_channels: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<Transfer>>>>,
     
+    /// Transfer tracking (transfer_id -> status)
+    transfer_status: Arc<RwLock<HashMap<String, TransferTracker>>>,
+    
     /// Configuration
     config: NetworkServiceConfig,
     
     /// Start time for uptime calculation
     start_time: u64,
+    
+    /// Transfer counter for generating IDs
+    transfer_counter: AtomicU64,
+    
+    /// VLC counter (simulated)
+    vlc_counter: AtomicU64,
+}
+
+/// Transfer tracking information
+#[derive(Debug, Clone)]
+pub struct TransferTracker {
+    pub transfer_id: String,
+    pub status: String,
+    pub solver_id: Option<String>,
+    pub event_id: Option<String>,
+    pub processing_steps: Vec<ProcessingStep>,
+    pub created_at: u64,
 }
 
 impl ValidatorNetworkService {
@@ -108,8 +133,11 @@ impl ValidatorNetworkService {
             router_manager,
             validators: Arc::new(RwLock::new(HashMap::new())),
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
+            transfer_status: Arc::new(RwLock::new(HashMap::new())),
             config,
             start_time,
+            transfer_counter: AtomicU64::new(0),
+            vlc_counter: AtomicU64::new(0),
         }
     }
     
@@ -130,6 +158,9 @@ impl ValidatorNetworkService {
             .route("/api/v1/solvers", get(http_get_solvers))
             .route("/api/v1/validators", get(http_get_validators))
             .route("/api/v1/health", get(http_health))
+            .route("/api/v1/transfer", post(http_submit_transfer))
+            .route("/api/v1/transfer/status", post(http_get_transfer_status))
+            .route("/api/v1/heartbeat", post(http_heartbeat))
             .with_state(service);
         
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -142,6 +173,234 @@ impl ValidatorNetworkService {
         axum::serve(listener, app).await?;
         
         Ok(())
+    }
+    
+    /// Submit a transfer (with simulated processing pipeline)
+    pub async fn submit_transfer(&self, request: SubmitTransferRequest) -> SubmitTransferResponse {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Generate transfer ID
+        let transfer_id = format!(
+            "tx-{}-{}",
+            now,
+            self.transfer_counter.fetch_add(1, Ordering::SeqCst)
+        );
+        
+        let mut steps = Vec::new();
+        
+        info!("╔════════════════════════════════════════════════════════════╗");
+        info!("║              Processing Transfer: {}              ║", &transfer_id[..20.min(transfer_id.len())]);
+        info!("╚════════════════════════════════════════════════════════════╝");
+        
+        // Step 1: Receive and validate
+        info!("[STEP 1/7] 📥 Receiving transfer request...");
+        info!("           From: {} → To: {}", request.from, request.to);
+        info!("           Amount: {}", request.amount);
+        info!("           Type: {}", request.transfer_type);
+        steps.push(ProcessingStep {
+            step: "receive".to_string(),
+            status: "completed".to_string(),
+            details: Some(format!("Transfer {} received", transfer_id)),
+            timestamp: now,
+        });
+        
+        // Step 2: VLC Assignment (Simulated)
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        info!("[STEP 2/7] ⏰ [VLC] Assigning Vector Logical Clock...");
+        info!("           └─ VLC Time: {} (simulated)", vlc_time);
+        info!("           └─ Node: {}", self.validator_id);
+        steps.push(ProcessingStep {
+            step: "vlc_assign".to_string(),
+            status: "completed".to_string(),
+            details: Some(format!("VLC time: {} (simulated)", vlc_time)),
+            timestamp: now,
+        });
+        
+        // Step 3: DAG Parent Resolution (Simulated)
+        info!("[STEP 3/7] 🔗 [DAG] Resolving parent events...");
+        info!("           └─ Checking resource dependencies: {:?}", request.resources);
+        info!("           └─ Parent events: [] (genesis or no conflicts)");
+        info!("           └─ DAG depth: 0 (simulated)");
+        steps.push(ProcessingStep {
+            step: "dag_resolve".to_string(),
+            status: "completed".to_string(),
+            details: Some("No parent conflicts (simulated)".to_string()),
+            timestamp: now,
+        });
+        
+        // Step 4: Router Selection
+        info!("[STEP 4/7] 🔀 Selecting solver via router...");
+        
+        // Create internal transfer
+        let mut vlc = Vlc::new();
+        vlc.entries.insert(self.validator_id.clone(), vlc_time);
+        
+        let transfer_type = match request.transfer_type.to_lowercase().as_str() {
+            "flux" | "fluxtransfer" => TransferType::FluxTransfer,
+            _ => TransferType::FluxTransfer,
+        };
+        
+        let transfer = Transfer {
+            id: transfer_id.clone(),
+            from: request.from.clone(),
+            to: request.to.clone(),
+            amount: request.amount,
+            transfer_type,
+            resources: if request.resources.is_empty() {
+                vec![format!("account:{}", request.from), format!("account:{}", request.to)]
+            } else {
+                request.resources.clone()
+            },
+            vlc,
+            power: 10,
+            preferred_solver: request.preferred_solver.clone(),
+            shard_id: request.shard_id.clone(),
+        };
+        
+        // Route to solver
+        let solver_result = self.router_manager.route_transfer(&transfer);
+        
+        let solver_id = match solver_result {
+            Ok(id) => {
+                info!("           └─ Selected solver: {}", id);
+                steps.push(ProcessingStep {
+                    step: "route".to_string(),
+                    status: "completed".to_string(),
+                    details: Some(format!("Routed to solver: {}", id)),
+                    timestamp: now,
+                });
+                Some(id)
+            }
+            Err(e) => {
+                warn!("           └─ No solver available: {}", e);
+                steps.push(ProcessingStep {
+                    step: "route".to_string(),
+                    status: "failed".to_string(),
+                    details: Some(format!("No solver available: {}", e)),
+                    timestamp: now,
+                });
+                
+                // Store failed transfer status
+                self.transfer_status.write().insert(transfer_id.clone(), TransferTracker {
+                    transfer_id: transfer_id.clone(),
+                    status: "failed".to_string(),
+                    solver_id: None,
+                    event_id: None,
+                    processing_steps: steps.clone(),
+                    created_at: now,
+                });
+                
+                return SubmitTransferResponse {
+                    success: false,
+                    message: format!("No solver available: {}", e),
+                    transfer_id: Some(transfer_id),
+                    solver_id: None,
+                    processing_steps: steps,
+                };
+            }
+        };
+        
+        // Step 5: Send to Solver
+        info!("[STEP 5/7] 📤 Dispatching to solver...");
+        if let Some(ref sid) = solver_id {
+            match self.router_manager.send_to_solver(sid, transfer).await {
+                Ok(()) => {
+                    info!("           └─ Transfer dispatched successfully");
+                    steps.push(ProcessingStep {
+                        step: "dispatch".to_string(),
+                        status: "completed".to_string(),
+                        details: Some("Transfer sent to solver".to_string()),
+                        timestamp: now,
+                    });
+                }
+                Err(e) => {
+                    error!("           └─ Dispatch failed: {}", e);
+                    steps.push(ProcessingStep {
+                        step: "dispatch".to_string(),
+                        status: "failed".to_string(),
+                        details: Some(format!("Dispatch error: {}", e)),
+                        timestamp: now,
+                    });
+                }
+            }
+        }
+        
+        // Step 6: Consensus Preparation (Simulated)
+        info!("[STEP 6/7] 🤝 [CONSENSUS] Preparing consensus...");
+        info!("           └─ Mode: Single validator (no consensus needed)");
+        info!("           └─ Validators: 1 (self)");
+        info!("           └─ Threshold: 1/1 (100%)");
+        steps.push(ProcessingStep {
+            step: "consensus_prepare".to_string(),
+            status: "completed".to_string(),
+            details: Some("Single validator mode - no consensus needed (simulated)".to_string()),
+            timestamp: now,
+        });
+        
+        // Step 7: FoldGraph Update (Simulated)
+        info!("[STEP 7/7] 📊 [FOLDGRAPH] Updating fold graph...");
+        info!("           └─ Current frame: 0");
+        info!("           └─ Events in frame: 1");
+        info!("           └─ Fold threshold: 100 events");
+        info!("           └─ Status: Not folding (below threshold)");
+        steps.push(ProcessingStep {
+            step: "foldgraph_update".to_string(),
+            status: "completed".to_string(),
+            details: Some("FoldGraph updated (simulated)".to_string()),
+            timestamp: now,
+        });
+        
+        info!("╔════════════════════════════════════════════════════════════╗");
+        info!("║              Transfer Submitted Successfully               ║");
+        info!("╠════════════════════════════════════════════════════════════╣");
+        info!("║  Transfer ID: {:^44} ║", &transfer_id);
+        info!("║  Solver:      {:^44} ║", solver_id.as_deref().unwrap_or("N/A"));
+        info!("║  Status:      {:^44} ║", "pending_execution");
+        info!("╚════════════════════════════════════════════════════════════╝");
+        
+        // Store transfer status
+        self.transfer_status.write().insert(transfer_id.clone(), TransferTracker {
+            transfer_id: transfer_id.clone(),
+            status: "pending_execution".to_string(),
+            solver_id: solver_id.clone(),
+            event_id: None,
+            processing_steps: steps.clone(),
+            created_at: now,
+        });
+        
+        SubmitTransferResponse {
+            success: true,
+            message: "Transfer submitted successfully".to_string(),
+            transfer_id: Some(transfer_id),
+            solver_id,
+            processing_steps: steps,
+        }
+    }
+    
+    /// Get transfer status
+    pub fn get_transfer_status(&self, transfer_id: &str) -> GetTransferStatusResponse {
+        if let Some(tracker) = self.transfer_status.read().get(transfer_id) {
+            GetTransferStatusResponse {
+                found: true,
+                transfer_id: tracker.transfer_id.clone(),
+                status: Some(tracker.status.clone()),
+                solver_id: tracker.solver_id.clone(),
+                event_id: tracker.event_id.clone(),
+                processing_steps: tracker.processing_steps.clone(),
+            }
+        } else {
+            GetTransferStatusResponse {
+                found: false,
+                transfer_id: transfer_id.to_string(),
+                status: None,
+                solver_id: None,
+                event_id: None,
+                processing_steps: vec![],
+            }
+        }
     }
     
     /// Register a solver internally (creates channel)
@@ -562,6 +821,28 @@ async fn http_get_validators(
     Json(handler.get_validator_list(GetValidatorListRequest {
         status_filter: None,
     }).await)
+}
+
+async fn http_submit_transfer(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<SubmitTransferRequest>,
+) -> Json<SubmitTransferResponse> {
+    Json(service.submit_transfer(request).await)
+}
+
+async fn http_get_transfer_status(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<GetTransferStatusRequest>,
+) -> Json<GetTransferStatusResponse> {
+    Json(service.get_transfer_status(&request.transfer_id))
+}
+
+async fn http_heartbeat(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    Json(request): Json<HeartbeatRequest>,
+) -> Json<HeartbeatResponse> {
+    let handler = service.registration_handler();
+    Json(handler.heartbeat(request).await)
 }
 
 async fn http_health(
