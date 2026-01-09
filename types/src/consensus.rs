@@ -3,6 +3,7 @@ use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 
 use crate::event::{EventId, VLCSnapshot};
+use crate::merkle::AnchorMerkleRoots;
 
 #[allow(unused_imports)]
 use crate::event::VectorClock;
@@ -10,18 +11,25 @@ use crate::event::VectorClock;
 pub type AnchorId = String;
 pub type CFId = String;
 
+/// Anchor represents a checkpoint in the DAG that commits to a set of events
+/// and the resulting state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Anchor {
     pub id: AnchorId,
     pub event_ids: Vec<EventId>,
     pub vlc_snapshot: VLCSnapshot,
+    /// Legacy state root (for backward compatibility)
     pub state_root: String,
+    /// Full Merkle roots (new field)
+    #[serde(default)]
+    pub merkle_roots: Option<AnchorMerkleRoots>,
     pub previous_anchor: Option<AnchorId>,
     pub depth: u64,
     pub timestamp: u64,
 }
 
 impl Anchor {
+    /// Create a new anchor with legacy state_root (backward compatible)
     pub fn new(
         event_ids: Vec<EventId>,
         vlc_snapshot: VLCSnapshot,
@@ -41,6 +49,36 @@ impl Anchor {
             event_ids,
             vlc_snapshot,
             state_root,
+            merkle_roots: None,
+            previous_anchor,
+            depth,
+            timestamp,
+        }
+    }
+    
+    /// Create a new anchor with full Merkle roots
+    pub fn with_merkle_roots(
+        event_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        merkle_roots: AnchorMerkleRoots,
+        previous_anchor: Option<AnchorId>,
+        depth: u64,
+    ) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Use global_state_root as the legacy state_root
+        let state_root = hex::encode(&merkle_roots.global_state_root);
+        let id = Self::compute_id(&event_ids, &vlc_snapshot, &state_root, timestamp);
+
+        Self {
+            id,
+            event_ids,
+            vlc_snapshot,
+            state_root,
+            merkle_roots: Some(merkle_roots),
             previous_anchor,
             depth,
             timestamp,
@@ -65,6 +103,33 @@ impl Anchor {
 
     pub fn event_count(&self) -> usize {
         self.event_ids.len()
+    }
+    
+    /// Get the global state root (from merkle_roots if available)
+    pub fn global_state_root(&self) -> Option<&[u8; 32]> {
+        self.merkle_roots.as_ref().map(|m| &m.global_state_root)
+    }
+    
+    /// Get the events root
+    pub fn events_root(&self) -> Option<&[u8; 32]> {
+        self.merkle_roots.as_ref().map(|m| &m.events_root)
+    }
+    
+    /// Get the anchor chain root
+    pub fn anchor_chain_root(&self) -> Option<&[u8; 32]> {
+        self.merkle_roots.as_ref().map(|m| &m.anchor_chain_root)
+    }
+    
+    /// Check if this anchor has full Merkle roots
+    pub fn has_merkle_roots(&self) -> bool {
+        self.merkle_roots.is_some()
+    }
+    
+    /// Get a specific subnet's state root
+    pub fn get_subnet_root(&self, subnet_id: &crate::subnet::SubnetId) -> Option<&[u8; 32]> {
+        self.merkle_roots
+            .as_ref()
+            .and_then(|m| m.get_subnet_root(subnet_id))
     }
 }
 
