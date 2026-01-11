@@ -12,7 +12,16 @@ pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
 
 // Export commonly used types
-pub use event::{Event, EventId, EventStatus, EventType, Transfer};
+pub use event::{
+    Event, EventId, EventStatus, EventType, EventPayload, Transfer,
+    ExecutionResult, StateChange,
+    // Registration types
+    ValidatorRegistration, SolverRegistration, Unregistration,
+    SubnetRegistration, SubnetResourceLimits, SubnetType,
+    UserRegistration,
+    // Other payload types
+    PowerConsumption, TaskSubmission,
+};
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
 pub use node::*;
 

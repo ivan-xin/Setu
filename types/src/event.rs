@@ -58,6 +58,78 @@ pub struct Unregistration {
     pub node_type: String, // "validator" or "solver"
 }
 
+/// Subnet registration data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetRegistration {
+    /// Unique subnet identifier (will be assigned if not provided)
+    pub subnet_id: String,
+    /// Human-readable name for the subnet
+    pub name: String,
+    /// Description of the subnet's purpose
+    pub description: Option<String>,
+    /// Owner/creator of the subnet
+    pub owner: String,
+    /// Maximum number of users allowed (None = unlimited)
+    pub max_users: Option<u64>,
+    /// Resource limits for the subnet
+    pub resource_limits: Option<SubnetResourceLimits>,
+    /// List of Solver IDs assigned to this subnet
+    pub assigned_solvers: Vec<String>,
+    /// Subnet type (application, organization, etc.)
+    pub subnet_type: SubnetType,
+    /// Parent subnet ID (None = root subnet)
+    pub parent_subnet_id: Option<String>,
+}
+
+/// Subnet resource limits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetResourceLimits {
+    /// Maximum transactions per second
+    pub max_tps: Option<u64>,
+    /// Maximum storage in bytes
+    pub max_storage_bytes: Option<u64>,
+    /// Maximum compute units per transaction
+    pub max_compute_units: Option<u64>,
+}
+
+/// Subnet type enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubnetType {
+    /// Root subnet (subnet-0, created at genesis)
+    Root,
+    /// Application subnet (for a specific dApp)
+    Application,
+    /// Organization subnet (for a company/DAO)
+    Organization,
+    /// Personal subnet (for individual users)
+    Personal,
+    /// System subnet (for internal operations)
+    System,
+}
+
+impl Default for SubnetType {
+    fn default() -> Self {
+        SubnetType::Application
+    }
+}
+
+/// User registration data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRegistration {
+    /// User's unique identifier (address/public key hash)
+    pub user_id: String,
+    /// User's public key for authentication
+    pub public_key: Vec<u8>,
+    /// Subnet ID to register in (None = root subnet)
+    pub subnet_id: Option<String>,
+    /// Optional display name
+    pub display_name: Option<String>,
+    /// Optional metadata (JSON string)
+    pub metadata: Option<String>,
+    /// Initial power allocation
+    pub initial_power: Option<u64>,
+}
+
 pub type EventId = String;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,6 +159,10 @@ pub enum EventType {
     SolverRegister,
     /// Solver unregistration event
     SolverUnregister,
+    /// Subnet registration event (create a new subnet)
+    SubnetRegister,
+    /// User registration event (register a user in a subnet)
+    UserRegister,
     /// Power consumption event
     PowerConsume,
     /// Task submission event
@@ -107,6 +183,8 @@ impl EventType {
                 | EventType::ValidatorUnregister
                 | EventType::SolverRegister
                 | EventType::SolverUnregister
+                | EventType::SubnetRegister
+                | EventType::UserRegister
                 | EventType::PowerConsume
                 | EventType::TaskSubmit
         )
@@ -122,6 +200,8 @@ impl EventType {
             EventType::ValidatorUnregister => "ValidatorUnregister",
             EventType::SolverRegister => "SolverRegister",
             EventType::SolverUnregister => "SolverUnregister",
+            EventType::SubnetRegister => "SubnetRegister",
+            EventType::UserRegister => "UserRegister",
             EventType::PowerConsume => "PowerConsume",
             EventType::TaskSubmit => "TaskSubmit",
             EventType::AgentChat => "AgentChat",
@@ -139,6 +219,8 @@ pub enum EventPayload {
     ValidatorUnregister(Unregistration),
     SolverRegister(SolverRegistration),
     SolverUnregister(Unregistration),
+    SubnetRegister(SubnetRegistration),
+    UserRegister(UserRegistration),
     PowerConsume(PowerConsumption),
     TaskSubmit(TaskSubmission),
 }
@@ -295,6 +377,30 @@ impl Event {
         event.payload = EventPayload::TaskSubmit(task);
         event
     }
+    
+    /// Create a subnet registration event
+    pub fn subnet_register(
+        registration: SubnetRegistration,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::SubnetRegister, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::SubnetRegister(registration);
+        event
+    }
+    
+    /// Create a user registration event
+    pub fn user_register(
+        registration: UserRegistration,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::UserRegister, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::UserRegister(registration);
+        event
+    }
 
     fn compute_id(
         parent_ids: &[EventId],
@@ -355,7 +461,10 @@ impl Event {
     pub fn is_registration(&self) -> bool {
         matches!(
             self.event_type,
-            EventType::ValidatorRegister | EventType::SolverRegister
+            EventType::ValidatorRegister 
+                | EventType::SolverRegister
+                | EventType::SubnetRegister
+                | EventType::UserRegister
         )
     }
     
@@ -381,6 +490,16 @@ impl Event {
             }
             EventPayload::ValidatorUnregister(u) | EventPayload::SolverUnregister(u) => {
                 vec![format!("node:{}", u.node_id)]
+            }
+            EventPayload::SubnetRegister(s) => {
+                vec![format!("subnet:{}", s.subnet_id)]
+            }
+            EventPayload::UserRegister(u) => {
+                let subnet = u.subnet_id.as_deref().unwrap_or("subnet-0");
+                vec![
+                    format!("user:{}", u.user_id),
+                    format!("subnet:{}", subnet),
+                ]
             }
             EventPayload::PowerConsume(p) => {
                 vec![format!("power:{}", p.user_id)]
@@ -474,7 +593,85 @@ mod tests {
         assert!(EventType::Transfer.requires_solver_execution());
         assert!(EventType::SolverRegister.requires_solver_execution());
         assert!(EventType::ValidatorRegister.requires_solver_execution());
+        assert!(EventType::SubnetRegister.requires_solver_execution());
+        assert!(EventType::UserRegister.requires_solver_execution());
         assert!(!EventType::Genesis.requires_solver_execution());
         assert!(!EventType::System.requires_solver_execution());
+    }
+    
+    #[test]
+    fn test_subnet_register_event() {
+        let registration = SubnetRegistration {
+            subnet_id: "subnet-1".to_string(),
+            name: "DeFi App".to_string(),
+            description: Some("A DeFi application subnet".to_string()),
+            owner: "alice".to_string(),
+            max_users: Some(10000),
+            resource_limits: Some(SubnetResourceLimits {
+                max_tps: Some(1000),
+                max_storage_bytes: Some(1024 * 1024 * 1024),
+                max_compute_units: Some(100000),
+            }),
+            assigned_solvers: vec!["solver-1".to_string(), "solver-2".to_string()],
+            subnet_type: SubnetType::Application,
+            parent_subnet_id: None,
+        };
+        let event = Event::subnet_register(
+            registration,
+            vec![],
+            create_vlc_snapshot(),
+            "alice".to_string(),
+        );
+        assert_eq!(event.event_type, EventType::SubnetRegister);
+        assert!(event.is_registration());
+        
+        let resources = event.affected_resources();
+        assert!(resources.contains(&"subnet:subnet-1".to_string()));
+    }
+    
+    #[test]
+    fn test_user_register_event() {
+        let registration = UserRegistration {
+            user_id: "user-alice-123".to_string(),
+            public_key: vec![1, 2, 3, 4],
+            subnet_id: Some("subnet-1".to_string()),
+            display_name: Some("Alice".to_string()),
+            metadata: None,
+            initial_power: Some(100),
+        };
+        let event = Event::user_register(
+            registration,
+            vec![],
+            create_vlc_snapshot(),
+            "user-alice-123".to_string(),
+        );
+        assert_eq!(event.event_type, EventType::UserRegister);
+        assert!(event.is_registration());
+        
+        let resources = event.affected_resources();
+        assert!(resources.contains(&"user:user-alice-123".to_string()));
+        assert!(resources.contains(&"subnet:subnet-1".to_string()));
+    }
+    
+    #[test]
+    fn test_user_register_default_subnet() {
+        let registration = UserRegistration {
+            user_id: "user-bob-456".to_string(),
+            public_key: vec![5, 6, 7, 8],
+            subnet_id: None, // Should default to subnet-0
+            display_name: None,
+            metadata: None,
+            initial_power: None,
+        };
+        let event = Event::user_register(
+            registration,
+            vec![],
+            create_vlc_snapshot(),
+            "user-bob-456".to_string(),
+        );
+        
+        let resources = event.affected_resources();
+        assert!(resources.contains(&"user:user-bob-456".to_string()));
+        assert!(resources.contains(&"subnet:subnet-0".to_string())); // Default to root subnet
     }
 }

@@ -219,14 +219,27 @@ impl Solver {
     }
     
     /// Update VLC and return snapshot
-    fn update_vlc(&mut self, _transfer: &Transfer) -> VLCSnapshot {
-        // Increment logical clock
+    /// 
+    /// NOTE: In the new architecture, VLC is managed by Validator.
+    /// Solver should use the assigned_vlc from Transfer when available.
+    fn update_vlc(&mut self, transfer: &Transfer) -> VLCSnapshot {
+        // Check if Validator assigned a VLC
+        if let Some(ref assigned) = transfer.assigned_vlc {
+            // Use Validator-assigned VLC
+            let mut vlc = VectorClock::new();
+            vlc.increment(&assigned.validator_id);
+            
+            return VLCSnapshot {
+                vector_clock: vlc,
+                logical_time: assigned.logical_time,
+                physical_time: assigned.physical_time,
+            };
+        }
+        
+        // Fallback: Increment local clock (for backward compatibility)
+        // This should not happen in normal operation
         self.vlc.increment(&self.config.node_id);
         
-        // Note: We would merge with transfer's VLC here if Transfer had a VectorClock field
-        // For now, we just increment our own clock
-        
-        // Create snapshot
         let mut snapshot = VLCSnapshot::new_with_clock(self.vlc.clone());
         snapshot.logical_time += 1;
         snapshot
