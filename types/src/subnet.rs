@@ -35,7 +35,27 @@ use std::fmt;
 
 use crate::object::Address;
 
+/// Subnet type classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubnetType {
+    /// ROOT subnet (SubnetId = 0)
+    Root,
+    /// System reserved subnets (type byte = 0x01)
+    SystemReserved,
+    /// Application subnets (type byte = 0x02)
+    App,
+    /// Unknown/invalid type
+    Unknown,
+}
+
 /// Unique identifier for a subnet (32 bytes)
+/// 
+/// # Encoding
+/// 
+/// SubnetId uses first byte as type marker:
+/// - `0x00`: ROOT subnet (all zeros)
+/// - `0x01`: System reserved subnets
+/// - `0x02`: Application subnets
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub struct SubnetId([u8; 32]);
 
@@ -43,12 +63,19 @@ impl SubnetId {
     /// The root/system subnet (for global operations)
     pub const ROOT: SubnetId = SubnetId([0u8; 32]);
     
+    /// Type byte for system reserved subnets
+    pub const SYSTEM_PREFIX: u8 = 0x01;
+    
+    /// Type byte for application subnets
+    pub const APP_PREFIX: u8 = 0x02;
+    
     /// Create from raw bytes
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
     
     /// Create from a string identifier (hashes the string)
+    /// Note: This creates an APP type subnet by default
     pub fn from_str_id(id: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"SUBNET:");
@@ -56,6 +83,43 @@ impl SubnetId {
         let result = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&result);
+        // Mark as APP subnet
+        bytes[0] = Self::APP_PREFIX;
+        Self(bytes)
+    }
+    
+    /// Create a new app subnet ID from creator address, name and nonce
+    pub fn new_app(creator: &Address, name: &str, nonce: u64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(&[Self::APP_PREFIX]);
+        hasher.update(creator.as_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(nonce.to_le_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes[0] = Self::APP_PREFIX;
+        bytes[1..].copy_from_slice(&result[..31]);
+        Self(bytes)
+    }
+    
+    /// Create a simple app subnet for testing (uses id as seed)
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_app_simple(id: u64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(&[Self::APP_PREFIX]);
+        hasher.update(id.to_le_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes[0] = Self::APP_PREFIX;
+        bytes[1..].copy_from_slice(&result[..31]);
+        Self(bytes)
+    }
+    
+    /// Create a system reserved subnet
+    pub fn new_system(id: u8) -> Self {
+        let mut bytes = [0u8; 32];
+        bytes[0] = Self::SYSTEM_PREFIX;
+        bytes[1] = id;
         Self(bytes)
     }
     
@@ -75,6 +139,11 @@ impl SubnetId {
         &self.0
     }
     
+    /// Get owned copy of bytes
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+    
     /// Get shard hint - first 2 bytes can be used for shard routing
     pub fn shard_hint(&self) -> u16 {
         u16::from_be_bytes([self.0[0], self.0[1]])
@@ -83,6 +152,31 @@ impl SubnetId {
     /// Check if this is the root subnet
     pub fn is_root(&self) -> bool {
         *self == Self::ROOT
+    }
+    
+    /// Check if this is a system/reserved subnet (type byte = 0x00 or 0x01)
+    pub fn is_system(&self) -> bool {
+        self.0[0] <= Self::SYSTEM_PREFIX
+    }
+    
+    /// Check if this is an app subnet (type byte = 0x02)
+    pub fn is_app(&self) -> bool {
+        self.0[0] == Self::APP_PREFIX
+    }
+    
+    /// Get the type of this subnet
+    pub fn subnet_type(&self) -> SubnetType {
+        match self.0[0] {
+            0x00 if *self == Self::ROOT => SubnetType::Root,
+            0x00 | 0x01 => SubnetType::SystemReserved,
+            0x02 => SubnetType::App,
+            _ => SubnetType::Unknown,
+        }
+    }
+    
+    /// Get the type byte
+    pub fn type_byte(&self) -> u8 {
+        self.0[0]
     }
 }
 

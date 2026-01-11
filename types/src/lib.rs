@@ -4,6 +4,7 @@ pub mod consensus;
 pub mod node;
 pub mod object;
 pub mod subnet;          // Subnet (sub-application) types
+pub mod merkle;          // Merkle tree types for state commitment
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -17,7 +18,7 @@ pub use event::{
     ExecutionResult, StateChange,
     // Registration types
     ValidatorRegistration, SolverRegistration, Unregistration,
-    SubnetRegistration, SubnetResourceLimits, SubnetType,
+    SubnetRegistration, SubnetResourceLimits,
     UserRegistration,
     // Other payload types
     PowerConsumption, TaskSubmission,
@@ -48,7 +49,14 @@ pub use relation::{
 };
 
 // Subnet related
-pub use subnet::{SubnetId, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
+pub use subnet::{SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
+
+// Merkle tree types
+pub use merkle::{
+    HashValue, ObjectStateValue, SubnetStateRoot, AnchorMerkleRoots,
+    MerkleExecutionResult, CrossSubnetLock, CrossSubnetLockStatus,
+    object_type, ZERO_HASH,
+};
 
 // Aggregated views
 pub use account_view::AccountView;

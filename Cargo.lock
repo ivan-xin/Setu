@@ -641,6 +641,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "setu-merkle",
  "setu-types",
  "setu-vlc",
  "sha2 0.10.9",
@@ -2937,6 +2938,7 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
+ "setu-merkle",
  "setu-types",
  "sha2 0.10.9",
  "tempfile",
