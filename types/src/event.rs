@@ -128,6 +128,10 @@ pub struct UserRegistration {
     pub metadata: Option<String>,
     /// Initial power allocation
     pub initial_power: Option<u64>,
+    /// Inviter's address (who invited this user)
+    pub invited_by: Option<String>,
+    /// Invite code used for registration
+    pub invite_code: Option<String>,
 }
 
 pub type EventId = String;

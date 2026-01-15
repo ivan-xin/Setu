@@ -1,12 +1,39 @@
 //! RelationGraph Object - Social Relationship Graph
 //! 
 //! Design Philosophy:
-//! - RelationGraph is a resource object owned by SBT
-//! - One SBT can have multiple RelationGraphs (friend circle, work circle, etc.)
-//! - RelationGraph stores relationships to other SBTs
+//! - RelationGraph is a resource object owned by Address
+//! - One Address can have multiple RelationGraphs (friend circle, work circle, etc.)
+//! - RelationGraph stores relationships to other users
+//! - UserRelationNetwork is a specialized structure for user registration
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use crate::object::{Object, ObjectId, Address, generate_object_id};
+use crate::subnet::SubnetId;
+
+// ============================================================================
+// Relation Type Constants
+// ============================================================================
+
+/// Predefined relation type constants
+pub mod relation_type {
+    /// Invited by - who invited this user to register
+    pub const INVITED_BY: &str = "invited_by";
+    /// Invited - users this user has invited
+    pub const INVITED: &str = "invited";
+    /// Chatted - users this user has chatted with
+    pub const CHATTED: &str = "chatted";
+    /// Trusted - users this user trusts
+    pub const TRUSTED: &str = "trusted";
+    /// Follows - users this user follows
+    pub const FOLLOWS: &str = "follows";
+    /// Friend - mutual friendship (bidirectional)
+    pub const FRIEND: &str = "friend";
+    /// Collaborated - users collaborated with in tasks
+    pub const COLLABORATED: &str = "collaborated";
+    /// Traded - users traded with
+    pub const TRADED: &str = "traded";
+}
 
 /// Relationship edge
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
