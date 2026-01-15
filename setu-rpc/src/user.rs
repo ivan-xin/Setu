@@ -2,9 +2,9 @@
 //!
 //! This module provides RPC interfaces for:
 //! - User registration
-//! - Account queries (Flux, Power, Dread balances)
-//! - Relation network queries
-//! - Subnet membership queries
+//! - Account queries (Flux, Power, Credit balances)
+//! - Credential queries
+//! - Transfer operations
 //!
 //! These APIs are designed to be consumed by:
 //! - Wallet plugins (like MetaMask-style browser extensions)
@@ -87,14 +87,10 @@ pub struct GetAccountResponse {
     pub flux_balance: u64,
     /// Power value (computational/voting power)
     pub power: u64,
-    /// Dread value (reputation/penalty score)
-    pub dread: u64,
+    /// Credit value (reputation score)
+    pub credit: u64,
     /// User profile information
     pub profile: Option<ProfileInfo>,
-    /// Number of relations in the user's network
-    pub relation_count: u64,
-    /// Number of subnets the user has joined
-    pub subnet_count: u64,
     /// Number of credentials the user holds
     pub credential_count: u64,
 }
@@ -167,31 +163,31 @@ pub struct PowerChange {
     pub event_id: Option<String>,
 }
 
-/// Request to get user dread
+/// Request to get user credit
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetDreadRequest {
+pub struct GetCreditRequest {
     /// User's address
     pub address: String,
 }
 
-/// Response with user dread information
+/// Response with user credit information
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetDreadResponse {
+pub struct GetCreditResponse {
     /// Whether the account was found
     pub found: bool,
     /// User's address
     pub address: String,
-    /// Current dread value
-    pub dread: u64,
-    /// Dread level/tier
+    /// Current credit value
+    pub credit: u64,
+    /// Credit level/tier
     pub level: Option<String>,
-    /// Recent dread changes
-    pub recent_changes: Vec<DreadChange>,
+    /// Recent credit changes
+    pub recent_changes: Vec<CreditChange>,
 }
 
-/// A dread change record
+/// A credit change record
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DreadChange {
+pub struct CreditChange {
     /// Amount changed
     pub amount: i64,
     /// Reason for change
@@ -200,55 +196,6 @@ pub struct DreadChange {
     pub timestamp: u64,
     /// Related event ID
     pub event_id: Option<String>,
-}
-
-// ============================================================================
-// Relation Network Queries
-// ============================================================================
-
-/// Request to get user relations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetRelationsRequest {
-    /// User's address
-    pub address: String,
-    /// Optional filter by relation type
-    pub relation_type: Option<String>,
-    /// Maximum number of relations to return
-    pub limit: Option<u32>,
-    /// Offset for pagination
-    pub offset: Option<u32>,
-}
-
-/// A relation in the user's network
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelationInfo {
-    /// Target user's address
-    pub target_address: String,
-    /// Target user's display name (if available)
-    pub target_display_name: Option<String>,
-    /// Relation type
-    pub relation_type: String,
-    /// Relation weight/strength
-    pub weight: u32,
-    /// When the relation was established
-    pub established_at: u64,
-}
-
-/// Response with user relations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetRelationsResponse {
-    /// Whether the account was found
-    pub found: bool,
-    /// User's address
-    pub address: String,
-    /// Relations list
-    pub relations: Vec<RelationInfo>,
-    /// Total relation count (for pagination)
-    pub total_count: u64,
-    /// Inviter information (if any)
-    pub invited_by: Option<String>,
-    /// Number of users this user has invited
-    pub invite_count: u64,
 }
 
 // ============================================================================
@@ -299,49 +246,6 @@ pub struct GetCredentialsResponse {
 }
 
 // ============================================================================
-// Subnet Queries
-// ============================================================================
-
-/// Request to get user's subnet memberships
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetSubnetsRequest {
-    /// User's address
-    pub address: String,
-}
-
-/// Subnet membership information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubnetMembershipInfo {
-    /// Subnet ID
-    pub subnet_id: String,
-    /// Subnet name
-    pub subnet_name: Option<String>,
-    /// When the user joined
-    pub joined_at: u64,
-    /// Last activity timestamp
-    pub last_activity: u64,
-    /// Whether this is the user's primary subnet
-    pub is_primary: bool,
-    /// Number of interactions in this subnet
-    pub interaction_count: u64,
-    /// Number of local relations in this subnet
-    pub local_relation_count: u64,
-}
-
-/// Response with user's subnet memberships
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetSubnetsResponse {
-    /// Whether the account was found
-    pub found: bool,
-    /// User's address
-    pub address: String,
-    /// Subnet memberships
-    pub subnets: Vec<SubnetMembershipInfo>,
-    /// Primary subnet ID
-    pub primary_subnet: Option<String>,
-}
-
-// ============================================================================
 // Transfer Operations
 // ============================================================================
 
@@ -376,36 +280,6 @@ pub struct TransferResponse {
 }
 
 // ============================================================================
-// Relation Operations
-// ============================================================================
-
-/// Request to add a relation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddRelationRequest {
-    /// User's address (who is adding the relation)
-    pub from: String,
-    /// Target user's address
-    pub to: String,
-    /// Relation type
-    pub relation_type: String,
-    /// Optional weight (default: 50)
-    pub weight: Option<u32>,
-    /// Signature for authentication
-    pub signature: Vec<u8>,
-}
-
-/// Response to add relation request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddRelationResponse {
-    /// Whether the relation was added successfully
-    pub success: bool,
-    /// Human-readable message
-    pub message: String,
-    /// Event ID for this operation
-    pub event_id: Option<String>,
-}
-
-// ============================================================================
 // User RPC Handler Trait
 // ============================================================================
 
@@ -431,31 +305,18 @@ pub trait UserRpcHandler: Send + Sync {
     /// Get user power
     async fn get_power(&self, request: GetPowerRequest) -> GetPowerResponse;
     
-    /// Get user dread
-    async fn get_dread(&self, request: GetDreadRequest) -> GetDreadResponse;
-    
-    // ========== Relation Queries ==========
-    
-    /// Get user relations
-    async fn get_relations(&self, request: GetRelationsRequest) -> GetRelationsResponse;
+    /// Get user credit
+    async fn get_credit(&self, request: GetCreditRequest) -> GetCreditResponse;
     
     // ========== Credential Queries ==========
     
     /// Get user credentials
     async fn get_credentials(&self, request: GetCredentialsRequest) -> GetCredentialsResponse;
     
-    // ========== Subnet Queries ==========
-    
-    /// Get user's subnet memberships
-    async fn get_subnets(&self, request: GetSubnetsRequest) -> GetSubnetsResponse;
-    
     // ========== Operations ==========
     
     /// Transfer Flux to another user
     async fn transfer(&self, request: TransferRequest) -> TransferResponse;
-    
-    /// Add a relation to another user
-    async fn add_relation(&self, request: AddRelationRequest) -> AddRelationResponse;
 }
 
 // ============================================================================
@@ -469,12 +330,9 @@ pub enum UserRpcRequest {
     GetAccount(GetAccountRequest),
     GetBalance(GetBalanceRequest),
     GetPower(GetPowerRequest),
-    GetDread(GetDreadRequest),
-    GetRelations(GetRelationsRequest),
+    GetCredit(GetCreditRequest),
     GetCredentials(GetCredentialsRequest),
-    GetSubnets(GetSubnetsRequest),
     Transfer(TransferRequest),
-    AddRelation(AddRelationRequest),
 }
 
 /// Wrapper enum for all user RPC response types
@@ -484,12 +342,9 @@ pub enum UserRpcResponse {
     GetAccount(GetAccountResponse),
     GetBalance(GetBalanceResponse),
     GetPower(GetPowerResponse),
-    GetDread(GetDreadResponse),
-    GetRelations(GetRelationsResponse),
+    GetCredit(GetCreditResponse),
     GetCredentials(GetCredentialsResponse),
-    GetSubnets(GetSubnetsResponse),
     Transfer(TransferResponse),
-    AddRelation(AddRelationResponse),
     Error(String),
 }
 
@@ -555,15 +410,13 @@ mod tests {
             address: "0x123".to_string(),
             flux_balance: 1000,
             power: 50,
-            dread: 0,
+            credit: 100,
             profile: Some(ProfileInfo {
                 display_name: Some("Alice".to_string()),
                 avatar_url: None,
                 bio: Some("Hello!".to_string()),
                 created_at: 1234567890,
             }),
-            relation_count: 10,
-            subnet_count: 2,
             credential_count: 1,
         };
         
@@ -576,9 +429,9 @@ mod tests {
                 assert!(resp.found);
                 assert_eq!(resp.flux_balance, 1000);
                 assert_eq!(resp.power, 50);
+                assert_eq!(resp.credit, 100);
             }
             _ => panic!("Wrong response type"),
         }
     }
 }
-
