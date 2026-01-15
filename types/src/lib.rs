@@ -52,7 +52,11 @@ pub use relation::{
 };
 
 // Subnet related
-pub use subnet::{SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
+pub use subnet::{
+    SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext,
+    // Subnet interaction tracking
+    InteractionType, SubnetInteraction, LocalRelation, UserSubnetActivity,
+};
 
 // Merkle tree types
 pub use merkle::{

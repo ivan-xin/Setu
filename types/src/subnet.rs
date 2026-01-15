@@ -326,6 +326,264 @@ impl UserSubnetMembership {
     }
 }
 
+// ============================================================================
+// Subnet Interaction Tracking
+// ============================================================================
+
+/// Interaction type within a subnet
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InteractionType {
+    /// Chat/message interaction
+    Chat,
+    /// Trade/exchange interaction
+    Trade,
+    /// Collaboration on a task
+    Collaborate,
+    /// Following another user
+    Follow,
+    /// Endorsement/recommendation
+    Endorse,
+    /// Custom interaction type
+    Custom(String),
+}
+
+impl InteractionType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            InteractionType::Chat => "chat",
+            InteractionType::Trade => "trade",
+            InteractionType::Collaborate => "collaborate",
+            InteractionType::Follow => "follow",
+            InteractionType::Endorse => "endorse",
+            InteractionType::Custom(s) => s.as_str(),
+        }
+    }
+}
+
+impl From<&str> for InteractionType {
+    fn from(s: &str) -> Self {
+        match s {
+            "chat" => InteractionType::Chat,
+            "trade" => InteractionType::Trade,
+            "collaborate" => InteractionType::Collaborate,
+            "follow" => InteractionType::Follow,
+            "endorse" => InteractionType::Endorse,
+            other => InteractionType::Custom(other.to_string()),
+        }
+    }
+}
+
+/// A single interaction record within a subnet
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetInteraction {
+    /// The other user involved in this interaction
+    pub with_user: Address,
+    /// Type of interaction
+    pub interaction_type: InteractionType,
+    /// Timestamp of the interaction
+    pub timestamp: u64,
+    /// Optional metadata (e.g., message hash, trade details)
+    pub metadata: Option<String>,
+    /// Event ID that created this interaction (for traceability)
+    pub event_id: Option<String>,
+}
+
+impl SubnetInteraction {
+    pub fn new(with_user: Address, interaction_type: InteractionType) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        Self {
+            with_user,
+            interaction_type,
+            timestamp: now,
+            metadata: None,
+            event_id: None,
+        }
+    }
+    
+    pub fn with_metadata(mut self, metadata: String) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+    
+    pub fn with_event_id(mut self, event_id: String) -> Self {
+        self.event_id = Some(event_id);
+        self
+    }
+}
+
+/// Local relation built within a subnet (to be synced to global relation network)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRelation {
+    /// Target user address
+    pub target: Address,
+    /// Relation type (e.g., "friend", "trusted", "followed")
+    pub relation_type: String,
+    /// Relation weight/strength (0-100)
+    pub weight: u32,
+    /// When this relation was established
+    pub established_at: u64,
+    /// Whether this has been synced to the global UserRelationNetwork
+    pub synced_to_global: bool,
+    /// Source interactions that led to this relation
+    pub source_interactions: Vec<String>, // event_ids
+}
+
+impl LocalRelation {
+    pub fn new(target: Address, relation_type: impl Into<String>, weight: u32) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        Self {
+            target,
+            relation_type: relation_type.into(),
+            weight,
+            established_at: now,
+            synced_to_global: false,
+            source_interactions: Vec::new(),
+        }
+    }
+    
+    pub fn mark_synced(&mut self) {
+        self.synced_to_global = true;
+    }
+    
+    pub fn add_source_interaction(&mut self, event_id: String) {
+        self.source_interactions.push(event_id);
+    }
+}
+
+/// Extended user subnet membership with interaction tracking
+/// 
+/// This extends the basic UserSubnetMembership with:
+/// - Detailed interaction history within each subnet
+/// - Local relations built through interactions
+/// - Sync status for relation extraction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSubnetActivity {
+    /// User's address
+    pub user: Address,
+    /// Subnet ID
+    pub subnet_id: SubnetId,
+    /// When the user joined this subnet
+    pub joined_at: u64,
+    /// Recent interactions (limited to last N for storage efficiency)
+    pub recent_interactions: Vec<SubnetInteraction>,
+    /// Local relations built in this subnet
+    pub local_relations: Vec<LocalRelation>,
+    /// Total interaction count (even if not all stored)
+    pub total_interaction_count: u64,
+    /// Unique users interacted with
+    pub unique_users_count: u64,
+    /// Last activity timestamp
+    pub last_activity: u64,
+}
+
+impl UserSubnetActivity {
+    /// Maximum number of recent interactions to store
+    const MAX_RECENT_INTERACTIONS: usize = 100;
+    
+    pub fn new(user: Address, subnet_id: SubnetId) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        Self {
+            user,
+            subnet_id,
+            joined_at: now,
+            recent_interactions: Vec::new(),
+            local_relations: Vec::new(),
+            total_interaction_count: 0,
+            unique_users_count: 0,
+            last_activity: now,
+        }
+    }
+    
+    /// Record a new interaction
+    pub fn record_interaction(&mut self, interaction: SubnetInteraction) {
+        // Check if this is a new unique user
+        let is_new_user = !self.recent_interactions
+            .iter()
+            .any(|i| i.with_user == interaction.with_user);
+        
+        if is_new_user {
+            self.unique_users_count += 1;
+        }
+        
+        // Add to recent interactions (with limit)
+        if self.recent_interactions.len() >= Self::MAX_RECENT_INTERACTIONS {
+            self.recent_interactions.remove(0);
+        }
+        self.recent_interactions.push(interaction);
+        
+        self.total_interaction_count += 1;
+        self.touch();
+    }
+    
+    /// Add or update a local relation
+    pub fn add_local_relation(&mut self, relation: LocalRelation) {
+        // Check if relation already exists
+        if let Some(existing) = self.local_relations
+            .iter_mut()
+            .find(|r| r.target == relation.target && r.relation_type == relation.relation_type)
+        {
+            // Update weight if new is higher
+            if relation.weight > existing.weight {
+                existing.weight = relation.weight;
+            }
+            existing.synced_to_global = false; // Mark for re-sync
+        } else {
+            self.local_relations.push(relation);
+        }
+        self.touch();
+    }
+    
+    /// Get unsynced local relations
+    pub fn get_unsynced_relations(&self) -> Vec<&LocalRelation> {
+        self.local_relations
+            .iter()
+            .filter(|r| !r.synced_to_global)
+            .collect()
+    }
+    
+    /// Mark all relations as synced
+    pub fn mark_all_synced(&mut self) {
+        for relation in &mut self.local_relations {
+            relation.synced_to_global = true;
+        }
+    }
+    
+    /// Get interactions with a specific user
+    pub fn get_interactions_with(&self, user: &Address) -> Vec<&SubnetInteraction> {
+        self.recent_interactions
+            .iter()
+            .filter(|i| &i.with_user == user)
+            .collect()
+    }
+    
+    /// Get interactions by type
+    pub fn get_interactions_by_type(&self, interaction_type: &InteractionType) -> Vec<&SubnetInteraction> {
+        self.recent_interactions
+            .iter()
+            .filter(|i| &i.interaction_type == interaction_type)
+            .collect()
+    }
+    
+    fn touch(&mut self) {
+        self.last_activity = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+    }
+}
+
 /// Cross-subnet transaction marker
 /// 
 /// When a transaction involves multiple subnets, it needs special handling.
