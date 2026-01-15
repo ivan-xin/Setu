@@ -3,8 +3,9 @@
 use crate::object_store::ObjectStore;
 use crate::rocks::{SetuDB, ColumnFamily};
 use setu_types::{
-    ObjectId, Address,
+    ObjectId, Address, SubnetId,
     Coin, Profile, Credential, RelationGraph, AccountView,
+    UserRelationNetworkObject, UserSubnetActivity,
     SetuResult, SetuError,
 };
 
@@ -54,6 +55,46 @@ impl RocksObjectStore {
         self.db.get(cf, key)
             .map_err(|e| SetuError::StorageError(e.to_string()))
             .map(|opt| opt.unwrap_or_default())
+    }
+    
+    /// Create a composite key for subnet activity: user_bytes + subnet_bytes
+    fn make_subnet_activity_key(user: &Address, subnet_id: &SubnetId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(user.as_bytes());
+        key.extend_from_slice(subnet_id.as_bytes());
+        key
+    }
+    
+    /// Add a subnet to user's activity index
+    fn add_subnet_to_user_index(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()> {
+        let mut subnet_ids: Vec<SubnetId> = self.db.get(ColumnFamily::UserSubnetActivitiesByUser, user)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        if !subnet_ids.contains(subnet_id) {
+            subnet_ids.push(*subnet_id);
+            self.db.put(ColumnFamily::UserSubnetActivitiesByUser, user, &subnet_ids)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+    
+    /// Remove a subnet from user's activity index
+    fn remove_subnet_from_user_index(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()> {
+        let mut subnet_ids: Vec<SubnetId> = self.db.get(ColumnFamily::UserSubnetActivitiesByUser, user)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        let original_len = subnet_ids.len();
+        subnet_ids.retain(|id| id != subnet_id);
+        if subnet_ids.len() < original_len {
+            if subnet_ids.is_empty() {
+                self.db.delete(ColumnFamily::UserSubnetActivitiesByUser, user)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            } else {
+                self.db.put(ColumnFamily::UserSubnetActivitiesByUser, user, &subnet_ids)
+                    .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -237,6 +278,92 @@ impl ObjectStore for RocksObjectStore {
         let coins = self.get_coins_by_owner(address)?;
         let graphs = self.get_graphs_by_owner(address)?;
         Ok(AccountView::new(address.clone(), profile, credentials, coins, graphs))
+    }
+    
+    // ========== UserRelationNetwork operations ==========
+    
+    fn store_user_relation_network(&self, network: &UserRelationNetworkObject) -> SetuResult<ObjectId> {
+        let id = network.metadata.id;
+        let user = &network.data.user;
+        self.db.put(ColumnFamily::UserRelationNetworks, &id, network)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        // Index by user address
+        self.db.put(ColumnFamily::UserRelationNetworkByUser, user, &id)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        Ok(id)
+    }
+    
+    fn get_user_relation_network(&self, user: &Address) -> SetuResult<Option<UserRelationNetworkObject>> {
+        // First get the object ID from the user index
+        let network_id: Option<ObjectId> = self.db.get(ColumnFamily::UserRelationNetworkByUser, user)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        match network_id {
+            Some(id) => self.db.get(ColumnFamily::UserRelationNetworks, &id)
+                .map_err(|e| SetuError::StorageError(e.to_string())),
+            None => Ok(None),
+        }
+    }
+    
+    fn update_user_relation_network(&self, network: &UserRelationNetworkObject) -> SetuResult<()> {
+        self.db.put(ColumnFamily::UserRelationNetworks, &network.metadata.id, network)
+            .map_err(|e| SetuError::StorageError(e.to_string()))
+    }
+    
+    fn delete_user_relation_network(&self, user: &Address) -> SetuResult<()> {
+        if let Some(network) = self.get_user_relation_network(user)? {
+            self.db.delete(ColumnFamily::UserRelationNetworks, &network.metadata.id)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+            self.db.delete(ColumnFamily::UserRelationNetworkByUser, user)
+                .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+    
+    // ========== UserSubnetActivity operations ==========
+    
+    fn store_user_subnet_activity(&self, activity: &UserSubnetActivity) -> SetuResult<()> {
+        // Create a composite key: user + subnet_id
+        let key = Self::make_subnet_activity_key(&activity.user, &activity.subnet_id);
+        self.db.put(ColumnFamily::UserSubnetActivities, &key, activity)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        // Add to user's activity index
+        self.add_subnet_to_user_index(&activity.user, &activity.subnet_id)?;
+        Ok(())
+    }
+    
+    fn get_user_subnet_activity(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<Option<UserSubnetActivity>> {
+        let key = Self::make_subnet_activity_key(user, subnet_id);
+        self.db.get(ColumnFamily::UserSubnetActivities, &key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))
+    }
+    
+    fn get_user_all_subnet_activities(&self, user: &Address) -> SetuResult<Vec<UserSubnetActivity>> {
+        // Get all subnet IDs for this user
+        let subnet_ids: Vec<SubnetId> = self.db.get(ColumnFamily::UserSubnetActivitiesByUser, user)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?
+            .unwrap_or_default();
+        
+        let mut activities = Vec::new();
+        for subnet_id in subnet_ids {
+            if let Some(activity) = self.get_user_subnet_activity(user, &subnet_id)? {
+                activities.push(activity);
+            }
+        }
+        Ok(activities)
+    }
+    
+    fn update_user_subnet_activity(&self, activity: &UserSubnetActivity) -> SetuResult<()> {
+        let key = Self::make_subnet_activity_key(&activity.user, &activity.subnet_id);
+        self.db.put(ColumnFamily::UserSubnetActivities, &key, activity)
+            .map_err(|e| SetuError::StorageError(e.to_string()))
+    }
+    
+    fn delete_user_subnet_activity(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()> {
+        let key = Self::make_subnet_activity_key(user, subnet_id);
+        self.db.delete(ColumnFamily::UserSubnetActivities, &key)
+            .map_err(|e| SetuError::StorageError(e.to_string()))?;
+        self.remove_subnet_from_user_index(user, subnet_id)?;
+        Ok(())
     }
 }
 

@@ -11,6 +11,12 @@ pub enum ColumnFamily {
     CredentialsByIssuer,
     RelationGraphs,
     GraphsByOwner,
+    // User relation network storage
+    UserRelationNetworks,
+    UserRelationNetworkByUser,
+    // User subnet activity storage
+    UserSubnetActivities,
+    UserSubnetActivitiesByUser,
     Events,
     Anchors,
     Checkpoints,
@@ -32,6 +38,10 @@ impl ColumnFamily {
             Self::CredentialsByIssuer => "credentials_by_issuer",
             Self::RelationGraphs => "relation_graphs",
             Self::GraphsByOwner => "graphs_by_owner",
+            Self::UserRelationNetworks => "user_relation_networks",
+            Self::UserRelationNetworkByUser => "user_relation_network_by_user",
+            Self::UserSubnetActivities => "user_subnet_activities",
+            Self::UserSubnetActivitiesByUser => "user_subnet_activities_by_user",
             Self::Events => "events",
             Self::Anchors => "anchors",
             Self::Checkpoints => "checkpoints",
@@ -52,6 +62,10 @@ impl ColumnFamily {
             Self::CredentialsByIssuer,
             Self::RelationGraphs,
             Self::GraphsByOwner,
+            Self::UserRelationNetworks,
+            Self::UserRelationNetworkByUser,
+            Self::UserSubnetActivities,
+            Self::UserSubnetActivitiesByUser,
             Self::Events,
             Self::Anchors,
             Self::Checkpoints,
@@ -76,6 +90,14 @@ impl ColumnFamily {
                     }
                     Self::CoinsByOwner | Self::GraphsByOwner | Self::ProfileByAddress |
                     Self::CredentialsByHolder | Self::CredentialsByIssuer => {
+                        opts.set_write_buffer_size(32 * 1024 * 1024);
+                        opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+                    }
+                    Self::UserRelationNetworks | Self::UserSubnetActivities => {
+                        opts.set_write_buffer_size(64 * 1024 * 1024);
+                        opts.set_max_write_buffer_number(3);
+                    }
+                    Self::UserRelationNetworkByUser | Self::UserSubnetActivitiesByUser => {
                         opts.set_write_buffer_size(32 * 1024 * 1024);
                         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
                     }

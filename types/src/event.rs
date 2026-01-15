@@ -702,6 +702,8 @@ mod tests {
             display_name: Some("Alice".to_string()),
             metadata: None,
             initial_power: Some(100),
+            invited_by: Some("user-inviter".to_string()),
+            invite_code: Some("INVITE123".to_string()),
         };
         let event = Event::user_register(
             registration,
@@ -726,6 +728,8 @@ mod tests {
             display_name: None,
             metadata: None,
             initial_power: None,
+            invited_by: None,
+            invite_code: None,
         };
         let event = Event::user_register(
             registration,
