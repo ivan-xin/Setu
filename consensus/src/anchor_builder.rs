@@ -131,6 +131,25 @@ impl AnchorBuilder {
         &self.state_manager
     }
     
+    /// Restore AnchorBuilder state from storage after restart
+    /// 
+    /// This should be called during node initialization to recover:
+    /// - last_anchor_chain_root: for continuing the chain hash
+    /// - anchor_depth: for creating next anchor
+    /// - total_anchor_count: for statistics
+    pub fn restore_state(
+        &mut self,
+        last_anchor_chain_root: [u8; 32],
+        anchor_depth: u64,
+        total_anchor_count: u64,
+        last_fold_vlc: u64,
+    ) {
+        self.last_anchor_chain_root = last_anchor_chain_root;
+        self.anchor_depth = anchor_depth;
+        self.total_anchor_count = total_anchor_count;
+        self.last_fold_vlc = last_fold_vlc;
+    }
+    
     /// Get the global state manager (mutable)
     pub fn state_manager_mut(&mut self) -> &mut GlobalStateManager {
         &mut self.state_manager

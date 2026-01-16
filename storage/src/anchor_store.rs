@@ -53,6 +53,25 @@ impl AnchorStore {
     pub async fn get_chain(&self) -> Vec<AnchorId> {
         self.chain.read().await.clone()
     }
+    
+    /// Get the latest anchor_chain_root for recovery after restart
+    /// Returns (anchor_chain_root, depth, total_count)
+    pub async fn get_recovery_state(&self) -> Option<([u8; 32], u64, u64)> {
+        let chain = self.chain.read().await;
+        let anchors = self.anchors.read().await;
+        
+        chain.last().and_then(|id| {
+            anchors.get(id).and_then(|anchor| {
+                anchor.merkle_roots.as_ref().map(|roots| {
+                    (
+                        roots.anchor_chain_root,  // HashValue is already [u8; 32]
+                        anchor.depth,
+                        chain.len() as u64,
+                    )
+                })
+            })
+        })
+    }
 }
 
 impl Clone for AnchorStore {
