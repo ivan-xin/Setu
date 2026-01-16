@@ -10,7 +10,7 @@
 use crate::dag::Dag;
 use crate::vlc::VLC;
 use crate::router::{EventRouter, RoutedEvents};
-use crate::merkle_integration::{compute_events_root, compute_anchor_chain_root_from_hashes};
+use crate::merkle_integration::compute_events_root;
 use setu_types::{
     Anchor, ConsensusConfig, Event, EventId, SubnetId,
 };
@@ -83,8 +83,14 @@ pub struct AnchorBuilder {
     anchor_depth: u64,
     /// Last fold VLC timestamp
     last_fold_vlc: u64,
-    /// Historical anchor hashes for anchor chain tree
-    anchor_history: Vec<[u8; 32]>,
+    /// Cumulative anchor chain root (chain hash of all previous anchors)
+    /// 
+    /// Uses chain hashing: new_root = hash(prev_root || anchor_hash)
+    /// This provides O(1) memory and O(1) computation while maintaining
+    /// cryptographic commitment to the entire anchor history.
+    last_anchor_chain_root: [u8; 32],
+    /// Total number of anchors created (for statistics)
+    total_anchor_count: u64,
 }
 
 impl AnchorBuilder {
@@ -96,7 +102,8 @@ impl AnchorBuilder {
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
-            anchor_history: Vec::new(),
+            last_anchor_chain_root: [0u8; 32], // Genesis: all zeros
+            total_anchor_count: 0,
         }
     }
     
@@ -108,7 +115,8 @@ impl AnchorBuilder {
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
-            anchor_history: Vec::new(),
+            last_anchor_chain_root: [0u8; 32], // Genesis: all zeros
+            total_anchor_count: 0,
         }
     }
     
@@ -207,8 +215,9 @@ impl AnchorBuilder {
         let events_root_hash = compute_events_root(&events);
         let events_root = *events_root_hash.as_bytes();
         
-        // Compute anchor chain root
-        let anchor_chain_root = compute_anchor_chain_root_from_hashes(&self.anchor_history);
+        // Use the current anchor chain root (commitment to all previous anchors)
+        // This will be updated after creating the new anchor
+        let anchor_chain_root = self.last_anchor_chain_root;
         
         // Build anchor merkle roots
         let merkle_roots = self.state_manager.build_anchor_roots(
@@ -232,8 +241,12 @@ impl AnchorBuilder {
             merkle_roots,
         );
         
-        // Update anchor history for anchor chain tree
-        self.anchor_history.push(anchor.compute_hash());
+        // Update anchor chain root using chain hashing:
+        // new_chain_root = hash(prev_chain_root || anchor_hash)
+        // This provides O(1) memory and maintains cryptographic commitment to entire history
+        let anchor_hash = anchor.compute_hash();
+        self.last_anchor_chain_root = Self::chain_hash(&self.last_anchor_chain_root, &anchor_hash);
+        self.total_anchor_count += 1;
         
         // Commit state
         let anchor_id = self.anchor_depth + 1;
@@ -261,9 +274,14 @@ impl AnchorBuilder {
         self.anchor_depth
     }
     
-    /// Get anchor history count
+    /// Get total anchor count
     pub fn anchor_count(&self) -> usize {
-        self.anchor_history.len()
+        self.total_anchor_count as usize
+    }
+    
+    /// Get the current anchor chain root
+    pub fn anchor_chain_root(&self) -> [u8; 32] {
+        self.last_anchor_chain_root
     }
     
     /// Get a subnet's current state root
@@ -275,6 +293,28 @@ impl AnchorBuilder {
     pub fn get_global_root(&self) -> [u8; 32] {
         let (root, _) = self.state_manager.compute_global_root_bytes();
         root
+    }
+    
+    /// Chain hash: combines previous chain root with new anchor hash
+    /// 
+    /// new_root = SHA256(prev_root || anchor_hash)
+    /// 
+    /// This creates an append-only commitment where:
+    /// - R0 = [0; 32] (genesis)
+    /// - R1 = hash(R0 || H1)
+    /// - R2 = hash(R1 || H2)
+    /// - Rn = hash(R_{n-1} || Hn)
+    /// 
+    /// Each Rn commits to the entire history [H1, H2, ..., Hn]
+    fn chain_hash(prev_root: &[u8; 32], anchor_hash: &[u8; 32]) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(prev_root);
+        hasher.update(anchor_hash);
+        let result = hasher.finalize();
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&result);
+        output
     }
 }
 
