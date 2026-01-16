@@ -243,15 +243,21 @@ impl ConsensusEngine {
     /// Receive a ConsensusFrame from another validator (Follower path)
     /// 
     /// When a follower receives a CF from the leader:
-    /// 1. Verify the CF's merkle roots are valid
-    /// 2. Apply the state changes from the anchor's events to local SMT
-    /// 3. Verify resulting state matches the anchor's state root
-    /// 4. Vote for the CF
+    /// 1. Check if we've already processed this CF (idempotency)
+    /// 2. Verify the CF's merkle roots are valid
+    /// 3. Apply the state changes from the anchor's events to local SMT
+    /// 4. Verify resulting state matches the anchor's state root
+    /// 5. Vote for the CF
     /// 
     /// This ensures followers have consistent state with the leader.
     pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<()> {
         let dag = self.dag.read().await;
         let mut manager = self.consensus_manager.write().await;
+        
+        // Idempotency check: skip if already processed
+        if manager.has_cf(&cf.id) {
+            return Ok(());
+        }
         
         // First verify the CF's merkle roots are internally consistent
         if !manager.verify_cf_merkle_roots(&cf) {
@@ -350,6 +356,15 @@ impl ConsensusEngine {
     pub async fn get_anchor_count(&self) -> usize {
         let manager = self.consensus_manager.read().await;
         manager.anchor_count()
+    }
+    
+    /// Mark an anchor as successfully persisted to storage
+    /// 
+    /// Call this after successfully storing the anchor to AnchorStore.
+    /// This enables safe garbage collection of finalized CFs from memory.
+    pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
+        let mut manager = self.consensus_manager.write().await;
+        manager.mark_anchor_persisted(anchor_id);
     }
 
     /// Get the message sender for external communication
