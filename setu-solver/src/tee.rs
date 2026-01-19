@@ -37,6 +37,7 @@ use core_types::Transfer;
 use setu_enclave::{
     Attestation, EnclaveInfo, EnclaveRuntime,
     MockEnclave, StfInput, StfOutput, ReadSetEntry,
+    SolverTask, ResolvedInputs, GasBudget, GasUsage,
 };
 use setu_types::event::{Event, ExecutionResult, StateChange};
 use setu_types::SubnetId;
@@ -171,9 +172,57 @@ impl TeeExecutor {
         }
     }
 
-    /// Execute events and generate attestation
+    /// Execute a SolverTask prepared by Validator (solver-tee3 architecture)
     ///
-    /// This is the main entry point for Solver event execution.
+    /// This is the recommended entry point that follows the pass-through pattern:
+    /// - Validator prepares SolverTask with all necessary data
+    /// - Solver converts to StfInput and passes to TEE
+    /// - TEE validates and executes
+    ///
+    /// The Solver does NOT perform coin selection or state lookups - all that
+    /// is done by Validator and included in SolverTask.
+    pub async fn execute_solver_task(&self, task: SolverTask) -> anyhow::Result<TeeExecutionResult> {
+        debug!(
+            solver_id = %self.solver_id,
+            task_id = ?task.task_id,
+            subnet_id = ?task.subnet_id,
+            event_id = %task.event.id,
+            read_set_len = task.read_set.len(),
+            "Executing SolverTask in TEE (pass-through)"
+        );
+        
+        // Convert SolverTask to StfInput (direct pass-through)
+        let input = StfInput::new(
+            task.task_id,
+            task.subnet_id.clone(),
+            task.pre_state_root,
+            task.resolved_inputs,
+            task.gas_budget,
+        )
+        .with_events(vec![task.event])
+        .with_read_set(task.read_set);
+        
+        // Execute STF in TEE
+        let output = self.enclave.execute_stf(input).await
+            .map_err(|e| anyhow::anyhow!("STF execution failed: {}", e))?;
+        
+        info!(
+            solver_id = %self.solver_id,
+            task_id = ?output.task_id,
+            events_processed = output.events_processed.len(),
+            events_failed = output.events_failed.len(),
+            gas_used = output.gas_usage.gas_used,
+            "SolverTask TEE execution completed"
+        );
+        
+        Ok(TeeExecutionResult::from_stf_output(output))
+    }
+    
+    /// Execute events and generate attestation (legacy API, uses mock task_id)
+    ///
+    /// DEPRECATED: Use `execute_solver_task` instead which properly handles
+    /// task_id binding from Validator-prepared SolverTask.
+    #[deprecated(since = "0.3.0", note = "Use execute_solver_task() instead")]
     pub async fn execute_events(
         &self,
         subnet_id: SubnetId,
@@ -185,11 +234,30 @@ impl TeeExecutor {
             solver_id = %self.solver_id,
             subnet_id = ?subnet_id,
             event_count = events.len(),
-            "Executing events in TEE"
+            "Executing events in TEE (legacy API)"
         );
         
+        // Generate a task_id from events (legacy behavior)
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        for event in &events {
+            hasher.update(event.id.as_bytes());
+        }
+        hasher.update(&pre_state_root);
+        let task_id: [u8; 32] = hasher.finalize().into();
+        
+        // Use default/empty resolved_inputs for legacy API
+        let resolved_inputs = ResolvedInputs::new();
+        let gas_budget = GasBudget::default();
+        
         // Build StfInput
-        let input = StfInput::new(subnet_id.clone(), pre_state_root)
+        let input = StfInput::new(
+            task_id,
+            subnet_id.clone(),
+            pre_state_root,
+            resolved_inputs,
+            gas_budget,
+        )
             .with_events(events)
             .with_read_set(
                 read_set.into_iter()
@@ -445,6 +513,8 @@ impl TeeExecutor {
 /// Result of TEE execution
 #[derive(Debug, Clone)]
 pub struct TeeExecutionResult {
+    /// Task ID for this execution (for attestation verification)
+    pub task_id: [u8; 32],
     /// Subnet that was executed
     pub subnet_id: SubnetId,
     /// Post-execution state root
@@ -455,6 +525,8 @@ pub struct TeeExecutionResult {
     pub events_processed: usize,
     /// Number of events failed
     pub events_failed: usize,
+    /// Gas usage for this execution
+    pub gas_usage: GasUsage,
     /// TEE attestation
     pub attestation: Attestation,
     /// Execution time in microseconds
@@ -482,11 +554,13 @@ impl TeeExecutionResult {
             .collect();
         
         Self {
+            task_id: output.task_id,
             subnet_id: output.subnet_id,
             post_state_root: output.post_state_root,
             state_changes,
             events_processed: output.events_processed.len(),
             events_failed: output.events_failed.len(),
+            gas_usage: output.gas_usage,
             attestation: output.attestation,
             execution_time_us: output.stats.execution_time_us,
         }
