@@ -290,6 +290,9 @@ impl ValidatorNetworkService {
             .route("/api/v1/solvers", get(http_get_solvers))
             .route("/api/v1/validators", get(http_get_validators))
             .route("/api/v1/health", get(http_health))
+            // State query endpoints (for Solver to read current state - Scheme B)
+            .route("/api/v1/state/balance/:account", get(http_get_balance))
+            .route("/api/v1/state/object/:key", get(http_get_object))
             // Transfer endpoints
             .route("/api/v1/transfer", post(http_submit_transfer))
             .route("/api/v1/transfer/status", post(http_get_transfer_status))
@@ -821,6 +824,73 @@ impl ValidatorNetworkService {
         self.events.read().values().cloned().collect()
     }
     
+    // ============================================
+    // State Query Methods (Scheme B)
+    // ============================================
+    // These methods provide current committed state to Solver
+    // Solver reads this state before executing transactions
+    
+    /// Get the current balance for an account
+    /// 
+    /// Returns the committed balance from the state store.
+    /// In Scheme B, Solver calls this before executing transfers.
+    /// 
+    /// TODO: Currently returns mock data. Should read from GlobalStateManager/SMT.
+    pub fn get_balance(&self, account: &str) -> GetBalanceResponse {
+        // TODO: Read from GlobalStateManager (committed state SMT)
+        // For now, return mock balance for testing
+        // 
+        // Real implementation:
+        // let state_manager = self.state_manager.read();
+        // let key = format!("balance:{}", account);
+        // match state_manager.get_object(&key) {
+        //     Some(bytes) => {
+        //         let balance = u128::from_le_bytes(bytes.try_into().unwrap_or([0u8; 16]));
+        //         GetBalanceResponse { account: account.to_string(), balance, exists: true }
+        //     }
+        //     None => GetBalanceResponse { account: account.to_string(), balance: 0, exists: false }
+        // }
+        
+        debug!(
+            account = %account,
+            "Getting balance (mock: returning 1_000_000)"
+        );
+        
+        GetBalanceResponse {
+            account: account.to_string(),
+            balance: 1_000_000, // Mock balance for testing
+            exists: true,
+        }
+    }
+    
+    /// Get an object by key
+    /// 
+    /// Returns raw object data from the state store.
+    /// 
+    /// TODO: Currently returns None. Should read from GlobalStateManager/SMT.
+    pub fn get_object(&self, key: &str) -> GetObjectResponse {
+        // TODO: Read from GlobalStateManager (committed state SMT)
+        // For now, return None for testing
+        //
+        // Real implementation:
+        // let state_manager = self.state_manager.read();
+        // match state_manager.get_object(key) {
+        //     Some(bytes) => GetObjectResponse { key: key.to_string(), value: Some(bytes), exists: true }
+        //     None => GetObjectResponse { key: key.to_string(), value: None, exists: false }
+        // }
+        
+        debug!(
+            key = %key,
+            "Getting object (mock: returning None)"
+        );
+        
+        GetObjectResponse {
+            key: key.to_string(),
+            value: None,
+            exists: false,
+        }
+    }
+
     /// Register a solver internally (creates channel)
     fn register_solver_internal(&self, request: &RegisterSolverRequest) -> mpsc::UnboundedSender<Transfer> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1460,3 +1530,48 @@ async fn http_health(
     }))
 }
 
+// ============================================
+// State Query Endpoints (Scheme B)
+// ============================================
+// In Scheme B, Solver is stateless and reads current committed state from Validator
+
+/// Get balance response
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GetBalanceResponse {
+    pub account: String,
+    pub balance: u128,
+    pub exists: bool,
+}
+
+/// Get object response
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GetObjectResponse {
+    pub key: String,
+    pub value: Option<Vec<u8>>,
+    pub exists: bool,
+}
+
+/// Get balance for an account
+/// 
+/// This endpoint is used by Solver (Scheme B) to read current committed state
+/// before executing transactions.
+/// 
+/// GET /api/v1/state/balance/:account
+async fn http_get_balance(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    axum::extract::Path(account): axum::extract::Path<String>,
+) -> Json<GetBalanceResponse> {
+    Json(service.get_balance(&account))
+}
+
+/// Get object by key
+/// 
+/// This endpoint is used by Solver (Scheme B) to read arbitrary state objects.
+/// 
+/// GET /api/v1/state/object/:key
+async fn http_get_object(
+    State(service): State<Arc<ValidatorNetworkService>>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Json<GetObjectResponse> {
+    Json(service.get_object(&key))
+}

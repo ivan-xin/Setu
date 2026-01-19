@@ -330,6 +330,145 @@ impl SolverNetworkClient {
     }
 }
 
+// ============================================
+// HTTP State Reader (Scheme B)
+// ============================================
+// Implements StateReader trait by calling Validator's HTTP API
+
+use crate::tee::StateReader;
+use async_trait::async_trait;
+
+/// Get balance response (matches Validator's response)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBalanceResponse {
+    pub account: String,
+    pub balance: u128,
+    pub exists: bool,
+}
+
+/// Get object response (matches Validator's response)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetObjectResponse {
+    pub key: String,
+    pub value: Option<Vec<u8>>,
+    pub exists: bool,
+}
+
+/// HTTP-based StateReader that reads state from Validator
+/// 
+/// In Scheme B, Solver is stateless. This implementation reads current
+/// committed state from Validator via HTTP API before executing transactions.
+pub struct HttpStateReader {
+    /// Validator address
+    validator_address: String,
+    /// Validator HTTP port
+    validator_port: u16,
+    /// HTTP client
+    client: reqwest::Client,
+}
+
+impl HttpStateReader {
+    /// Create a new HTTP state reader
+    pub fn new(validator_address: String, validator_port: u16) -> Self {
+        Self {
+            validator_address,
+            validator_port,
+            client: reqwest::Client::new(),
+        }
+    }
+    
+    /// Create from SolverNetworkConfig
+    pub fn from_config(config: &SolverNetworkConfig) -> Self {
+        Self::new(
+            config.validator_address.clone(),
+            config.validator_port,
+        )
+    }
+    
+    /// Build base URL for Validator API
+    fn base_url(&self) -> String {
+        format!("http://{}:{}", self.validator_address, self.validator_port)
+    }
+}
+
+#[async_trait]
+impl StateReader for HttpStateReader {
+    /// Get the current balance for an account from Validator
+    async fn get_balance(&self, account: &str) -> anyhow::Result<u128> {
+        let url = format!("{}/api/v1/state/balance/{}", self.base_url(), account);
+        
+        debug!(
+            account = %account,
+            url = %url,
+            "Fetching balance from Validator"
+        );
+        
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Validator: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Validator returned error: {}",
+                response.status()
+            ));
+        }
+        
+        let balance_response: GetBalanceResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse balance response: {}", e))?;
+        
+        debug!(
+            account = %account,
+            balance = balance_response.balance,
+            exists = balance_response.exists,
+            "Balance fetched from Validator"
+        );
+        
+        Ok(balance_response.balance)
+    }
+    
+    /// Get raw object data by key from Validator
+    async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let url = format!("{}/api/v1/state/object/{}", self.base_url(), key);
+        
+        debug!(
+            key = %key,
+            url = %url,
+            "Fetching object from Validator"
+        );
+        
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Validator: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Validator returned error: {}",
+                response.status()
+            ));
+        }
+        
+        let object_response: GetObjectResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse object response: {}", e))?;
+        
+        debug!(
+            key = %key,
+            exists = object_response.exists,
+            "Object fetched from Validator"
+        );
+        
+        Ok(object_response.value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
