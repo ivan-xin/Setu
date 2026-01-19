@@ -7,18 +7,27 @@
 //! - Maintaining the global Foldgraph
 //! - Coordinating consensus
 //! - Providing registration service for solvers and validators
+//!
+//! ## solver-tee3 Architecture
+//!
+//! In the new architecture, Validator is responsible for:
+//! - Preparing SolverTask with coin selection and Merkle proofs
+//! - Sending SolverTask to Solver (pass-through to TEE)
+//! - Verifying Attestation from TEE execution results
 
 mod verifier;
 mod dag;
 mod sampling;
 mod router_manager;
 mod network_service;
+pub mod task_preparer;
 
 pub use verifier::Verifier;
 pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
 pub use sampling::{SamplingVerifier, SamplingConfig, SamplingStats};
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network_service::{ValidatorNetworkService, ValidatorRegistrationHandler, NetworkServiceConfig, ValidatorInfo};
+pub use task_preparer::{TaskPreparer, StateProvider, MockStateProvider, CoinInfo, TaskPrepareError};
 
 use core_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
