@@ -12,9 +12,13 @@ mod tee;
 mod network_client;
 
 pub use dependency::{DependencyTracker, DependencyStats};
-pub use tee::{TeeExecutor, TeeExecutionResult};
+pub use tee::{TeeExecutor, TeeExecutionResult, StateReader, MockStateReader};
 pub use setu_enclave::{EnclaveInfo, Attestation};
-pub use network_client::{SolverNetworkClient, SolverNetworkConfig, SubmitEventRequest, SubmitEventResponse};
+pub use network_client::{
+    SolverNetworkClient, SolverNetworkConfig, 
+    SubmitEventRequest, SubmitEventResponse,
+    HttpStateReader,  // Scheme B: HTTP-based state reader
+};
 
 use core_types::Transfer;
 use setu_core::{NodeConfig, ShardManager};
