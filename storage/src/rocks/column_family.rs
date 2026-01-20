@@ -4,6 +4,9 @@ pub enum ColumnFamily {
     Objects,
     Coins,
     CoinsByOwner,
+    /// Index: (owner, coin_type) -> Vec<ObjectId>
+    /// Enables efficient lookup of coins by owner and type for multi-subnet scenarios
+    CoinsByOwnerAndType,
     Profiles,
     ProfileByAddress,
     Credentials,
@@ -31,6 +34,7 @@ impl ColumnFamily {
             Self::Objects => "objects",
             Self::Coins => "coins",
             Self::CoinsByOwner => "coins_by_owner",
+            Self::CoinsByOwnerAndType => "coins_by_owner_and_type",
             Self::Profiles => "profiles",
             Self::ProfileByAddress => "profile_by_address",
             Self::Credentials => "credentials",
@@ -55,6 +59,7 @@ impl ColumnFamily {
             Self::Objects,
             Self::Coins,
             Self::CoinsByOwner,
+            Self::CoinsByOwnerAndType,
             Self::Profiles,
             Self::ProfileByAddress,
             Self::Credentials,
@@ -88,7 +93,7 @@ impl ColumnFamily {
                         opts.set_write_buffer_size(64 * 1024 * 1024);
                         opts.set_max_write_buffer_number(3);
                     }
-                    Self::CoinsByOwner | Self::GraphsByOwner | Self::ProfileByAddress |
+                    Self::CoinsByOwner | Self::CoinsByOwnerAndType | Self::GraphsByOwner | Self::ProfileByAddress |
                     Self::CredentialsByHolder | Self::CredentialsByIssuer => {
                         opts.set_write_buffer_size(32 * 1024 * 1024);
                         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);

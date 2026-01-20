@@ -1,6 +1,6 @@
 //! Object Store trait for Coin/Profile/Credential/RelationGraph storage operations
 use setu_types::{
-    ObjectId, Address, SubnetId,
+    ObjectId, Address, SubnetId, CoinType,
     Coin, Profile, Credential, RelationGraph, AccountView,
     UserRelationNetworkObject, UserSubnetActivity,
     SetuResult,
@@ -20,6 +20,12 @@ pub trait ObjectStore {
     
     /// Get all coins owned by an address
     fn get_coins_by_owner(&self, owner: &Address) -> SetuResult<Vec<Coin>>;
+    
+    /// Get coins owned by an address filtered by coin type
+    /// 
+    /// This is essential for multi-subnet scenarios where each subnet
+    /// may have its own token type.
+    fn get_coins_by_owner_and_type(&self, owner: &Address, coin_type: &CoinType) -> SetuResult<Vec<Coin>>;
     
     /// Update a coin (replaces existing)
     fn update_coin(&self, coin: &Coin) -> SetuResult<()>;

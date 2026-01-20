@@ -25,6 +25,6 @@ pub use state_provider::{
 
 // Re-export RocksDB types
 pub use rocks::{SetuDB, RocksDBConfig, ColumnFamily, StorageError};
-pub use rocks_object_store::RocksObjectStore;
+pub use rocks_object_store::{RocksObjectStore, RebuildIndexResult};
 pub use rocks_merkle_store::RocksDBMerkleStore;
 

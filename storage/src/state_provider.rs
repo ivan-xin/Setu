@@ -41,6 +41,8 @@ pub struct CoinInfo {
     pub owner: String,
     pub balance: u64,
     pub version: u64,
+    /// Coin type (e.g., "SETU", "USDC") - supports multi-subnet token types
+    pub coin_type: String,
 }
 
 /// Coin state as stored in the Merkle tree
@@ -49,14 +51,26 @@ pub struct CoinState {
     pub owner: String,
     pub balance: u64,
     pub version: u64,
+    /// Coin type identifier (e.g., "SETU", "USDC")
+    #[serde(default = "default_coin_type")]
+    pub coin_type: String,
+}
+
+fn default_coin_type() -> String {
+    "SETU".to_string()
 }
 
 impl CoinState {
     pub fn new(owner: String, balance: u64) -> Self {
+        Self::new_with_type(owner, balance, "SETU".to_string())
+    }
+    
+    pub fn new_with_type(owner: String, balance: u64, coin_type: String) -> Self {
         Self {
             owner,
             balance,
             version: 1,
+            coin_type,
         }
     }
 
@@ -112,8 +126,20 @@ impl SimpleMerkleProof {
 /// ## Thread Safety
 /// Implementations must be Send + Sync for use across async boundaries.
 pub trait StateProvider: Send + Sync {
-    /// Get coins owned by an address
+    /// Get all coins owned by an address (all types)
     fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo>;
+    
+    /// Get coins owned by an address filtered by coin type
+    /// 
+    /// This is essential for multi-subnet scenarios where each subnet
+    /// application may have its own token type.
+    fn get_coins_for_address_by_type(&self, address: &str, coin_type: &str) -> Vec<CoinInfo> {
+        // Default implementation: filter from all coins
+        self.get_coins_for_address(address)
+            .into_iter()
+            .filter(|c| c.coin_type == coin_type)
+            .collect()
+    }
 
     /// Get object data by ID
     fn get_object(&self, object_id: &ObjectId) -> Option<Vec<u8>>;
@@ -253,7 +279,7 @@ impl MerkleStateProvider {
 impl StateProvider for MerkleStateProvider {
     fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo> {
         // For now: single coin per address (convention-based lookup)
-        // Future: implement proper coin indexing
+        // Future: implement proper coin indexing with multi-type support
         let coin_object_id = Self::coin_object_id(address);
 
         if let Some(data) = self.get_object_internal(&coin_object_id) {
@@ -263,6 +289,7 @@ impl StateProvider for MerkleStateProvider {
                     owner: coin_state.owner,
                     balance: coin_state.balance,
                     version: coin_state.version,
+                    coin_type: coin_state.coin_type,
                 }];
             }
         }
