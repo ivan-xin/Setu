@@ -169,6 +169,8 @@ impl TaskPreparer {
         let parent_ids = self.derive_dependencies(&input_objects);
         
         // Step 4: Build read_set with Merkle proof
+        // Pass raw storage data (CoinState) so TEE can verify Merkle proof
+        // TEE is responsible for converting CoinState → Object<CoinData>
         let coin_data = self.state_provider.get_object(&selected_coin.object_id)
             .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
         

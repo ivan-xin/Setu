@@ -33,17 +33,35 @@
 use crate::{
     attestation::{Attestation, AttestationData},
     solver_task::GasUsage,
-    stf::{ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult, WriteSetEntry},
+    stf::{ExecutionStats, FailedEvent, StateDiff, StfError, StfInput, StfOutput, StfResult, WriteSetEntry, ReadSetEntry},
     traits::{EnclaveConfig, EnclaveInfo, EnclavePlatform, EnclaveRuntime},
 };
 use async_trait::async_trait;
 use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, StateStore};
-use setu_types::{EventId, create_coin, Address};
+use setu_types::{EventId, create_coin, Address, Object, CoinData, ObjectId, Balance, CoinType};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// CoinState from storage layer - matches storage/src/state_provider.rs
+/// 
+/// TEE receives raw CoinState (BCS) from read_set so it can:
+/// 1. Verify Merkle proof (hash must match what's stored in tree)
+/// 2. Convert to Object<CoinData> for runtime execution
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CoinState {
+    pub owner: String,
+    pub balance: u64,
+    pub version: u64,
+    #[serde(default = "default_coin_type")]
+    pub coin_type: String,
+}
+
+fn default_coin_type() -> String {
+    "SETU".to_string()
+}
 
 /// Mock enclave measurement (constant for testing)
 const MOCK_MEASUREMENT: [u8; 32] = [
@@ -111,6 +129,97 @@ impl MockEnclave {
         *self.execution_count.read().await
     }
     
+    /// Build temporary state from read_set (solver-tee3 architecture)
+    /// 
+    /// This is the key function that loads objects from read_set into
+    /// a fresh InMemoryStateStore, making the TEE execution truly stateless.
+    /// 
+    /// ## Format
+    /// 
+    /// read_set entries use key format: "coin:{hex_object_id}"
+    /// value is BCS-serialized CoinState (raw storage format)
+    /// 
+    /// ## Security
+    /// 
+    /// TEE receives raw CoinState so it can verify Merkle proof:
+    /// - hash(CoinState) must match the leaf in Merkle tree
+    /// - If TaskPreparer converted to Object<CoinData>, verification would fail
+    /// 
+    /// ## Conversion
+    /// 
+    /// After verification, TEE converts CoinState → Object<CoinData> for runtime
+    fn build_state_from_read_set(&self, read_set: &[ReadSetEntry]) -> StfResult<InMemoryStateStore> {
+        let mut store = InMemoryStateStore::new();
+        let mut loaded_count = 0;
+        
+        for entry in read_set {
+            // Parse object key: "coin:{hex_object_id}"
+            let hex_id = entry.key.strip_prefix("coin:");
+            
+            if let Some(hex_id) = hex_id {
+                // Parse ObjectId from hex string
+                let object_id = ObjectId::from_hex(hex_id)
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e)))?;
+                
+                // TODO: Verify Merkle proof here (for production)
+                // let leaf_hash = sha256(entry.value);
+                // verify_proof(leaf_hash, entry.proof, pre_state_root)?;
+                
+                // Deserialize CoinState from BCS (raw storage format)
+                let coin_state: CoinState = bcs::from_bytes(&entry.value)
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                        "Failed to deserialize CoinState {}: {}", hex_id, e
+                    )))?;
+                
+                // Convert CoinState → Object<CoinData> for runtime
+                let owner = Address::from(coin_state.owner.as_str());
+                let coin_data = CoinData {
+                    coin_type: CoinType::new(&coin_state.coin_type),
+                    balance: Balance::new(coin_state.balance),
+                };
+                
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                
+                let coin_object = Object {
+                    metadata: setu_types::ObjectMetadata {
+                        id: object_id,
+                        version: coin_state.version,
+                        digest: setu_types::ObjectDigest::ZERO,
+                        object_type: setu_types::ObjectType::OwnedObject,
+                        owner: Some(owner),
+                        ownership: setu_types::Ownership::AddressOwner(owner),
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    data: coin_data,
+                };
+                
+                // Store in the temporary state
+                store.set_object(object_id, coin_object)
+                    .map_err(|e| StfError::InternalError(format!("Failed to store object: {}", e)))?;
+                
+                loaded_count += 1;
+                debug!(
+                    object_id = %hex_id,
+                    owner = %coin_state.owner,
+                    balance = coin_state.balance,
+                    "Loaded coin from read_set"
+                );
+            }
+        }
+        
+        info!(
+            loaded_count = loaded_count,
+            total_entries = read_set.len(),
+            "Built temporary state from read_set"
+        );
+        
+        Ok(store)
+    }
+    
     /// Simulate applying events to state using setu-runtime
     async fn simulate_execution(&self, input: &StfInput) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
         let start = std::time::Instant::now();
@@ -173,8 +282,8 @@ impl MockEnclave {
     /// Execute a transfer event via setu-runtime (solver-tee3 architecture)
     /// 
     /// Uses resolved_inputs.primary_coin() to get the coin_id that Validator
-    /// has already selected, instead of letting runtime do coin selection.
-    /// This follows the solver-tee3 design where Validator prepares everything.
+    /// has already selected. This follows the solver-tee3 design where 
+    /// Validator prepares everything - if coin_id is missing, it's an error.
     async fn execute_transfer_via_runtime(
         &self,
         event: &setu_types::Event,
@@ -188,41 +297,27 @@ impl MockEnclave {
             in_tee: false, // Mock enclave
         };
         
-        // Try to use resolved_inputs coin_id if available (solver-tee3 path)
-        let output = if let Some(resolved_coin) = resolved_inputs.primary_coin() {
-            debug!(
-                event_id = %event.id,
-                coin_id = %resolved_coin.object_id,
-                from = %transfer.from,
-                to = %transfer.to,
-                amount = transfer.amount,
-                "Executing transfer with resolved coin_id (solver-tee3)"
-            );
-            
-            // Use the coin_id from resolved_inputs
+        // solver-tee3: resolved_inputs MUST have primary_coin
+        let resolved_coin = resolved_inputs.primary_coin()
+            .ok_or_else(|| "Missing resolved_inputs.primary_coin - TaskPreparer error".to_string())?;
+        
+        debug!(
+            event_id = %event.id,
+            coin_id = %resolved_coin.object_id,
+            from = %transfer.from,
+            to = %transfer.to,
+            amount = transfer.amount,
+            "Executing transfer with resolved coin_id (solver-tee3)"
+        );
+        
+        // Use the coin_id from resolved_inputs
+        let output = {
             let mut runtime = self.runtime.write().await;
             runtime.execute_transfer_with_coin(
                 resolved_coin.object_id.clone(),
                 &transfer.from,
                 &transfer.to,
                 Some(transfer.amount as u64),
-                &ctx,
-            ).map_err(|e| format!("Runtime error: {}", e))?
-        } else {
-            // Fallback to legacy behavior: let runtime select coin
-            debug!(
-                event_id = %event.id,
-                from = %transfer.from,
-                to = %transfer.to,
-                amount = transfer.amount,
-                "Executing transfer via simple_transfer (legacy fallback)"
-            );
-            
-            let mut runtime = self.runtime.write().await;
-            runtime.execute_simple_transfer(
-                &transfer.from,
-                &transfer.to,
-                transfer.amount as u64,
                 &ctx,
             ).map_err(|e| format!("Runtime error: {}", e))?
         };
@@ -244,7 +339,6 @@ impl MockEnclave {
             to = %transfer.to,
             amount = transfer.amount,
             state_changes = output.state_changes.len(),
-            used_resolved_inputs = resolved_inputs.primary_coin().is_some(),
             "Transfer executed successfully via setu-runtime"
         );
         
@@ -314,12 +408,26 @@ impl EnclaveRuntime for MockEnclave {
         // For now, skip verification in mock mode
         // self.verify_read_set(&input.read_set, &input.pre_state_root)?;
         
-        // TODO (solver-tee3): Build temporary state from read_set instead of using persistent state
-        // This would make the enclave truly stateless:
-        // let temp_state = self.build_state_from_read_set(&input.read_set)?;
-        // let runtime = RuntimeExecutor::new(temp_state);
+        // ========== solver-tee3: Build temporary state from read_set ==========
+        // If read_set is non-empty, build a fresh state store from it.
+        // This makes the TEE execution truly stateless - it only sees what Validator provided.
+        let use_read_set_state = !input.read_set.is_empty();
         
-        // Execute using setu-runtime (current implementation uses persistent state)
+        if use_read_set_state {
+            // Build temporary state from read_set
+            let temp_store = self.build_state_from_read_set(&input.read_set)?;
+            
+            // Replace the runtime's state with the temporary state
+            let mut runtime = self.runtime.write().await;
+            *runtime = RuntimeExecutor::new(temp_store);
+            
+            info!(
+                read_set_entries = input.read_set.len(),
+                "Using read_set state for execution (solver-tee3 mode)"
+            );
+        }
+        
+        // Execute using setu-runtime
         let (diff, events_processed, events_failed) = self.simulate_execution(&input).await?;
         
         // Compute post-state root from legacy state
