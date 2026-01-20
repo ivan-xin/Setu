@@ -14,7 +14,7 @@ use setu_router_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, debug};
 
 /// Router manager error
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +83,7 @@ impl SolverConnection {
 /// Router manager for the Validator
 pub struct RouterManager {
     /// Unified router from setu-router-core
+    #[allow(dead_code)] // Reserved for future unified router integration
     router: UnifiedRouter,
     
     /// Solver registry

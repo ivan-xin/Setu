@@ -133,6 +133,7 @@ impl SamplingVerifier {
     /// 2. Execute transfer logic
     /// 3. Generate execution result
     /// 4. Return result for comparison
+    #[allow(dead_code)] // Reserved for future sampling verification
     async fn re_execute_transfer(&self, transfer: &Transfer) -> anyhow::Result<ExecutionResult> {
         debug!(
             node_id = %self.node_id,
@@ -157,6 +158,7 @@ impl SamplingVerifier {
     /// 2. Compare state changes (keys, old values, new values)
     /// 3. Allow for minor differences (e.g., timestamps)
     /// 4. Return detailed comparison report
+    #[allow(dead_code)] // Reserved for future sampling verification
     fn compare_results(
         &self,
         claimed: &ExecutionResult,
