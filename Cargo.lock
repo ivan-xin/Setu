@@ -2797,6 +2797,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "setu-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "setu-rpc",
+ "setu-types",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "setu-cli"
 version = "0.1.0"
 dependencies = [
@@ -3050,6 +3064,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "setu-api",
  "setu-core",
  "setu-enclave",
  "setu-router-core",
