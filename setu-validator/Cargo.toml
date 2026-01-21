@@ -18,12 +18,13 @@ setu-rpc = { path = "../setu-rpc" }
 setu-enclave = { path = "../crates/setu-enclave", features = ["mock"] }
 setu-storage = { path = "../storage" }
 setu-api = { path = "../api" }
+setu-network-anemo = { path = "../crates/setu-network-anemo" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 
 # Web framework for HTTP API
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
 serde_json = "1.0"
 
 # Crypto

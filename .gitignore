@@ -28,5 +28,11 @@ target
 # Added by cargo
 
 /target
-/tests
-/Cargo.lock
+
+# Local files to ignore
+*.lock
+docs
+*.md
+examples
+tests
+.DS_Store

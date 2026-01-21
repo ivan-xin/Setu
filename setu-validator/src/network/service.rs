@@ -1,10 +1,11 @@
 //! Core ValidatorNetworkService implementation
 //!
 //! This is the main service handling network operations for the Validator.
+//! Now with integrated consensus support.
 
 use super::registration::ValidatorRegistrationHandler;
 use super::types::*;
-use crate::{RouterManager, TaskPreparer};
+use crate::{RouterManager, TaskPreparer, ConsensusValidator};
 use axum::{
     routing::{get, post},
     Router,
@@ -31,6 +32,7 @@ use setu_api::{self, ValidatorService};
 /// Core service handling:
 /// - Solver/Validator registration
 /// - Transfer submission and routing
+/// - Consensus integration (CF proposal and voting)
 /// - Event verification and DAG management
 /// - State queries (Scheme B)
 pub struct ValidatorNetworkService {
@@ -42,6 +44,9 @@ pub struct ValidatorNetworkService {
 
     /// Task preparer for solver-tee3 architecture
     task_preparer: Arc<TaskPreparer>,
+
+    /// Consensus validator (optional)
+    consensus_validator: Option<Arc<ConsensusValidator>>,
 
     /// Registered validators
     validators: Arc<RwLock<HashMap<String, ValidatorInfo>>>,
@@ -94,6 +99,44 @@ impl ValidatorNetworkService {
             validator_id,
             router_manager,
             task_preparer,
+            consensus_validator: None,
+            validators: Arc::new(RwLock::new(HashMap::new())),
+            solver_channels: Arc::new(RwLock::new(HashMap::new())),
+            transfer_status: Arc::new(RwLock::new(HashMap::new())),
+            events: Arc::new(RwLock::new(HashMap::new())),
+            pending_events: Arc::new(RwLock::new(Vec::new())),
+            dag_events: Arc::new(RwLock::new(Vec::new())),
+            config,
+            start_time,
+            transfer_counter: AtomicU64::new(0),
+            vlc_counter: AtomicU64::new(0),
+            event_counter: AtomicU64::new(0),
+        }
+    }
+    
+    /// Create with consensus enabled
+    pub fn with_consensus(
+        validator_id: String,
+        router_manager: Arc<RouterManager>,
+        task_preparer: Arc<TaskPreparer>,
+        consensus_validator: Arc<ConsensusValidator>,
+        config: NetworkServiceConfig,
+    ) -> Self {
+        let start_time = current_timestamp_secs();
+
+        info!(
+            validator_id = %validator_id,
+            http_addr = %config.http_listen_addr,
+            p2p_addr = %config.p2p_listen_addr,
+            consensus_enabled = true,
+            "Creating validator network service with consensus"
+        );
+
+        Self {
+            validator_id,
+            router_manager,
+            task_preparer,
+            consensus_validator: Some(consensus_validator),
             validators: Arc::new(RwLock::new(HashMap::new())),
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             transfer_status: Arc::new(RwLock::new(HashMap::new())),
@@ -118,6 +161,15 @@ impl ValidatorNetworkService {
 
     pub fn router_manager(&self) -> &RouterManager {
         &self.router_manager
+    }
+    
+    pub fn consensus_validator(&self) -> Option<&Arc<ConsensusValidator>> {
+        self.consensus_validator.as_ref()
+    }
+    
+    /// Check if consensus is enabled
+    pub fn consensus_enabled(&self) -> bool {
+        self.consensus_validator.is_some()
     }
 
     pub fn start_time(&self) -> u64 {
@@ -487,6 +539,7 @@ impl ValidatorNetworkService {
             event_id = %&event.id[..20.min(event.id.len())],
             event_type = %event.event_type.name(),
             creator = %event.creator,
+            consensus_enabled = self.consensus_enabled(),
             "Receiving event from solver"
         );
 
@@ -511,11 +564,58 @@ impl ValidatorNetworkService {
             }
         }
 
-        // VLC + 1
+        let event_id = event.id.clone();
+        
+        // If consensus is enabled, submit to consensus engine
+        if let Some(ref consensus) = self.consensus_validator {
+            match consensus.submit_event(event.clone()).await {
+                Ok(_) => {
+                    // Get VLC from consensus
+                    let vlc = consensus.vlc_snapshot().await;
+                    let vlc_time = vlc.logical_time;
+                    
+                    // Store event locally
+                    self.events.write().insert(event_id.clone(), event);
+                    self.pending_events.write().retain(|id| id != &event_id);
+                    self.dag_events.write().push(event_id.clone());
+                    
+                    // Apply side effects
+                    self.apply_event_side_effects(&event_id).await;
+                    
+                    // Log consensus stats - evaluate all async values BEFORE the info! macro
+                    let stats = consensus.dag_stats().await;
+                    let is_leader = consensus.is_leader().await;
+                    info!(
+                        event_id = %&event_id[..20.min(event_id.len())],
+                        vlc_time = vlc_time,
+                        consensus_dag_size = stats.node_count,
+                        is_leader = is_leader,
+                        "Event added to consensus DAG"
+                    );
+                    
+                    return SubmitEventResponse {
+                        success: true,
+                        message: "Event verified and added to consensus DAG".to_string(),
+                        event_id: Some(event_id),
+                        vlc_time: Some(vlc_time),
+                    };
+                }
+                Err(e) => {
+                    error!(event_id = %event_id, error = %e, "Failed to submit event to consensus");
+                    return SubmitEventResponse {
+                        success: false,
+                        message: format!("Consensus submission failed: {}", e),
+                        event_id: Some(event_id),
+                        vlc_time: None,
+                    };
+                }
+            }
+        }
+        
+        // Legacy path: local VLC and DAG only
         let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Store event and add to DAG
-        let event_id = event.id.clone();
         self.events.write().insert(event_id.clone(), event);
         self.pending_events.write().retain(|id| id != &event_id);
         self.dag_events.write().push(event_id.clone());
@@ -523,7 +623,7 @@ impl ValidatorNetworkService {
         // Apply side effects
         self.apply_event_side_effects(&event_id).await;
 
-        info!(event_id = %&event_id[..20.min(event_id.len())], vlc_time = vlc_time, dag_size = self.dag_events.read().len(), "Event verified");
+        info!(event_id = %&event_id[..20.min(event_id.len())], vlc_time = vlc_time, dag_size = self.dag_events.read().len(), "Event verified (legacy mode)");
 
         SubmitEventResponse {
             success: true,

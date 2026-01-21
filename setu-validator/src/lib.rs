@@ -30,6 +30,8 @@ mod router_manager;
 mod network;
 pub mod task_preparer;
 mod user_handler;
+pub mod consensus_integration;
+pub mod broadcaster;
 
 pub use verifier::Verifier;
 pub use dag::{DagManager, DagManagerError, DagNode, DagStats};
@@ -42,6 +44,26 @@ pub use network::{
 };
 pub use task_preparer::{TaskPreparer, TaskPrepareError};
 pub use user_handler::ValidatorUserHandler;
+
+// Re-export consensus integration types
+pub use consensus_integration::{
+    ConsensusValidator, ConsensusValidatorConfig, ConsensusValidatorStats,
+    ConsensusMessageHandler,
+};
+
+// Re-export broadcaster types
+pub use broadcaster::{
+    AnemoConsensusBroadcaster, ConsensusBroadcaster, BroadcastError, BroadcastResult,
+    NoOpBroadcaster, MockBroadcaster,
+};
+
+// Re-export consensus types from the consensus crate
+pub use consensus::{
+    ConsensusEngine, ConsensusMessage, ConsensusManager,
+    Dag as ConsensusDag, DagError as ConsensusDagError, DagStats as ConsensusDagStats,
+    ValidatorSet, VLC, AnchorBuilder,
+    TeeVerifier, TeeAttestation, VerificationResult,
+};
 
 // Re-export StateProvider types from storage (canonical location)
 pub use setu_storage::{StateProvider, CoinInfo, SimpleMerkleProof, MerkleStateProvider};
