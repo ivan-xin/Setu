@@ -81,6 +81,12 @@ pub enum SetuMessage {
     /// Consensus frame finalized
     CFFinalized { cf: ConsensusFrame },
 
+    /// Request specific events by ID
+    RequestEvents { event_ids: Vec<String>, requester_id: String },
+
+    /// Response to event request
+    EventsResponse { events: Vec<Event>, responder_id: String },
+
     /// Ping message for health check
     Ping { timestamp: u64, nonce: u64 },
 
@@ -249,6 +255,64 @@ impl AnemoNetworkService {
         }
 
         Ok(())
+    }
+
+    /// Request specific events by ID from peers
+    /// 
+    /// Sends request to all connected peers and collects responses.
+    /// Returns events that were successfully fetched.
+    pub async fn request_events_by_id(&self, event_ids: &[String]) -> Result<Vec<Event>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug!(count = event_ids.len(), "Requesting events by ID from peers");
+
+        let message = SetuMessage::RequestEvents {
+            event_ids: event_ids.to_vec(),
+            requester_id: self.local_node_info.id.clone(),
+        };
+
+        let bytes = self.serialize_message(&message)?;
+        let peers = self.peer_manager.get_connected_peers();
+        let mut fetched_events: Vec<Event> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        // Try each peer until we have all events (or exhausted peers)
+        for peer_info in peers {
+            let request = anemo::Request::new(bytes.clone());
+            match self.transport.rpc(peer_info.peer_id, request).await {
+                Ok(response) => {
+                    // Parse response
+                    if let Ok(SetuMessage::EventsResponse { events, .. }) = 
+                        self.deserialize_message(response.body()) 
+                    {
+                        for event in events {
+                            if !seen_ids.contains(&event.id) {
+                                seen_ids.insert(event.id.clone());
+                                fetched_events.push(event);
+                            }
+                        }
+                    }
+
+                    // Check if we got all requested events
+                    if fetched_events.len() >= event_ids.len() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!(peer = %peer_info.peer_id, error = %e, "Failed to request events from peer");
+                }
+            }
+        }
+
+        info!(
+            requested = event_ids.len(),
+            fetched = fetched_events.len(),
+            "Event fetch completed"
+        );
+
+        Ok(fetched_events)
     }
 
     /// Send a consensus frame proposal

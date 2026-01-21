@@ -6,10 +6,10 @@
 
 use consensus::{BroadcastError, BroadcastResult, ConsensusBroadcaster};
 use setu_network_anemo::AnemoNetworkService;
-use setu_types::{ConsensusFrame, Vote};
+use setu_types::{ConsensusFrame, Event, EventId, Vote};
 use std::fmt;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Adapter that implements ConsensusBroadcaster using Anemo P2P network
 pub struct AnemoConsensusBroadcaster {
@@ -131,6 +131,63 @@ impl ConsensusBroadcaster for AnemoConsensusBroadcaster {
         debug!(cf_id = %cf_id, peer_count = total_peers, "CF finalization acknowledged (implicit via votes)");
         
         Ok(BroadcastResult::success(total_peers, total_peers))
+    }
+
+    async fn broadcast_event(&self, event: &Event) -> Result<BroadcastResult, BroadcastError> {
+        let total_peers = self.network.get_peer_count();
+        
+        if total_peers == 0 {
+            debug!(event_id = %event.id, "No peers to broadcast event to");
+            return Ok(BroadcastResult::success(0, 0));
+        }
+
+        // Use the network layer's broadcast_event method
+        match self.network.broadcast_event(event.clone()).await {
+            Ok(_) => {
+                info!(
+                    event_id = %event.id,
+                    peer_count = total_peers,
+                    "Event broadcasted to all peers"
+                );
+                Ok(BroadcastResult::success(total_peers, total_peers))
+            }
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                warn!(event_id = %event.id, error = %error_msg, "Failed to broadcast event");
+                // Network layer broadcasts to all peers, so if it fails, all failed
+                Err(BroadcastError::AllFailed(error_msg))
+            }
+        }
+    }
+
+    async fn request_events(&self, event_ids: &[EventId]) -> Result<Vec<Event>, BroadcastError> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug!(
+            count = event_ids.len(),
+            "Requesting missing events from peers"
+        );
+
+        // Convert EventId to String for network layer
+        let event_id_strings: Vec<String> = event_ids.iter().cloned().collect();
+
+        // Use the network layer's request_events_by_id method
+        match self.network.request_events_by_id(&event_id_strings).await {
+            Ok(events) => {
+                info!(
+                    requested = event_ids.len(),
+                    fetched = events.len(),
+                    "Successfully fetched events from peers"
+                );
+                Ok(events)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch events from peers");
+                Err(BroadcastError::NetworkError(format!("{}", e)))
+            }
+        }
     }
 
     fn peer_count(&self) -> usize {

@@ -222,8 +222,8 @@ impl ConsensusValidator {
             "Receiving event from network"
         );
         
-        // Add to local DAG
-        self.engine.add_event(event).await
+        // Use the dedicated network receive method (no re-broadcast)
+        self.engine.receive_event_from_network(event).await
     }
     
     /// Receive a ConsensusFrame proposal from the leader

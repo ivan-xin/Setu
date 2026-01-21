@@ -100,6 +100,11 @@ impl Dag {
         self.events.get(event_id)
     }
 
+    /// Check if an event exists in the DAG
+    pub fn contains(&self, event_id: &EventId) -> bool {
+        self.events.contains_key(event_id)
+    }
+
     /// Get a mutable reference to an event
     pub fn get_event_mut(&mut self, event_id: &EventId) -> Option<&mut Event> {
         self.events.get_mut(event_id)

@@ -27,7 +27,7 @@
 //!     (production)                 (testing)
 //! ```
 
-use setu_types::{ConsensusFrame, Vote};
+use setu_types::{ConsensusFrame, Event, EventId, Vote};
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
@@ -138,6 +138,19 @@ pub trait ConsensusBroadcaster: Send + Sync + Debug {
     /// This helps late-joining nodes sync up.
     async fn broadcast_finalized(&self, cf_id: &str) -> Result<BroadcastResult, BroadcastError>;
 
+    /// Broadcast an event to all peer validators
+    ///
+    /// Called when a new event is added to the local DAG.
+    /// This ensures all validators have the same events before CF creation.
+    /// This is the PRIMARY path for event propagation.
+    async fn broadcast_event(&self, event: &Event) -> Result<BroadcastResult, BroadcastError>;
+
+    /// Request specific events from peers (fallback/recovery)
+    ///
+    /// Called when receiving a CF that references unknown events.
+    /// Returns the events that were successfully fetched.
+    async fn request_events(&self, event_ids: &[EventId]) -> Result<Vec<Event>, BroadcastError>;
+
     /// Get the number of connected peer validators
     fn peer_count(&self) -> usize;
 
@@ -173,6 +186,16 @@ impl ConsensusBroadcaster for NoOpBroadcaster {
         Ok(BroadcastResult::success(0, 0))
     }
 
+    async fn broadcast_event(&self, _event: &Event) -> Result<BroadcastResult, BroadcastError> {
+        // No-op: just return success with 0 peers
+        Ok(BroadcastResult::success(0, 0))
+    }
+
+    async fn request_events(&self, _event_ids: &[EventId]) -> Result<Vec<Event>, BroadcastError> {
+        // No-op: return empty vec (no peers to request from)
+        Ok(Vec::new())
+    }
+
     fn peer_count(&self) -> usize {
         0
     }
@@ -193,6 +216,8 @@ pub struct MockBroadcaster {
     pub vote_broadcasts: std::sync::Mutex<Vec<Vote>>,
     /// Recorded finalization broadcasts
     pub finalized_broadcasts: std::sync::Mutex<Vec<String>>,
+    /// Recorded event broadcasts
+    pub event_broadcasts: std::sync::Mutex<Vec<Event>>,
     /// Whether to simulate failures
     pub simulate_failure: std::sync::atomic::AtomicBool,
 }
@@ -206,6 +231,7 @@ impl MockBroadcaster {
             cf_broadcasts: std::sync::Mutex::new(Vec::new()),
             vote_broadcasts: std::sync::Mutex::new(Vec::new()),
             finalized_broadcasts: std::sync::Mutex::new(Vec::new()),
+            event_broadcasts: std::sync::Mutex::new(Vec::new()),
             simulate_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -228,6 +254,11 @@ impl MockBroadcaster {
     /// Get recorded finalization broadcasts
     pub fn get_finalized_broadcasts(&self) -> Vec<String> {
         self.finalized_broadcasts.lock().unwrap().clone()
+    }
+
+    /// Get recorded event broadcasts
+    pub fn get_event_broadcasts(&self) -> Vec<Event> {
+        self.event_broadcasts.lock().unwrap().clone()
     }
 }
 
@@ -255,6 +286,22 @@ impl ConsensusBroadcaster for MockBroadcaster {
         }
         self.finalized_broadcasts.lock().unwrap().push(cf_id.to_string());
         Ok(BroadcastResult::success(self.peer_count, self.peer_count))
+    }
+
+    async fn broadcast_event(&self, event: &Event) -> Result<BroadcastResult, BroadcastError> {
+        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
+        }
+        self.event_broadcasts.lock().unwrap().push(event.clone());
+        Ok(BroadcastResult::success(self.peer_count, self.peer_count))
+    }
+
+    async fn request_events(&self, _event_ids: &[EventId]) -> Result<Vec<Event>, BroadcastError> {
+        if self.simulate_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(BroadcastError::AllFailed("Simulated failure".to_string()));
+        }
+        // Mock: return empty vec (no events to fetch)
+        Ok(Vec::new())
     }
 
     fn peer_count(&self) -> usize {
