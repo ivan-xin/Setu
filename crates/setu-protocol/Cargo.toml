@@ -1,0 +1,17 @@
+[package]
+name = "setu-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Setu protocol message definitions and serialization"
+
+[dependencies]
+# Internal dependencies
+setu-types = { path = "../../types" }
+
+# Serialization
+serde = { workspace = true }
+bincode = "1.3"
+bytes = { version = "1.5", features = ["serde"] }
+
+# Utilities
+thiserror = "1.0"
