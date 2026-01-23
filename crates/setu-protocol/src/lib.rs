@@ -48,6 +48,12 @@ pub mod codec;
 pub mod error;
 pub mod rpc;
 
+// =============================================================================
+// Solver HTTP Communication (Validator ↔ Solver)
+// =============================================================================
+
+pub mod solver_http;
+
 // Re-export core types
 pub use version::ProtocolVersion;
 pub use codec::{GenericCodec, BincodeCodec};
@@ -58,6 +64,12 @@ pub use rpc::{
     SerializedEvent, SerializedConsensusFrame, SerializedVote,
     SyncEventsRequest, SyncEventsResponse,
     SyncConsensusFramesRequest, SyncConsensusFramesResponse,
+};
+
+// Re-export Solver HTTP types
+pub use solver_http::{
+    ExecuteTaskRequest, ExecuteTaskResponse,
+    TeeExecutionResultDto, StateChangeDto, AttestationDto,
 };
 
 
