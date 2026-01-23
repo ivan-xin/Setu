@@ -1,0 +1,38 @@
+[package]
+name = "setu-transport"
+version.workspace = true
+edition.workspace = true
+description = "Setu transport layer: HTTP/WebSocket/gRPC communication for Validator ↔ Solver"
+
+[features]
+default = ["http"]
+http = ["axum", "tower", "tower-http", "reqwest"]
+# Future features
+# websocket = ["tokio-tungstenite"]
+# grpc = ["tonic", "prost"]
+
+[dependencies]
+# Internal dependencies
+setu-types = { path = "../../types" }
+
+# HTTP server (optional)
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+
+# HTTP client (optional)
+reqwest = { version = "0.11", features = ["json"], optional = true }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Utilities
+thiserror = "1.0"
+tracing = "0.1"
+async-trait = "0.1"
+anyhow = "1.0"
+hex = "0.4"
