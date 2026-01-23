@@ -70,12 +70,12 @@ fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
     info!("Loading keypair from: {}", key_file);
     
     let keypair = load_keypair(key_file)?;
-    let account_address = keypair.address();
-    let public_key = keypair.public_key_bytes();
+    let account_address = keypair.address().to_string();
+    let public_key = keypair.public().as_bytes();
     
     // Create registration message to sign
     let message = format!("Register Validator: {}", account_address);
-    let signature = keypair.sign(message.as_bytes());
+    let signature = keypair.sign(message.as_bytes()).as_bytes();
     
     info!("Keypair loaded successfully");
     info!("  Account Address: {}", account_address);
