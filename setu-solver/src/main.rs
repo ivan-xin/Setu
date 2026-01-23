@@ -17,6 +17,7 @@ use setu_solver::{
     TeeExecutor, TeeExecutionResult,
     SolverNetworkClient, SolverNetworkConfig,
     SolverTask,
+    start_server,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -180,88 +181,46 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_client.start_heartbeat_loop().await;
     });
 
-    // Create channel for receiving SolverTasks from Validator
-    // In production, this would come via RPC/network
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<SolverTask>();
+    // ============================================
+    // HTTP Server for Sync Task Execution (solver-tee3)
+    // ============================================
+    // 
+    // This is the **synchronous HTTP** approach:
+    // - Validator sends POST /api/v1/execute-task with SolverTask
+    // - Solver executes in TEE synchronously
+    // - Solver returns TeeExecutionResult in HTTP response
+    // - Validator keeps Event in scope, no pending_tasks needed
+    //
+    let http_solver_id = config.solver_id.clone();
+    let http_executor = tee_executor.clone();
     
-    // Create channel for sending results back
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<TeeExecutionResult>();
-
-    // Task processor - the core of solver-tee3 architecture
-    let executor = tee_executor.clone();
-    let result_sender = result_tx.clone();
-    let task_handle = tokio::spawn(async move {
-        info!("[TASK_RX] Task processor ready, waiting for SolverTasks...");
+    let http_address = config.address.clone();
+    let http_port = config.port;
+    let http_handle = tokio::spawn(async move {
+        info!(
+            address = %http_address,
+            port = http_port,
+            "Starting Solver HTTP server for sync task execution"
+        );
         
-        while let Some(task) = task_rx.recv().await {
-            let task_id_hex = hex::encode(&task.task_id[..8]);
-            
-            info!("╔════════════════════════════════════════════════════════════╗");
-            info!("║              Processing SolverTask                         ║");
-            info!("╠════════════════════════════════════════════════════════════╣");
-            info!("║  Task ID:    {:^44} ║", task_id_hex);
-            info!("║  Event ID:   {:^44} ║", &task.event.id[..20.min(task.event.id.len())]);
-            info!("║  Inputs:     {:^44} ║", format!("{} objects", task.resolved_inputs.input_objects.len()));
-            info!("╚════════════════════════════════════════════════════════════╝");
-            
-            // Execute in TEE (this is all the Solver does in solver-tee3)
-            match executor.execute_solver_task(task).await {
-                Ok(result) => {
-                    info!("╔════════════════════════════════════════════════════════════╗");
-                    info!("║              TEE Execution Complete                        ║");
-                    info!("╠════════════════════════════════════════════════════════════╣");
-                    info!("║  Status:     {:^44} ║", if result.is_success() { "SUCCESS" } else { "FAILED" });
-                    info!("║  Events:     {:^44} ║", result.events_processed);
-                    info!("║  Gas Used:   {:^44} ║", result.gas_usage.gas_used);
-                    info!("╚════════════════════════════════════════════════════════════╝");
-                    
-                    if let Err(e) = result_sender.send(result) {
-                        error!("Failed to send result: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("TEE execution failed: {}", e);
-                }
-            }
+        if let Err(e) = start_server(&http_address, http_port, http_solver_id, http_executor).await {
+            error!("HTTP server failed: {}", e);
         }
-        
-        info!("[TASK_RX] Task processor stopped");
-    });
-
-    // Result sender - sends results back to Validator
-    let result_client = network_client.clone();
-    let result_handle = tokio::spawn(async move {
-        info!("[RESULT_TX] Result sender ready...");
-        
-        while let Some(result) = result_rx.recv().await {
-            // In solver-tee3, we send the TeeExecutionResult back to Validator
-            // The Validator then creates the Event from the result
-            info!("[RESULT_TX] Sending result to Validator...");
-            
-            // TODO: Implement actual RPC call to Validator
-            // For now, just log it
-            info!("[RESULT_TX] Result sent (task_id: {})", hex::encode(&result.task_id[..8]));
-        }
-        
-        info!("[RESULT_TX] Result sender stopped");
     });
 
     // Log startup complete
     info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║              Solver Ready (solver-tee3 Mode)               ║");
+    info!("║              Solver Ready (solver-tee3 Sync HTTP)          ║");
     info!("╠════════════════════════════════════════════════════════════╣");
-    info!("║  Status: Waiting for SolverTasks from Validator            ║");
-    info!("║  Mode:   Pass-through to TEE                               ║");
-    info!("║  Note:   Validator handles coin selection & VLC            ║");
+    info!("║  HTTP Server:  http://{}:{}/api/v1/execute-task {:>11}║", config.address, config.port, "");
+    info!("║  Mode:         Synchronous HTTP (no callback)             ║");
+    info!("║  Note:         Validator sends task, waits for result     ║");
     info!("╚════════════════════════════════════════════════════════════╝");
 
     // Wait for shutdown signal
     tokio::select! {
-        _ = task_handle => {
-            info!("Task processor stopped");
-        }
-        _ = result_handle => {
-            info!("Result sender stopped");
+        _ = http_handle => {
+            info!("HTTP server stopped");
         }
         _ = heartbeat_handle => {
             info!("Heartbeat loop stopped");
