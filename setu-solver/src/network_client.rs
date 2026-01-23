@@ -62,6 +62,12 @@ pub struct SolverNetworkConfig {
     pub validator_port: u16,
     /// Heartbeat interval in seconds
     pub heartbeat_interval_secs: u64,
+    /// Account address for receiving fees
+    pub account_address: String,
+    /// Public key (secp256k1)
+    pub public_key: Vec<u8>,
+    /// Signature for registration
+    pub signature: Vec<u8>,
 }
 
 impl Default for SolverNetworkConfig {
@@ -76,6 +82,9 @@ impl Default for SolverNetworkConfig {
             validator_address: "127.0.0.1".to_string(),
             validator_port: 8080,
             heartbeat_interval_secs: 30,
+            account_address: "0x0000000000000000000000000000000000000000".to_string(),
+            public_key: vec![],
+            signature: vec![],
         }
     }
 }
@@ -133,9 +142,9 @@ impl SolverNetworkClient {
             solver_id: self.config.solver_id.clone(),
             network_address: self.config.address.clone(),
             network_port: self.config.port,
-            account_address: "0x0000000000000000000000000000000000000000".to_string(), // TODO: 从配置读取
-            public_key: vec![],  // TODO: 从配置读取
-            signature: vec![],   // TODO: 实现签名
+            account_address: self.config.account_address.clone(),
+            public_key: self.config.public_key.clone(),
+            signature: self.config.signature.clone(),
             capacity: self.config.capacity,
             shard_id: self.config.shard_id.clone(),
             resources: self.config.resources.clone(),

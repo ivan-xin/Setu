@@ -18,6 +18,7 @@ use setu_solver::{
     SolverNetworkClient, SolverNetworkConfig,
     SolverTask,
 };
+use setu_keys::{KeyPair, load_keypair};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn, error, Level};
@@ -45,6 +46,8 @@ struct SolverConfig {
     heartbeat_interval_secs: u64,
     /// Auto-register on startup
     auto_register: bool,
+    /// Key file path (optional)
+    key_file: Option<String>,
 }
 
 impl SolverConfig {
@@ -89,6 +92,8 @@ impl SolverConfig {
             .map(|s| s.to_lowercase() != "false" && s != "0")
             .unwrap_or(true);
         
+        let key_file = std::env::var("SOLVER_KEY_FILE").ok();
+        
         Self {
             solver_id,
             address,
@@ -100,8 +105,28 @@ impl SolverConfig {
             validator_port,
             heartbeat_interval_secs,
             auto_register,
+            key_file,
         }
     }
+}
+
+/// Load keypair from file and extract registration info
+fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
+    info!("Loading keypair from: {}", key_file);
+    
+    let keypair = load_keypair(key_file)?;
+    let account_address = keypair.address();
+    let public_key = keypair.public_key_bytes();
+    
+    // Create registration message to sign
+    let message = format!("Register Solver: {}", account_address);
+    let signature = keypair.sign(message.as_bytes());
+    
+    info!("Keypair loaded successfully");
+    info!("  Account Address: {}", account_address);
+    info!("  Public Key: {}", hex::encode(&public_key));
+    
+    Ok((account_address, public_key, signature))
 }
 
 #[tokio::main]
@@ -137,6 +162,30 @@ async fn main() -> anyhow::Result<()> {
     info!("│ Mode:        {:^44} │", if tee_executor.enclave_info().is_simulated { "Mock (Development)" } else { "Production" });
     info!("└─────────────────────────────────────────────────────────────┘");
 
+    // Load key info if key file is provided
+    let (account_address, public_key, signature) = if let Some(ref key_file) = config.key_file {
+        match load_key_info(key_file) {
+            Ok(info) => info,
+            Err(e) => {
+                error!("Failed to load key file: {}", e);
+                error!("Using placeholder values for registration");
+                (
+                    "0x0000000000000000000000000000000000000000".to_string(),
+                    vec![],
+                    vec![],
+                )
+            }
+        }
+    } else {
+        warn!("No key file provided (SOLVER_KEY_FILE not set)");
+        warn!("Using placeholder values for registration");
+        (
+            "0x0000000000000000000000000000000000000000".to_string(),
+            vec![],
+            vec![],
+        )
+    };
+
     // Create network client for Validator communication
     let network_config = SolverNetworkConfig {
         solver_id: config.solver_id.clone(),
@@ -148,6 +197,9 @@ async fn main() -> anyhow::Result<()> {
         validator_address: config.validator_address.clone(),
         validator_port: config.validator_port,
         heartbeat_interval_secs: config.heartbeat_interval_secs,
+        account_address: account_address.clone(),
+        public_key: public_key.clone(),
+        signature: signature.clone(),
     };
     
     let network_client = Arc::new(SolverNetworkClient::new(network_config));
