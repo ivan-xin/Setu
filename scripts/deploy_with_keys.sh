@@ -38,9 +38,9 @@ fi
 # Get the project root directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-CLI_BIN="${PROJECT_ROOT${CLI_BIN}"
-VALIDATOR_BIN="${PROJECT_ROOT${VALIDATOR_BIN}"
-SOLVER_BIN="${PROJECT_ROOT${SOLVER_BIN}"
+CLI_BIN="${PROJECT_ROOT}/target/release/setu-cli"
+VALIDATOR_BIN="${PROJECT_ROOT}/target/release/setu-validator"
+SOLVER_BIN="${PROJECT_ROOT}/target/release/setu-solver"
 
 # ============================================
 # Generate Validator Key
