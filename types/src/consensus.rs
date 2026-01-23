@@ -133,6 +133,11 @@ impl Anchor {
     }
     
     /// Compute a hash of this anchor for anchor chain tree
+    /// 
+    /// This hash includes all critical fields:
+    /// - id, depth, previous_anchor (chain structure)
+    /// - events_root, global_state_root, anchor_chain_root (Merkle commitments)
+    /// - vlc_snapshot, timestamp (ordering)
     pub fn compute_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.id.as_bytes());
@@ -143,6 +148,9 @@ impl Anchor {
         if let Some(roots) = &self.merkle_roots {
             hasher.update(&roots.events_root);
             hasher.update(&roots.global_state_root);
+            // Include anchor_chain_root to commit to the entire history
+            // This ensures anchors with different histories produce different hashes
+            hasher.update(&roots.anchor_chain_root);
         }
         hasher.update(self.vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(self.timestamp.to_le_bytes());
