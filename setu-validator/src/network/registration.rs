@@ -25,8 +25,9 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
     async fn register_solver(&self, request: RegisterSolverRequest) -> RegisterSolverResponse {
         info!(
             solver_id = %request.solver_id,
-            address = %request.address,
-            port = request.port,
+            network_address = %request.network_address,
+            network_port = request.network_port,
+            account_address = %request.account_address,
             capacity = request.capacity,
             shard_id = ?request.shard_id,
             "Processing solver registration"
@@ -55,15 +56,17 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             physical_time: current_timestamp_millis(),
         };
 
-        let registration = SolverRegistration {
-            solver_id: request.solver_id.clone(),
-            address: request.address.clone(),
-            port: request.port,
-            capacity: request.capacity,
-            shard_id: request.shard_id.clone(),
-            resources: request.resources.clone(),
-            public_key: request.public_key.clone(),
-        };
+        let registration = SolverRegistration::new(
+            request.solver_id.clone(),
+            request.network_address.clone(),
+            request.network_port,
+            request.account_address.clone(),
+            request.public_key.clone(),
+            request.signature.clone(),
+        )
+        .with_capacity(request.capacity)
+        .with_shard(request.shard_id.clone().unwrap_or_default())
+        .with_resources(request.resources.clone());
 
         let mut event = Event::solver_register(
             registration,
@@ -79,7 +82,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 key: format!("solver:{}", request.solver_id),
                 old_value: None,
                 new_value: Some(
-                    format!("registered:{}:{}", request.address, request.port).into_bytes(),
+                    format!("registered:{}:{}", request.network_address, request.network_port).into_bytes(),
                 ),
             }],
         });
@@ -105,8 +108,10 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
     async fn register_validator(&self, request: RegisterValidatorRequest) -> RegisterValidatorResponse {
         info!(
             validator_id = %request.validator_id,
-            address = %request.address,
-            port = request.port,
+            network_address = %request.network_address,
+            network_port = request.network_port,
+            account_address = %request.account_address,
+            stake_amount = request.stake_amount,
             "Processing validator registration"
         );
 
@@ -120,13 +125,16 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             physical_time: current_timestamp_millis(),
         };
 
-        let registration = ValidatorRegistration {
-            validator_id: request.validator_id.clone(),
-            address: request.address.clone(),
-            port: request.port,
-            public_key: request.public_key.clone(),
-            stake: request.stake,
-        };
+        let registration = ValidatorRegistration::new(
+            request.validator_id.clone(),
+            request.network_address.clone(),
+            request.network_port,
+            request.account_address.clone(),
+            request.public_key.clone(),
+            request.signature.clone(),
+            request.stake_amount,
+        )
+        .with_commission_rate(request.commission_rate);
 
         let mut event = Event::validator_register(
             registration,
@@ -142,7 +150,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                 key: format!("validator:{}", request.validator_id),
                 old_value: None,
                 new_value: Some(
-                    format!("registered:{}:{}", request.address, request.port).into_bytes(),
+                    format!("registered:{}:{}", request.network_address, request.network_port).into_bytes(),
                 ),
             }],
         });
@@ -151,8 +159,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         let now = current_timestamp_secs();
         let validator_info = ValidatorInfo {
             validator_id: request.validator_id.clone(),
-            address: request.address.clone(),
-            port: request.port,
+            address: request.network_address.clone(),
+            port: request.network_port,
             status: "online".to_string(),
             registered_at: now,
         };
@@ -231,13 +239,14 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             })
             .map(|s| SolverListItem {
                 solver_id: s.id,
-                address: s.address.split(':').next().unwrap_or("").to_string(),
-                port: s
+                network_address: s.address.split(':').next().unwrap_or("").to_string(),
+                network_port: s
                     .address
                     .split(':')
                     .nth(1)
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(0),
+                account_address: None,  // TODO: 从 SolverInfo 中获取
                 capacity: s.capacity,
                 current_load: s.current_load,
                 status: format!("{:?}", s.status),

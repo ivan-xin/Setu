@@ -679,8 +679,8 @@ impl ValidatorNetworkService {
                     reg.validator_id.clone(),
                     ValidatorInfo {
                         validator_id: reg.validator_id.clone(),
-                        address: reg.address.clone(),
-                        port: reg.port,
+                        address: reg.network_address.clone(),
+                        port: reg.network_port,
                         status: "online".to_string(),
                         registered_at: event.timestamp / 1000,
                     },
@@ -750,8 +750,9 @@ impl ValidatorNetworkService {
             .values()
             .map(|v| ValidatorListItem {
                 validator_id: v.validator_id.clone(),
-                address: v.address.clone(),
-                port: v.port,
+                network_address: v.address.clone(),
+                network_port: v.port,
+                account_address: None,  // TODO: 从 ValidatorInfo 中获取
                 status: v.status.clone(),
             })
             .collect()
@@ -775,7 +776,7 @@ impl ValidatorNetworkService {
         let (router_tx, _router_rx) = mpsc::unbounded_channel::<Transfer>();
         self.router_manager.register_solver_with_affinity(
             request.solver_id.clone(),
-            format!("{}:{}", request.address, request.port),
+            format!("{}:{}", request.network_address, request.network_port),
             request.capacity,
             router_tx,
             request.shard_id.clone(),
@@ -913,12 +914,14 @@ mod tests {
 
         let request = setu_rpc::RegisterSolverRequest {
             solver_id: "solver-1".to_string(),
-            address: "127.0.0.1".to_string(),
-            port: 9001,
+            network_address: "127.0.0.1".to_string(),
+            network_port: 9001,
+            account_address: "0xtest".to_string(),
+            public_key: vec![],
+            signature: vec![],
             capacity: 100,
             shard_id: Some("shard-0".to_string()),
             resources: vec!["ETH".to_string()],
-            public_key: None,
         };
 
         let response = handler.register_solver(request).await;
@@ -934,10 +937,13 @@ mod tests {
 
         let request = setu_rpc::RegisterValidatorRequest {
             validator_id: "validator-2".to_string(),
-            address: "127.0.0.1".to_string(),
-            port: 9002,
-            public_key: None,
-            stake: Some(1000),
+            network_address: "127.0.0.1".to_string(),
+            network_port: 9002,
+            account_address: "0xtest".to_string(),
+            public_key: vec![],
+            signature: vec![],
+            stake_amount: 1000,
+            commission_rate: 10,
         };
 
         let response = handler.register_validator(request).await;

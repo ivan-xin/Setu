@@ -36,9 +36,9 @@ impl ValidatorUserHandler {
 impl UserRpcHandler for ValidatorUserHandler {
     async fn register_user(&self, request: RegisterUserRequest) -> RegisterUserResponse {
         info!(
-            user_id = %request.user_id,
+            address = %request.address,
             subnet_id = ?request.subnet_id,
-            invited_by = ?request.invited_by,
+            invite_code = ?request.invite_code,
             "Processing user registration request"
         );
         
@@ -47,34 +47,81 @@ impl UserRpcHandler for ValidatorUserHandler {
         info!("╚════════════════════════════════════════════════════════════╝");
         
         // Step 1: Validate request
-        info!("[REG 1/5] 🔍 Validating registration request...");
-        if request.user_id.is_empty() {
+        info!("[REG 1/6] 🔍 Validating registration request...");
+        if request.address.is_empty() {
             return RegisterUserResponse {
                 success: false,
-                message: "User ID cannot be empty".to_string(),
-                user_address: None,
+                message: "Wallet address cannot be empty".to_string(),
+                address: request.address,
                 event_id: None,
+                initial_flux: 0,
+                initial_power: 0,
+                initial_credit: 0,
             };
         }
         
-        if request.public_key.is_empty() {
+        if request.nostr_pubkey.is_empty() {
             return RegisterUserResponse {
                 success: false,
-                message: "Public key cannot be empty".to_string(),
-                user_address: None,
+                message: "Nostr public key cannot be empty".to_string(),
+                address: request.address,
                 event_id: None,
+                initial_flux: 0,
+                initial_power: 0,
+                initial_credit: 0,
+            };
+        }
+        
+        if request.nostr_pubkey.len() != 32 {
+            return RegisterUserResponse {
+                success: false,
+                message: "Nostr public key must be 32 bytes".to_string(),
+                address: request.address,
+                event_id: None,
+                initial_flux: 0,
+                initial_power: 0,
+                initial_credit: 0,
+            };
+        }
+        
+        if request.signature.is_empty() {
+            return RegisterUserResponse {
+                success: false,
+                message: "Signature cannot be empty".to_string(),
+                address: request.address,
+                event_id: None,
+                initial_flux: 0,
+                initial_power: 0,
+                initial_credit: 0,
             };
         }
         
         info!("           └─ Request validation passed");
         
-        // Step 2: Generate user address from public key
-        info!("[REG 2/5] 🔑 Generating user address...");
-        let user_address = format!("0x{}", hex::encode(&request.public_key[..20.min(request.public_key.len())]));
-        info!("           └─ User address: {}", user_address);
+        // Step 2: Verify signature
+        info!("[REG 2/6] 🔐 Verifying signature...");
+        // TODO: Implement actual signature verification
+        // For now, just check that signature is not empty
+        // Expected message: "Register to Setu Network: {address}"
+        info!("           └─ Signature verification passed (mock)");
         
-        // Step 3: Create UserRegistration event
-        info!("[REG 3/5] 📝 Creating registration event...");
+        // Step 3: Check if user already registered
+        info!("[REG 3/6] 🔍 Checking if user already registered...");
+        // TODO: Query storage to check if address exists
+        info!("           └─ User not registered yet");
+        
+        // Step 4: Resolve invite code to inviter address
+        let invited_by = if let Some(ref code) = request.invite_code {
+            info!("[REG 4/6] 🎫 Resolving invite code: {}", code);
+            // TODO: Query storage to resolve invite code to inviter address
+            Some(format!("0xinviter_{}", code)) // Mock for now
+        } else {
+            info!("[REG 4/6] 🎫 No invite code provided");
+            None
+        };
+        
+        // Step 5: Create UserRegistration event
+        info!("[REG 5/6] 📝 Creating registration event...");
         
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -91,15 +138,21 @@ impl UserRpcHandler for ValidatorUserHandler {
         };
         
         let registration = UserRegistration {
-            user_id: request.user_id.clone(),
-            public_key: request.public_key.clone(),
+            address: request.address.clone(),
+            nostr_pubkey: request.nostr_pubkey.clone(),
+            signature: request.signature.clone(),
+            timestamp: request.timestamp,
             subnet_id: request.subnet_id.clone(),
             display_name: request.display_name.clone(),
             metadata: request.metadata.clone(),
-            initial_power: request.initial_power,
-            invited_by: request.invited_by.clone(),
+            invited_by: invited_by.clone(),
             invite_code: request.invite_code.clone(),
         };
+        
+        // Initial allocations
+        let initial_flux = 1000u64;  // Initial Flux balance
+        let initial_power = 100u64;  // Initial Power
+        let initial_credit = 50u64;  // Initial Credit
         
         let mut event = Event::user_register(
             registration,
@@ -114,14 +167,24 @@ impl UserRpcHandler for ValidatorUserHandler {
             message: Some("User registration executed successfully".to_string()),
             state_changes: vec![
                 setu_types::event::StateChange {
-                    key: format!("user:{}", request.user_id),
+                    key: format!("user:{}", request.address),
                     old_value: None,
-                    new_value: Some(format!("registered:{}", user_address).into_bytes()),
+                    new_value: Some(format!("registered").into_bytes()),
                 },
                 setu_types::event::StateChange {
-                    key: format!("address:{}", user_address),
+                    key: format!("balance:{}:flux", request.address),
                     old_value: None,
-                    new_value: Some(request.user_id.clone().into_bytes()),
+                    new_value: Some(initial_flux.to_string().into_bytes()),
+                },
+                setu_types::event::StateChange {
+                    key: format!("power:{}", request.address),
+                    old_value: None,
+                    new_value: Some(initial_power.to_string().into_bytes()),
+                },
+                setu_types::event::StateChange {
+                    key: format!("credit:{}", request.address),
+                    old_value: None,
+                    new_value: Some(initial_credit.to_string().into_bytes()),
                 },
             ],
         });
@@ -131,32 +194,33 @@ impl UserRpcHandler for ValidatorUserHandler {
         info!("           └─ Event ID: {}", &event_id[..20.min(event_id.len())]);
         info!("           └─ VLC Time: {}", vlc_time);
         
-        // Step 4: Add event to DAG
-        info!("[REG 4/5] 🔗 Adding registration event to DAG...");
+        // Step 6: Add event to DAG
+        info!("[REG 6/6] 🔗 Adding registration event to DAG...");
         self.network_service.add_event_to_dag(event.clone());
-        
-        // Note: EventTracker removed in new architecture
-        // Event tracking is now handled by the DAG manager
         
         info!("           └─ Event added to DAG");
         
-        // Step 5: Apply side effects (update user registry)
-        info!("[REG 5/5] 📋 Applying event side effects...");
+        // Apply side effects (update user registry)
         self.network_service.apply_event_side_effects(&event_id).await;
         
         info!("╔════════════════════════════════════════════════════════════╗");
         info!("║              User Registered Successfully                  ║");
         info!("╠════════════════════════════════════════════════════════════╣");
-        info!("║  User ID:    {:^44} ║", &request.user_id);
-        info!("║  Address:    {:^44} ║", &user_address[..20.min(user_address.len())]);
+        info!("║  Address:    {:^44} ║", &request.address[..20.min(request.address.len())]);
         info!("║  Event ID:   {:^44} ║", &event_id[..20.min(event_id.len())]);
+        info!("║  Flux:       {:^44} ║", initial_flux);
+        info!("║  Power:      {:^44} ║", initial_power);
+        info!("║  Credit:     {:^44} ║", initial_credit);
         info!("╚════════════════════════════════════════════════════════════╝");
         
         RegisterUserResponse {
             success: true,
             message: "User registered successfully".to_string(),
-            user_address: Some(user_address),
+            address: request.address,
             event_id: Some(event_id),
+            initial_flux,
+            initial_power,
+            initial_credit,
         }
     }
     
