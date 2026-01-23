@@ -42,17 +42,21 @@ pub struct RegisterSolverRequest {
     /// Unique solver identifier
     pub solver_id: String,
     /// Network address (IP or hostname)
-    pub address: String,
+    pub network_address: String,
     /// Port number
-    pub port: u16,
+    pub network_port: u16,
+    /// Ethereum-style account address for receiving fees
+    pub account_address: String,
+    /// Public key (secp256k1, 65 bytes uncompressed)
+    pub public_key: Vec<u8>,
+    /// Registration signature
+    pub signature: Vec<u8>,
     /// Maximum capacity (concurrent transfers)
     pub capacity: u32,
     /// Optional shard assignment
     pub shard_id: Option<String>,
     /// Resource types this solver can handle
     pub resources: Vec<String>,
-    /// Solver's public key for authentication
-    pub public_key: Option<Vec<u8>>,
 }
 
 /// Response to solver registration
@@ -71,14 +75,20 @@ pub struct RegisterSolverResponse {
 pub struct RegisterValidatorRequest {
     /// Unique validator identifier
     pub validator_id: String,
-    /// Network address
-    pub address: String,
+    /// Network address (IP or hostname)
+    pub network_address: String,
     /// Port number
-    pub port: u16,
-    /// Validator's public key
-    pub public_key: Option<Vec<u8>>,
-    /// Stake amount (for PoS)
-    pub stake: Option<u64>,
+    pub network_port: u16,
+    /// Ethereum-style account address for staking and rewards
+    pub account_address: String,
+    /// Public key (secp256k1, 65 bytes uncompressed)
+    pub public_key: Vec<u8>,
+    /// Registration signature
+    pub signature: Vec<u8>,
+    /// Stake amount in Flux
+    pub stake_amount: u64,
+    /// Commission rate (0-100)
+    pub commission_rate: u8,
 }
 
 /// Response to validator registration
@@ -143,8 +153,9 @@ pub struct GetSolverListRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolverListItem {
     pub solver_id: String,
-    pub address: String,
-    pub port: u16,
+    pub network_address: String,
+    pub network_port: u16,
+    pub account_address: Option<String>,
     pub capacity: u32,
     pub current_load: u32,
     pub status: String,
@@ -168,8 +179,9 @@ pub struct GetValidatorListRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorListItem {
     pub validator_id: String,
-    pub address: String,
-    pub port: u16,
+    pub network_address: String,
+    pub network_port: u16,
+    pub account_address: Option<String>,
     pub status: String,
 }
 

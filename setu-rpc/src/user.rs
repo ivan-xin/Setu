@@ -19,22 +19,24 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 /// Request to register a new user
+/// 
+/// Users register from Nostr applications. The address is derived from their Nostr public key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterUserRequest {
-    /// User's unique identifier (derived from public key)
-    pub user_id: String,
-    /// User's public key for authentication
-    pub public_key: Vec<u8>,
+    /// Ethereum-style address derived from Nostr public key
+    pub address: String,
+    /// Nostr public key (32 bytes, Schnorr x-only public key)
+    pub nostr_pubkey: Vec<u8>,
+    /// Nostr Schnorr signature of the registration event
+    pub signature: Vec<u8>,
+    /// Timestamp (for replay attack prevention)
+    pub timestamp: u64,
     /// Subnet ID to register in (None = root subnet)
     pub subnet_id: Option<String>,
     /// Optional display name
     pub display_name: Option<String>,
     /// Optional metadata (JSON string)
     pub metadata: Option<String>,
-    /// Initial power allocation (if allowed)
-    pub initial_power: Option<u64>,
-    /// Inviter's address (who invited this user)
-    pub invited_by: Option<String>,
     /// Invite code used for registration
     pub invite_code: Option<String>,
 }
@@ -46,10 +48,16 @@ pub struct RegisterUserResponse {
     pub success: bool,
     /// Human-readable message
     pub message: String,
-    /// Assigned user address
-    pub user_address: Option<String>,
+    /// User's registered address (same as request)
+    pub address: String,
     /// Event ID for this registration
     pub event_id: Option<String>,
+    /// Initial Flux balance allocated
+    pub initial_flux: u64,
+    /// Initial Power allocated
+    pub initial_power: u64,
+    /// Initial Credit allocated
+    pub initial_credit: u64,
 }
 
 // ============================================================================
@@ -379,13 +387,13 @@ mod tests {
     #[test]
     fn test_register_user_request_serialization() {
         let request = RegisterUserRequest {
-            user_id: "user-123".to_string(),
-            public_key: vec![1, 2, 3, 4],
+            address: "0x1234567890abcdef".to_string(),
+            nostr_pubkey: vec![1; 32],
+            signature: vec![5, 6, 7, 8],
+            timestamp: 1234567890,
             subnet_id: Some("subnet-1".to_string()),
             display_name: Some("Alice".to_string()),
             metadata: None,
-            initial_power: Some(100),
-            invited_by: Some("user-456".to_string()),
             invite_code: Some("INVITE123".to_string()),
         };
         
@@ -395,9 +403,11 @@ mod tests {
         
         match decoded {
             UserRpcRequest::RegisterUser(req) => {
-                assert_eq!(req.user_id, "user-123");
+                assert_eq!(req.address, "0x1234567890abcdef");
+                assert_eq!(req.nostr_pubkey.len(), 32);
+                assert_eq!(req.timestamp, 1234567890);
                 assert_eq!(req.display_name, Some("Alice".to_string()));
-                assert_eq!(req.invited_by, Some("user-456".to_string()));
+                assert_eq!(req.invite_code, Some("INVITE123".to_string()));
             }
             _ => panic!("Wrong request type"),
         }
