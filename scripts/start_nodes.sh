@@ -17,7 +17,7 @@ echo -e "${GREEN}╚════════════════════
 # Get the project root directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-CLI_BIN="${PROJECT_ROOT}/target/release/setu-cli"
+CLI_BIN="${PROJECT_ROOT}/target/release/setu"
 VALIDATOR_BIN="${PROJECT_ROOT}/target/release/setu-validator"
 SOLVER_BIN="${PROJECT_ROOT}/target/release/setu-solver"
 

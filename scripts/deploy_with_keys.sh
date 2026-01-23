@@ -20,6 +20,13 @@ KEYS_DIR=${DATA_DIR}/keys
 LOGS_DIR=${DATA_DIR}/logs
 PIDS_DIR=${DATA_DIR}/pids
 
+# Get the project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+CLI_BIN="${PROJECT_ROOT}/target/release/setu"
+VALIDATOR_BIN="${PROJECT_ROOT}/target/release/setu-validator"
+SOLVER_BIN="${PROJECT_ROOT}/target/release/setu-solver"
+
 # Create necessary directories
 echo -e "${YELLOW}[1/6] Creating directory structure...${NC}"
 mkdir -p ${KEYS_DIR}
@@ -30,17 +37,11 @@ chmod 700 ${KEYS_DIR}  # Set strict permissions for keys directory
 # Check if already compiled
 if [ ! -f "${VALIDATOR_BIN}" ] || [ ! -f "${SOLVER_BIN}" ] || [ ! -f "${CLI_BIN}" ]; then
     echo -e "${YELLOW}[2/6] Compiling project...${NC}"
+    cd "${PROJECT_ROOT}"
     cargo build --release
 else
     echo -e "${GREEN}[2/6] ✓ Already compiled${NC}"
 fi
-
-# Get the project root directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-CLI_BIN="${PROJECT_ROOT}/target/release/setu-cli"
-VALIDATOR_BIN="${PROJECT_ROOT}/target/release/setu-validator"
-SOLVER_BIN="${PROJECT_ROOT}/target/release/setu-solver"
 
 # ============================================
 # Generate Validator Key
