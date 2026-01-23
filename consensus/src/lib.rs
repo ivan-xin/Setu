@@ -47,7 +47,10 @@ pub mod validator_set;
 pub mod vlc;
 
 // Re-export main types
-pub use anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError};
+pub use anchor_builder::{
+    AnchorBuilder, AnchorBuildResult, AnchorBuildError,
+    PendingAnchorBuild, BuilderStateSnapshot, StateChangeEntry,
+};
 pub use broadcaster::{
     ConsensusBroadcaster, BroadcastError, BroadcastResult,
     NoOpBroadcaster, MockBroadcaster, OptionalBroadcaster,

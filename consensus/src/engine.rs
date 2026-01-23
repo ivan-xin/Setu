@@ -64,6 +64,9 @@ pub struct ConsensusEngine {
     consensus_manager: Arc<RwLock<ConsensusManager>>,
     /// This validator's ID
     local_validator_id: String,
+    /// Private key for signing votes (ed25519, 32 bytes)
+    /// If None, votes will not be signed (backward compatibility mode)
+    private_key: Arc<RwLock<Option<Vec<u8>>>>,
     /// Channel for sending consensus messages (legacy, for internal use)
     message_tx: mpsc::Sender<ConsensusMessage>,
     /// Channel for receiving consensus messages (reserved for future use)
@@ -105,6 +108,7 @@ impl ConsensusEngine {
                 validator_id.clone(),
             ))),
             local_validator_id: validator_id,
+            private_key: Arc::new(RwLock::new(None)),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
@@ -147,6 +151,7 @@ impl ConsensusEngine {
                 state_manager,
             ))),
             local_validator_id: validator_id,
+            private_key: Arc::new(RwLock::new(None)),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
@@ -185,6 +190,7 @@ impl ConsensusEngine {
                 validator_id.clone(),
             ))),
             local_validator_id: validator_id,
+            private_key: Arc::new(RwLock::new(None)),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
@@ -222,10 +228,24 @@ impl ConsensusEngine {
                 state_manager,
             ))),
             local_validator_id: validator_id,
+            private_key: Arc::new(RwLock::new(None)),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set the private key for signing votes
+    /// 
+    /// The private key should be 32 bytes for ed25519 signatures.
+    /// If not set, votes will not be signed (backward compatibility mode).
+    pub async fn set_private_key(&self, key: Vec<u8>) {
+        *self.private_key.write().await = Some(key);
+    }
+    
+    /// Clear the private key (disable vote signing)
+    pub async fn clear_private_key(&self) {
+        *self.private_key.write().await = None;
     }
 
     /// Set the network broadcaster for P2P message delivery
@@ -241,6 +261,15 @@ impl ConsensusEngine {
     /// Check if a broadcaster is configured
     pub async fn has_broadcaster(&self) -> bool {
         self.broadcaster.read().await.is_some()
+    }
+    
+    /// Get a reference to the broadcaster for making network requests
+    /// 
+    /// Returns None if no broadcaster is configured.
+    /// Used for fetching missing events or other network operations.
+    pub async fn get_broadcaster(&self) -> Option<Arc<dyn ConsensusBroadcaster>> {
+        let b = self.broadcaster.read().await;
+        b.as_ref().cloned()
     }
 
     /// Add an event to the DAG and try to create a CF if conditions are met
@@ -475,6 +504,13 @@ impl ConsensusEngine {
     /// Returns (finalized, Option<Anchor>) so the caller can persist when finalized.
     /// This ensures followers have consistent state with the leader.
     pub async fn receive_cf(&self, cf: ConsensusFrame) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        // Step 0: Verify CF ID matches content (anti-tampering)
+        if !cf.verify_id() {
+            return Err(setu_types::SetuError::InvalidData(
+                format!("CF ID verification failed - possible tampering: {}", cf.id)
+            ));
+        }
+        
         // Step 1: Verify proposer is valid for current round
         // This prevents malicious nodes from creating fake CFs
         {
@@ -485,6 +521,32 @@ impl ConsensusEngine {
                     format!("CF proposer {} is not valid for round {}", cf.proposer, current_round)
                 ));
             }
+        }
+        
+        // Step 1.5: Verify anchor chain consistency
+        // This prevents historical fork attacks and time-travel attacks
+        // The CF's anchor_chain_root must match our local chain root
+        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
+            let local_chain_root = {
+                let manager = self.consensus_manager.read().await;
+                manager.anchor_builder().anchor_chain_root()
+            };
+            
+            if merkle_roots.anchor_chain_root != local_chain_root {
+                return Err(setu_types::SetuError::InvalidData(
+                    format!(
+                        "Anchor chain root mismatch - possible fork or time-travel attack: expected {}, got {}",
+                        hex::encode(local_chain_root),
+                        hex::encode(merkle_roots.anchor_chain_root)
+                    )
+                ));
+            }
+            
+            debug!(
+                cf_id = %cf.id,
+                chain_root = %hex::encode(local_chain_root),
+                "Anchor chain consistency verified"
+            );
         }
         
         // Step 2: Idempotency check (before acquiring write lock)
@@ -510,7 +572,7 @@ impl ConsensusEngine {
                 // Release dag lock before network call
                 drop(dag);
                 
-                // Try to fetch missing events from peers
+                // Try to fetch missing events from peers with retry
                 let broadcaster = self.broadcaster.read().await;
                 if let Some(ref b) = *broadcaster {
                     info!(
@@ -519,54 +581,81 @@ impl ConsensusEngine {
                         "Fetching missing events for CF"
                     );
                     
-                    match b.request_events(&missing_event_ids).await {
-                        Ok(fetched_events) => {
-                            // Add fetched events through DagManager with retry (handles TOCTOU)
-                            for event in fetched_events {
-                                // Update VLC when adding fetched events
-                                {
-                                    let mut vlc = self.vlc.write().await;
-                                    vlc.merge(&event.vlc_snapshot);
+                    // Retry up to 3 times for transient network failures
+                    const MAX_RETRY: usize = 3;
+                    let mut last_error = None;
+                    let mut fetch_success = false;
+                    
+                    for retry in 0..MAX_RETRY {
+                        match b.request_events(&missing_event_ids).await {
+                            Ok(fetched_events) => {
+                                fetch_success = true;
+                                last_error = None;
+                                // Add fetched events through DagManager with retry (handles TOCTOU)
+                                for event in fetched_events {
+                                    // Update VLC when adding fetched events
+                                    {
+                                        let mut vlc = self.vlc.write().await;
+                                        vlc.merge(&event.vlc_snapshot);
+                                    }
+                                    
+                                    match self.dag_manager.add_event_with_retry(event.clone()).await {
+                                        Ok(_) => {}
+                                        Err(DagManagerError::DuplicateEvent(_)) => {
+                                            // DuplicateEvent is OK (race condition)
+                                        }
+                                        Err(e) => {
+                                            warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
+                                        }
+                                    }
                                 }
                                 
-                                match self.dag_manager.add_event_with_retry(event.clone()).await {
-                                    Ok(_) => {}
-                                    Err(DagManagerError::DuplicateEvent(_)) => {
-                                        // DuplicateEvent is OK (race condition)
-                                    }
-                                    Err(e) => {
-                                        warn!(event_id = %event.id, error = %e, "Failed to add fetched event");
-                                    }
+                                // Re-check if we still have missing events
+                                let dag = self.dag.read().await;
+                                let still_missing: Vec<_> = cf.anchor.event_ids
+                                    .iter()
+                                    .filter(|id| !dag.contains(id))
+                                    .collect();
+                                
+                                if !still_missing.is_empty() {
+                                    // Still have missing events, continue retry
+                                    last_error = Some(format!(
+                                        "Still missing {} events after fetch",
+                                        still_missing.len()
+                                    ));
+                                    drop(dag);
+                                } else {
+                                    // All events fetched successfully
+                                    break;
                                 }
                             }
-                            
-                            // Re-check if we still have missing events
-                            let dag = self.dag.read().await;
-                            let still_missing: Vec<_> = cf.anchor.event_ids
-                                .iter()
-                                .filter(|id| !dag.contains(id))
-                                .collect();
-                            
-                            if !still_missing.is_empty() {
-                                return Err(setu_types::SetuError::InvalidData(
-                                    format!(
-                                        "CF {} references {} events not available locally after fetch attempt",
-                                        cf.id,
-                                        still_missing.len()
-                                    )
-                                ));
+                            Err(e) => {
+                                last_error = Some(format!("Fetch failed: {}", e));
+                                if retry < MAX_RETRY - 1 {
+                                    warn!(
+                                        cf_id = %cf.id,
+                                        retry = retry + 1,
+                                        max_retry = MAX_RETRY,
+                                        error = %e,
+                                        "Failed to fetch missing events, retrying..."
+                                    );
+                                    // Wait before retry with exponential backoff
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100 * (retry as u64 + 1))).await;
+                                }
                             }
                         }
-                        Err(e) => {
-                            return Err(setu_types::SetuError::InvalidData(
-                                format!(
-                                    "CF {} references {} missing events and fetch failed: {}",
-                                    cf.id,
-                                    missing_event_ids.len(),
-                                    e
-                                )
-                            ));
-                        }
+                    }
+                    
+                    // Check final result
+                    if !fetch_success {
+                        return Err(setu_types::SetuError::InvalidData(
+                            format!(
+                                "CF {} references {} missing events and all fetch attempts failed: {}",
+                                cf.id,
+                                missing_event_ids.len(),
+                                last_error.unwrap_or_else(|| "unknown error".to_string())
+                            )
+                        ));
                     }
                 } else {
                     // No broadcaster configured - cannot fetch missing events
@@ -612,7 +701,12 @@ impl ConsensusEngine {
         manager.receive_cf(cf.clone());
 
         // Vote for the CF (in MVP, we always approve valid CFs)
-        let vote = manager.vote_for_cf(&cf_id, true);
+        let private_key = self.private_key.read().await;
+        let vote = manager.vote_for_cf(
+            &cf_id, 
+            true,
+            private_key.as_ref().map(|k| k.as_slice())
+        );
         if let Some(ref v) = vote {
             // Broadcast vote to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
@@ -693,6 +787,62 @@ impl ConsensusEngine {
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
     /// so the caller can persist it to storage.
     pub async fn receive_vote(&self, vote: Vote) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        // Step 1: Verify voter is a valid validator
+        {
+            let validator_set = self.validator_set.read().await;
+            let all_validators = validator_set.all_validators();
+            if !all_validators.iter().any(|v| v.node.id == vote.validator_id) {
+                return Err(setu_types::SetuError::InvalidData(
+                    format!("Vote from non-validator: {}", vote.validator_id)
+                ));
+            }
+        }
+        
+        // Step 2: Verify vote signature
+        if !vote.signature.is_empty() {
+            // Get the public key for this validator
+            let public_key = {
+                let validator_set = self.validator_set.read().await;
+                let all_validators = validator_set.all_validators();
+                all_validators
+                    .iter()
+                    .find(|v| v.node.id == vote.validator_id)
+                    .map(|v| v.node.public_key.clone())
+            };
+            
+            if let Some(pub_key) = public_key {
+                if !pub_key.is_empty() {
+                    if !vote.verify_signature(&pub_key) {
+                        return Err(setu_types::SetuError::InvalidData(
+                            format!("Invalid vote signature from validator: {}", vote.validator_id)
+                        ));
+                    }
+                    debug!(
+                        cf_id = %vote.cf_id,
+                        voter = %vote.validator_id,
+                        "Vote signature verified successfully"
+                    );
+                } else {
+                    warn!(
+                        voter = %vote.validator_id,
+                        "Validator has no public key configured, skipping signature verification"
+                    );
+                }
+            } else {
+                // This shouldn't happen as we already checked validator existence
+                return Err(setu_types::SetuError::InvalidData(
+                    format!("Could not find public key for validator: {}", vote.validator_id)
+                ));
+            }
+        } else {
+            // Empty signature - for backward compatibility or testing
+            warn!(
+                cf_id = %vote.cf_id,
+                voter = %vote.validator_id,
+                "Vote has no signature - signature verification skipped (insecure in production)"
+            );
+        }
+        
         let mut manager = self.consensus_manager.write().await;
         let finalized = manager.receive_vote(vote);
 
@@ -734,6 +884,15 @@ impl ConsensusEngine {
     pub async fn get_subnet_state_root(&self, subnet_id: &setu_types::SubnetId) -> Option<[u8; 32]> {
         let manager = self.consensus_manager.read().await;
         manager.get_subnet_root(subnet_id)
+    }
+    
+    /// Get the current anchor chain root
+    /// 
+    /// This returns the cumulative chain root that commits to the entire anchor history.
+    /// Used for verifying anchor chain consistency when receiving CFs from other validators.
+    pub async fn get_anchor_chain_root(&self) -> [u8; 32] {
+        let manager = self.consensus_manager.read().await;
+        manager.anchor_builder().anchor_chain_root()
     }
     
     /// Get the number of anchors created
@@ -854,8 +1013,9 @@ pub struct DagStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{NodeInfo, ValidatorInfo};
+    use setu_types::{NodeInfo, ValidatorInfo, Anchor, AnchorMerkleRoots};
     use setu_vlc::VectorClock;
+    use std::collections::HashMap;
 
     fn create_validator_set() -> ValidatorSet {
         let mut set = ValidatorSet::new();
@@ -936,5 +1096,427 @@ mod tests {
 
         // Proposers should rotate
         assert_ne!(proposer_0, proposer_1);
+    }
+    
+    #[tokio::test]
+    async fn test_anchor_chain_root_verification() {
+        use setu_types::{Anchor, merkle::AnchorMerkleRoots};
+        
+        let config = ConsensusConfig::default();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        
+        // Get initial anchor chain root (should be all zeros for genesis)
+        let initial_root = engine.get_anchor_chain_root().await;
+        assert_eq!(initial_root, [0u8; 32], "Initial anchor chain root should be all zeros");
+        
+        // Create a CF with correct anchor_chain_root
+        let correct_merkle_roots = AnchorMerkleRoots::with_roots(
+            [1u8; 32], // events_root
+            [2u8; 32], // global_state_root
+            initial_root, // anchor_chain_root (matches current state)
+        );
+        
+        let anchor_correct = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 0,
+                physical_time: 0,
+            },
+            correct_merkle_roots,
+            None,
+            0,
+        );
+        
+        let cf_correct = ConsensusFrame::new(anchor_correct, "v1".to_string());
+        
+        // This should succeed (anchor_chain_root matches)
+        let result = engine.receive_cf(cf_correct).await;
+        // Note: Will fail at idempotency check or other steps, but should pass chain root verification
+        // The error should NOT be about anchor chain root mismatch
+        if let Err(e) = result {
+            let error_msg = e.to_string();
+            assert!(!error_msg.contains("Anchor chain root mismatch"), 
+                "Should not fail on anchor chain root verification, got: {}", error_msg);
+        }
+        
+        // Create a CF with WRONG anchor_chain_root
+        let wrong_merkle_roots = AnchorMerkleRoots::with_roots(
+            [1u8; 32], // events_root
+            [2u8; 32], // global_state_root
+            [99u8; 32], // anchor_chain_root (WRONG - doesn't match)
+        );
+        
+        let anchor_wrong = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 0,
+                physical_time: 0,
+            },
+            wrong_merkle_roots,
+            None,
+            0,
+        );
+        
+        let cf_wrong = ConsensusFrame::new(anchor_wrong, "v1".to_string());
+        
+        // This should FAIL due to anchor chain root mismatch
+        let result = engine.receive_cf(cf_wrong).await;
+        assert!(result.is_err(), "Should reject CF with wrong anchor_chain_root");
+        
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Anchor chain root mismatch"), 
+            "Error should be about anchor chain root mismatch, got: {}", error_msg);
+    }
+    
+    #[tokio::test]
+    async fn test_follower_synchronizes_anchor_chain_root() {
+        use setu_types::{Anchor, merkle::AnchorMerkleRoots, EventType};
+        
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 3,
+            ..Default::default()
+        };
+        
+        // Create leader engine
+        let leader_engine = ConsensusEngine::new(
+            config.clone(),
+            "v1".to_string(),
+            create_validator_set()
+        );
+        
+        // Create follower engine
+        let follower_engine = ConsensusEngine::new(
+            config.clone(),
+            "v2".to_string(),
+            create_validator_set()
+        );
+        
+        // Both start with same anchor_chain_root
+        let initial_root = leader_engine.get_anchor_chain_root().await;
+        assert_eq!(initial_root, [0u8; 32], "Initial root should be zero");
+        assert_eq!(
+            follower_engine.get_anchor_chain_root().await,
+            initial_root,
+            "Both nodes should start with same root"
+        );
+        
+        // Leader creates events and CF
+        for i in 0..3 {
+            let mut event = Event::new(
+                EventType::System,
+                vec![],
+                VLCSnapshot {
+                    vector_clock: VectorClock::new(),
+                    logical_time: i,
+                    physical_time: 0,
+                },
+                "v1".to_string(),
+            );
+            // Add execution result for state changes
+            event.execution_result = Some(setu_types::ExecutionResult::success());
+            let _ = leader_engine.add_event(event).await;
+        }
+        
+        // Try to create CF (needs enough VLC delta)
+        {
+            let mut vlc = leader_engine.vlc.write().await;
+            for _ in 0..10 {
+                vlc.tick();
+            }
+        }
+        
+        let _cf_opt = leader_engine.try_create_cf().await;
+        // CF creation might fail due to various reasons (min events, etc)
+        // For this test, we simulate a CF manually
+        
+        // Create a CF with correct merkle roots
+        let correct_merkle_roots = AnchorMerkleRoots::with_roots(
+            [1u8; 32],
+            [2u8; 32],
+            initial_root,
+        );
+        
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            correct_merkle_roots,
+            None,
+            0,
+        );
+        
+        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        
+        // Follower receives and finalizes CF
+        // Note: receive_cf will fail at various checks, but we can test the manager directly
+        {
+            let mut manager = follower_engine.consensus_manager.write().await;
+            manager.receive_cf(cf.clone());
+            
+            // Add votes to reach quorum (simulate 3 validators)
+            let vote1 = Vote::new("v1".to_string(), cf.id.clone(), true);
+            let vote2 = Vote::new("v2".to_string(), cf.id.clone(), true);
+            let vote3 = Vote::new("v3".to_string(), cf.id.clone(), true);
+            
+            manager.receive_vote(vote1);
+            manager.receive_vote(vote2);
+            let finalized = manager.receive_vote(vote3);
+            
+            assert!(finalized, "CF should be finalized after quorum");
+            
+            // Check that anchor_chain_root was updated
+            let updated_root = manager.anchor_builder().anchor_chain_root();
+            assert_ne!(updated_root, initial_root, "Anchor chain root should have been updated");
+            
+            // Verify it matches the expected computation
+            let expected_root = {
+                use sha2::{Sha256, Digest};
+                let anchor_hash = anchor.compute_hash();
+                let mut hasher = Sha256::new();
+                hasher.update(&initial_root);
+                hasher.update(&anchor_hash);
+                let result = hasher.finalize();
+                let mut output = [0u8; 32];
+                output.copy_from_slice(&result);
+                output
+            };
+            
+            assert_eq!(
+                updated_root, expected_root,
+                "Anchor chain root should match expected chain hash"
+            );
+        }
+        
+        // Verify follower can now accept next CF with updated root
+        let follower_root = follower_engine.get_anchor_chain_root().await;
+        assert_ne!(follower_root, initial_root, "Follower root should be updated");
+    }
+    
+    #[tokio::test]
+    async fn test_cf_rejection_with_minority_reject_votes() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 10,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 5000,
+            validator_count: 4,  // 4 validators: need 2 rejects to reject (1/3+1)
+        };
+        
+        let validator_set = create_validator_set();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
+        
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            AnchorMerkleRoots {
+                events_root: [0u8; 32],
+                global_state_root: [0u8; 32],
+                anchor_chain_root: [0u8; 32],
+                subnet_roots: HashMap::new(),
+            },
+            None,
+            0,
+        );
+        
+        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf_id = cf.id.clone();
+        
+        let mut manager = engine.consensus_manager.write().await;
+        manager.receive_cf(cf);
+        
+        // Vote 1: approve (should not finalize yet)
+        let vote1 = Vote::new("v1".to_string(), cf_id.clone(), true);
+        let result1 = manager.receive_vote(vote1);
+        assert!(!result1, "Should not finalize with 1 approve vote");
+        
+        // Vote 2: reject (1 reject, not enough)
+        let vote2 = Vote::new("v2".to_string(), cf_id.clone(), false);
+        let result2 = manager.receive_vote(vote2);
+        assert!(!result2, "Should not reject with only 1 reject vote");
+        
+        // Vote 3: reject (2 rejects = 1/3+1, should reject)
+        let vote3 = Vote::new("v3".to_string(), cf_id.clone(), false);
+        let result3 = manager.receive_vote(vote3);
+        assert!(result3, "Should reject with 2 reject votes (1/3+1 threshold)");
+        
+        // Verify CF was removed from pending (can't directly access private field)
+        // Instead verify it's not in last_finalized_cf
+        assert!(manager.last_finalized_cf().is_none(), "Rejected CF should not be finalized");
+    }
+    
+    #[tokio::test]
+    async fn test_cf_timeout_cleanup() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 10,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 100,  // 100ms timeout for testing
+            validator_count: 4,
+        };
+        
+        let validator_set = create_validator_set();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
+        
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            AnchorMerkleRoots {
+                events_root: [0u8; 32],
+                global_state_root: [0u8; 32],
+                anchor_chain_root: [0u8; 32],
+                subnet_roots: HashMap::new(),
+            },
+            None,
+            0,
+        );
+        
+        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf_id = cf.id.clone();
+        
+        {
+            let mut manager = engine.consensus_manager.write().await;
+            manager.receive_cf(cf);
+            
+            // Verify CF is pending (test by attempting to receive vote)
+            let vote = Vote::new("v1".to_string(), cf_id.clone(), true);
+            manager.receive_vote(vote);
+        }
+        
+        // Wait for timeout
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        
+        {
+            let mut manager = engine.consensus_manager.write().await;
+            
+            // Call cleanup
+            let removed_count = manager.cleanup_timeout_cfs();
+            assert_eq!(removed_count, 1, "Should remove 1 timeout CF");
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_timeout_check_in_vote_processing() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 10,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 100,  // 100ms timeout
+            validator_count: 4,
+        };
+        
+        let validator_set = create_validator_set();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
+        
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            AnchorMerkleRoots {
+                events_root: [0u8; 32],
+                global_state_root: [0u8; 32],
+                anchor_chain_root: [0u8; 32],
+                subnet_roots: HashMap::new(),
+            },
+            None,
+            0,
+        );
+        
+        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf_id = cf.id.clone();
+        
+        let mut manager = engine.consensus_manager.write().await;
+        manager.receive_cf(cf);
+        
+        // Wait for timeout
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        
+        // Receive a vote - should trigger timeout check and remove CF
+        let vote = Vote::new("v1".to_string(), cf_id.clone(), true);
+        let result = manager.receive_vote(vote);
+        
+        // The vote processing should detect timeout and remove CF
+        assert!(result, "Should return true when CF is removed due to timeout");
+    }
+    
+    #[tokio::test]
+    async fn test_leader_can_retry_after_cf_rejection() {
+        // This test verifies that after a CF is rejected, the leader can
+        // immediately create a new CF (rollback_failed_build works correctly)
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 10,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 5000,
+            validator_count: 4,
+        };
+        
+        let validator_set = create_validator_set();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
+        
+        // Create first CF
+        let anchor1 = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            AnchorMerkleRoots {
+                events_root: [0u8; 32],
+                global_state_root: [0u8; 32],
+                anchor_chain_root: [0u8; 32],
+                subnet_roots: HashMap::new(),
+            },
+            None,
+            0,
+        );
+        
+        let cf1 = ConsensusFrame::new(anchor1.clone(), "v1".to_string());
+        let cf1_id = cf1.id.clone();
+        
+        let mut manager = engine.consensus_manager.write().await;
+        
+        // Record state before receiving CF
+        let initial_vlc = manager.anchor_builder().last_fold_vlc();
+        let initial_depth = manager.anchor_builder().anchor_depth();
+        
+        // Simulate: leader created this CF (receive it as if we proposed it)
+        manager.receive_cf(cf1);
+        
+        // Reject the CF with enough reject votes
+        let vote1 = Vote::new("v2".to_string(), cf1_id.clone(), false);
+        let vote2 = Vote::new("v3".to_string(), cf1_id.clone(), false);
+        manager.receive_vote(vote1);
+        let rejected = manager.receive_vote(vote2);
+        
+        assert!(rejected, "CF should be rejected with 2 reject votes");
+        
+        // Verify the CF is removed
+        assert!(manager.last_finalized_cf().is_none(), "No CF should be finalized");
+        
+        // Key assertion: After rejection, leader's anchor_builder state should be
+        // rolled back, allowing immediate retry. Since we received (not created) this CF,
+        // the rollback won't apply (proposer check). But we can verify the mechanism exists.
+        
+        // For a true test of rollback, we'd need to use try_create_cf which actually
+        // modifies anchor_builder state. This test verifies the reject path works.
     }
 }

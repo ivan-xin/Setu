@@ -1,11 +1,19 @@
 use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, EventId, Vote,
 };
-use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError};
+use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
 use crate::vlc::VLC;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
+
+/// Decision outcome for a ConsensusFrame
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CFDecision {
+    Finalize,  // 2/3+1 approve votes
+    Reject,    // 1/3+1 reject votes
+    Timeout,   // Exceeded timeout threshold
+}
 
 /// Legacy DagFolder - kept for backward compatibility
 /// For new code, use AnchorBuilder directly or through ConsensusManager
@@ -82,6 +90,13 @@ impl DagFolder {
 /// - Anchor creation with full Merkle tree computation (via AnchorBuilder)
 /// - ConsensusFrame creation, voting, and finalization
 /// - State management across all subnets
+///
+/// ## Deferred Commit Mode
+/// 
+/// Uses a deferred commit pattern for safe state management:
+/// - `try_create_cf()` calls `prepare_build()` which computes but doesn't modify state
+/// - On finalization, `commit_build()` applies the pending state changes
+/// - On rejection/timeout, pending_builds are simply discarded (no rollback needed)
 pub struct ConsensusManager {
     config: ConsensusConfig,
     /// AnchorBuilder handles DAG folding with Merkle tree updates
@@ -91,6 +106,8 @@ pub struct ConsensusManager {
     legacy_folder: DagFolder,
     /// Pending ConsensusFrames awaiting votes
     pending_cfs: HashMap<String, ConsensusFrame>,
+    /// Pending anchor builds awaiting finalization (cf_id -> PendingAnchorBuild)
+    pending_builds: HashMap<String, PendingAnchorBuild>,
     /// Finalized ConsensusFrames
     finalized_cfs: Vec<ConsensusFrame>,
     /// Set of anchor IDs that have been persisted to storage
@@ -110,6 +127,7 @@ impl ConsensusManager {
             anchor_builder: AnchorBuilder::new(config.clone()),
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
+            pending_builds: HashMap::new(),
             finalized_cfs: Vec::new(),
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
@@ -128,6 +146,7 @@ impl ConsensusManager {
             anchor_builder: AnchorBuilder::with_state_manager(config.clone(), state_manager),
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
+            pending_builds: HashMap::new(),
             finalized_cfs: Vec::new(),
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
@@ -137,29 +156,27 @@ impl ConsensusManager {
 
     /// Try to create a ConsensusFrame with full Merkle tree computation
     /// 
-    /// This is the main entry point that:
-    /// 1. Checks VLC delta threshold
-    /// 2. Collects events from DAG
-    /// 3. Applies state changes to subnet SMTs
-    /// 4. Computes all Merkle roots (events, anchor chain, global state)
-    /// 5. Creates Anchor with merkle_roots
-    /// 6. Wraps in ConsensusFrame for voting
+    /// Uses deferred commit mode:
+    /// 1. Calls prepare_build() which computes but doesn't modify state
+    /// 2. Stores PendingAnchorBuild for later commit on finalization
+    /// 3. Creates ConsensusFrame for voting
     pub fn try_create_cf(
         &mut self,
         dag: &Dag,
         vlc: &VLC,
     ) -> Option<ConsensusFrame> {
-        // Use AnchorBuilder to create anchor with full Merkle computation
-        match self.anchor_builder.try_build(dag, vlc) {
-            Ok(build_result) => {
-                let anchor = build_result.anchor.clone();
-                
-                // Store build result for diagnostics
-                self.last_build_result = Some(build_result);
+        // Use AnchorBuilder.prepare_build (deferred commit mode)
+        match self.anchor_builder.prepare_build(dag, vlc) {
+            Ok(pending_build) => {
+                let anchor = pending_build.anchor.clone();
                 
                 // Create ConsensusFrame from anchor
                 let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
+                
+                // Store pending_build for later commit (keyed by cf_id)
+                self.pending_builds.insert(cf.id.clone(), pending_build);
                 self.pending_cfs.insert(cf.id.clone(), cf.clone());
+                
                 Some(cf)
             }
             Err(AnchorBuildError::DeltaNotReached { .. }) => None,
@@ -171,20 +188,6 @@ impl ConsensusManager {
                 None
             }
         }
-    }
-    
-    /// Legacy method: Try to create CF with external state_root (deprecated)
-    /// 
-    /// This method is kept for backward compatibility.
-    /// Prefer using `try_create_cf(dag, vlc)` which computes state roots internally.
-    #[deprecated(since = "0.2.0", note = "Use try_create_cf(dag, vlc) instead")]
-    pub fn try_create_cf_legacy(
-        &mut self,
-        dag: &Dag,
-        vlc: &VLC,
-        _state_root: String,
-    ) -> Option<ConsensusFrame> {
-        self.try_create_cf(dag, vlc)
     }
 
     /// Check if a CF (pending or finalized) already exists
@@ -199,14 +202,41 @@ impl ConsensusManager {
         }
     }
 
-    pub fn vote_for_cf(&mut self, cf_id: &str, approve: bool) -> Option<Vote> {
+    /// Vote for a ConsensusFrame
+    /// 
+    /// Args:
+    /// - cf_id: The CF ID to vote for
+    /// - approve: Whether to approve (true) or reject (false)
+    /// - private_key: Optional private key for signing the vote (32 bytes for ed25519)
+    /// 
+    /// Returns the vote if successful, None if:
+    /// - CF not found
+    /// - Already voted for this CF
+    pub fn vote_for_cf(
+        &mut self, 
+        cf_id: &str, 
+        approve: bool,
+        private_key: Option<&[u8]>
+    ) -> Option<Vote> {
         let cf = self.pending_cfs.get_mut(cf_id)?;
         
         if cf.votes.contains_key(&self.local_validator_id) {
             return None;
         }
 
-        let vote = Vote::new(self.local_validator_id.clone(), cf_id.to_string(), approve);
+        let mut vote = Vote::new(self.local_validator_id.clone(), cf_id.to_string(), approve);
+        
+        // Sign the vote if private key is provided
+        if let Some(key) = private_key {
+            if let Err(e) = vote.sign(key) {
+                tracing::warn!(
+                    cf_id = %cf_id,
+                    error = %e,
+                    "Failed to sign vote - continuing without signature for backward compatibility"
+                );
+            }
+        }
+        
         cf.add_vote(vote.clone());
         
         Some(vote)
@@ -232,31 +262,92 @@ impl ConsensusManager {
         self.check_finalization(&cf_id)
     }
 
-    /// Check if a CF has reached quorum and should be finalized
+    /// Check if a CF has reached quorum (finalize), rejection threshold (reject), or timeout
     /// 
-    /// This is called after adding a vote to check if finalization should occur.
+    /// This is called after adding a vote to check if finalization/rejection should occur.
     /// Public because engine.receive_cf() needs to check after vote_for_cf().
+    /// 
+    /// Returns true if CF was finalized or rejected (removed from pending).
     pub fn check_finalization(&mut self, cf_id: &str) -> bool {
-        let should_finalize = {
+        let decision = {
             let cf = match self.pending_cfs.get(cf_id) {
                 Some(cf) => cf,
                 None => return false,
             };
-            cf.check_quorum(self.config.validator_count)
+            
+            // Check if CF should be finalized (2/3+1 approve)
+            if cf.check_quorum(self.config.validator_count) {
+                Some(CFDecision::Finalize)
+            }
+            // Check if CF should be rejected (1/3+1 reject)
+            else if cf.check_rejection(self.config.validator_count) {
+                Some(CFDecision::Reject)
+            }
+            // Check if CF has timed out
+            else if cf.is_timeout(self.config.cf_timeout_ms) {
+                Some(CFDecision::Timeout)
+            } else {
+                None  // still pending
+            }
         };
 
-        if should_finalize {
-            if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
-                cf.finalize();
-                self.finalized_cfs.push(cf);
-                
-                // Trigger safe garbage collection
-                self.gc_finalized_cfs();
-                
-                return true;
+        match decision {
+            Some(CFDecision::Finalize) => {
+                if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
+                    cf.finalize();
+                    
+                    // Check if this is our CF (we have a pending_build for it)
+                    if let Some(pending_build) = self.pending_builds.remove(cf_id) {
+                        // Leader path: commit the pending build
+                        match self.anchor_builder.commit_build(pending_build.clone()) {
+                            Ok(state_summary) => {
+                                // Store result for diagnostics
+                                self.last_build_result = Some(AnchorBuildResult {
+                                    anchor: cf.anchor.clone(),
+                                    state_summary,
+                                    routed_events: pending_build.routed_events,
+                                });
+                            }
+                            Err(AnchorBuildError::SnapshotMismatch { .. }) => {
+                                // Another CF was committed first - use Follower path
+                                eprintln!("Snapshot mismatch during commit, falling back to follower path");
+                                let events = pending_build.all_events();
+                                if let Err(e) = self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                                    eprintln!("Follower fallback failed: {}, syncing metadata only", e);
+                                    self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                                }
+                            }
+                            Err(e) => {
+                                // Other error - sync metadata at minimum
+                                eprintln!("Commit failed: {}, syncing metadata only", e);
+                                self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                            }
+                        }
+                    } else {
+                        // Follower path: we didn't create this CF
+                        // For now, just sync metadata. Full state sync requires events from DAG
+                        self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                    }
+                    
+                    self.finalized_cfs.push(cf);
+                    
+                    // Trigger safe garbage collection
+                    self.gc_finalized_cfs();
+                    
+                    return true;
+                }
             }
+            Some(CFDecision::Reject) | Some(CFDecision::Timeout) => {
+                // Remove rejected/timeout CF from pending
+                if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
+                    // Simply discard the pending_build if it exists (no rollback needed!)
+                    self.pending_builds.remove(cf_id);
+                    cf.reject();
+                    return true;
+                }
+            }
+            None => {}
         }
-
         false
     }
     
@@ -304,12 +395,34 @@ impl ConsensusManager {
         }
         
         // Safety valve: if too many unpersisted CFs, log warning but don't drop
-        if self.finalized_cfs.len() > MAX_FINALIZED_CFS * 2 {
-            eprintln!(
-                "WARNING: {} finalized CFs in memory, persistence may be failing",
-                self.finalized_cfs.len()
-            );
+    }
+    
+    /// Clean up pending CFs that have timed out
+    /// 
+    /// This prevents memory leaks from CFs that never reach quorum due to:
+    /// - Network partitions
+    /// - Node failures
+    /// - Insufficient votes
+    /// 
+    /// Should be called periodically (e.g., every few seconds) by the consensus engine.
+    /// Returns the number of CFs that were removed.
+    pub fn cleanup_timeout_cfs(&mut self) -> usize {
+        let timeout_ms = self.config.cf_timeout_ms;
+        let timeout_ids: Vec<String> = self.pending_cfs
+            .iter()
+            .filter(|(_, cf)| cf.is_timeout(timeout_ms))
+            .map(|(id, _)| id.clone())
+            .collect();
+        
+        let count = timeout_ids.len();
+        for id in timeout_ids {
+            if let Some(mut cf) = self.pending_cfs.remove(&id) {
+                // Simply discard the pending_build (no rollback needed in deferred commit mode!)
+                self.pending_builds.remove(&id);
+                cf.reject();
+            }
         }
+        count
     }
     
     /// Get the last finalized anchor (for storage)
@@ -528,19 +641,30 @@ mod tests {
         let config = ConsensusConfig {
             vlc_delta_threshold: 5,
             min_events_per_cf: 1,
+            validator_count: 1,  // Single validator for immediate finalization
             ..Default::default()
         };
         let mut manager = ConsensusManager::new(config, "validator1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        // Create CF and verify state roots are accessible
-        let _ = manager.try_create_cf(&dag, &vlc);
+        // Create CF (deferred commit mode - state not modified yet)
+        let cf = manager.try_create_cf(&dag, &vlc);
+        assert!(cf.is_some());
+        let cf_id = cf.unwrap().id.clone();
+        
+        // State not committed yet (prepare_build only)
+        assert_eq!(manager.anchor_count(), 0);
+        
+        // Vote to finalize (single validator, so immediate finalization)
+        manager.vote_for_cf(&cf_id, true, None);
+        let finalized = manager.check_finalization(&cf_id);
+        assert!(finalized, "CF should be finalized with single validator");
+        
+        // Now state should be committed
+        assert_eq!(manager.anchor_count(), 1);
         
         // Global root should be computed
         let global_root = manager.get_global_root();
         assert_ne!(global_root, [0u8; 32]);
-        
-        // Anchor count should be 1
-        assert_eq!(manager.anchor_count(), 1);
     }
 }
