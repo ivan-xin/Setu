@@ -14,12 +14,12 @@ use setu_validator::{
     ValidatorNetworkService, NetworkServiceConfig,
 };
 use setu_types::event::Event;
+use setu_keys::{KeyPair, load_keypair};
 use std::sync::Arc;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use tracing::{info, error, Level};
+use tracing::{info, error, warn, Level};
 #[cfg(not(debug_assertions))]
-use tracing::warn;
 use tracing_subscriber;
 
 /// Validator configuration from environment
@@ -31,6 +31,8 @@ struct ValidatorConfig {
     http_addr: SocketAddr,
     /// P2P listen address (for future use)
     p2p_addr: SocketAddr,
+    /// Key file path (optional)
+    key_file: Option<String>,
 }
 
 impl ValidatorConfig {
@@ -52,12 +54,34 @@ impl ValidatorConfig {
         let listen_addr = std::env::var("VALIDATOR_LISTEN_ADDR")
             .unwrap_or_else(|_| "127.0.0.1".to_string());
         
+        let key_file = std::env::var("VALIDATOR_KEY_FILE").ok();
+        
         Self {
             node_config,
             http_addr: format!("{}:{}", listen_addr, http_port).parse().unwrap(),
             p2p_addr: format!("{}:{}", listen_addr, p2p_port).parse().unwrap(),
+            key_file,
         }
     }
+}
+
+/// Load keypair from file and extract registration info
+fn load_key_info(key_file: &str) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
+    info!("Loading keypair from: {}", key_file);
+    
+    let keypair = load_keypair(key_file)?;
+    let account_address = keypair.address();
+    let public_key = keypair.public_key_bytes();
+    
+    // Create registration message to sign
+    let message = format!("Register Validator: {}", account_address);
+    let signature = keypair.sign(message.as_bytes());
+    
+    info!("Keypair loaded successfully");
+    info!("  Account Address: {}", account_address);
+    info!("  Public Key: {}", hex::encode(&public_key));
+    
+    Ok((account_address, public_key, signature))
 }
 
 #[tokio::main]
@@ -79,6 +103,25 @@ async fn main() -> anyhow::Result<()> {
     info!("║  HTTP API:   {:^44} ║", config.http_addr);
     info!("║  P2P Addr:   {:^44} ║", config.p2p_addr);
     info!("╚════════════════════════════════════════════════════════════╝");
+
+    // Load key info if key file is provided
+    let _key_info = if let Some(ref key_file) = config.key_file {
+        match load_key_info(key_file) {
+            Ok(info) => {
+                info!("✓ Validator keypair loaded successfully");
+                Some(info)
+            }
+            Err(e) => {
+                warn!("Failed to load key file: {}", e);
+                warn!("Validator will run without keypair (registration features limited)");
+                None
+            }
+        }
+    } else {
+        info!("No key file provided (VALIDATOR_KEY_FILE not set)");
+        info!("Validator will run without keypair (registration features limited)");
+        None
+    };
 
     // Create channels
     // Note: transfer_tx is currently unused - will be needed when Validator processes transfers internally

@@ -19,6 +19,7 @@ setu-enclave = { path = "../crates/setu-enclave", features = ["mock"] }
 setu-storage = { path = "../storage" }
 setu-api = { path = "../api" }
 setu-network-anemo = { path = "../crates/setu-network-anemo" }
+setu-keys = { path = "../crates/setu-keys" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
