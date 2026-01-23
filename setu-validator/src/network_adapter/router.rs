@@ -182,7 +182,13 @@ impl NetworkEventHandler for MessageRouter {
                     
                     // Persist finalized data (same logic as handle_vote)
                     if let Some(anchor) = anchor {
-                        self.persist_finalized_anchor(&anchor).await;
+                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
+                            warn!(
+                                anchor_id = %anchor.id,
+                                error = %e,
+                                "Failed to persist finalized anchor (will retry)"
+                            );
+                        }
                     }
                 } else {
                     debug!(cf_id = %cf_id, "CF proposal processed, awaiting votes");
@@ -217,7 +223,13 @@ impl NetworkEventHandler for MessageRouter {
                     
                     // Persist finalized data
                     if let Some(anchor) = anchor {
-                        self.persist_finalized_anchor(&anchor).await;
+                        if let Err(e) = self.persist_finalized_anchor(&anchor).await {
+                            warn!(
+                                anchor_id = %anchor.id,
+                                error = %e,
+                                "Failed to persist finalized anchor (will retry)"
+                            );
+                        }
                     }
                 }
             }

@@ -317,7 +317,13 @@ impl ConsensusValidator {
                     event_count = a.event_ids.len(),
                     "CF finalized after local vote, persisting"
                 );
-                self.persist_finalized_anchor(a).await;
+                if let Err(e) = self.persist_finalized_anchor(a).await {
+                    warn!(
+                        anchor_id = %a.id,
+                        error = %e,
+                        "Failed to persist finalized anchor (will retry)"
+                    );
+                }
             }
         }
         
@@ -346,7 +352,13 @@ impl ConsensusValidator {
                     event_count = a.event_ids.len(),
                     "CF finalized via vote, persisting"
                 );
-                self.persist_finalized_anchor(a).await;
+                if let Err(e) = self.persist_finalized_anchor(a).await {
+                    warn!(
+                        anchor_id = %a.id,
+                        error = %e,
+                        "Failed to persist finalized anchor (will retry)"
+                    );
+                }
             }
         }
         
