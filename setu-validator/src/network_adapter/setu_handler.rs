@@ -20,9 +20,37 @@ pub const SETU_ROUTE: &str = "/setu";
 ///
 /// This trait abstracts the storage operations needed for message handling,
 /// allowing different storage backends to be used.
+///
+/// ## Three-Layer Query Requirement
+/// 
+/// Implementations MUST support three-layer query (DAG → EventStore) to ensure
+/// events can be found even after GC. Use `ConsensusEngine::get_events_by_ids_three_layer()`
+/// or equivalent logic:
+/// 
+/// ```ignore
+/// // Step 1: Query DAG (hot data)
+/// let mut results = Vec::new();
+/// let dag = dag_manager.dag().read().await;
+/// for id in event_ids {
+///     if let Some(event) = dag.get_event(id) {
+///         results.push(event.clone());
+///     } else {
+///         store_query_ids.push(id.clone());
+///     }
+/// }
+/// 
+/// // Step 2: Query EventStore for misses (cold data)
+/// if !store_query_ids.is_empty() {
+///     let store_events = event_store.get_events_batch(&store_query_ids).await;
+///     results.extend(store_events);
+/// }
+/// ```
 #[async_trait]
 pub trait MessageHandlerStore: Send + Sync + 'static {
     /// Get events by their IDs
+    /// 
+    /// **IMPORTANT**: Implementation must use three-layer query (DAG → EventStore)
+    /// to find events that may have been GC'd from the active DAG.
     async fn get_events_by_ids(&self, event_ids: &[String]) -> Result<Vec<SerializedEvent>, String>;
     
     /// Store events
