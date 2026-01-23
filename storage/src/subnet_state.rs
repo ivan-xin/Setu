@@ -22,6 +22,7 @@ use std::sync::Arc;
 use sha2::{Sha256, Digest};
 
 /// Manages Object State SMT for a single subnet
+#[derive(Clone)]
 pub struct SubnetStateSMT {
     /// The subnet this SMT belongs to
     subnet_id: SubnetId,
@@ -129,14 +130,34 @@ impl SubnetStateSMT {
 ///
 /// This is the main interface for managing state across all subnets.
 /// It maintains per-subnet SMTs and provides aggregation to a global root.
+///
+/// ## Clone Behavior
+/// 
+/// Clone creates a deep copy of all subnet SMTs. This is used for:
+/// - Computing pending state roots without modifying the original state
+/// - Temporary calculations in deferred commit mode
+/// 
+/// Note: The `store` field is not cloned (set to None in clones) since
+/// cloned instances are for temporary calculations only.
 pub struct GlobalStateManager {
     /// Per-subnet SMT instances
     subnet_states: HashMap<SubnetId, SubnetStateSMT>,
     /// Storage backend (optional, for persistence)
+    /// Note: Not cloned - temporary clones don't need persistence
     #[allow(dead_code)]
     store: Option<Arc<dyn MerkleStore>>,
     /// Current anchor ID
     current_anchor: u64,
+}
+
+impl Clone for GlobalStateManager {
+    fn clone(&self) -> Self {
+        Self {
+            subnet_states: self.subnet_states.clone(),
+            store: None,  // Don't clone store - clones are for temporary calculations
+            current_anchor: self.current_anchor,
+        }
+    }
 }
 
 impl GlobalStateManager {
