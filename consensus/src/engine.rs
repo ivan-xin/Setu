@@ -285,24 +285,27 @@ impl ConsensusEngine {
         }
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
-        let event_id = self.dag_manager
-            .add_event_with_retry(event.clone())
-            .await
-            .map_err(|e| match e {
-                DagManagerError::MissingParent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Missing parent: {}", id))
-                }
-                DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed } => {
-                    setu_types::SetuError::InvalidData(format!(
-                        "Parent {} too old: depth_diff {} > max {}",
-                        parent_id, depth_diff, max_allowed
-                    ))
-                }
-                DagManagerError::DuplicateEvent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Duplicate event: {}", id))
-                }
-                _ => setu_types::SetuError::InvalidData(e.to_string()),
-            })?;
+        // DuplicateEvent is treated as success (idempotent operation)
+        let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
+            Ok(id) => id,
+            Err(DagManagerError::DuplicateEvent(id)) => {
+                // Idempotent: event already exists, treat as success
+                debug!(event_id = %id, "Event already exists in DAG (idempotent)");
+                return Ok(id);
+            }
+            Err(DagManagerError::MissingParent(id)) => {
+                return Err(setu_types::SetuError::InvalidData(format!("Missing parent: {}", id)));
+            }
+            Err(DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed }) => {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Parent {} too old: depth_diff {} > max {}",
+                    parent_id, depth_diff, max_allowed
+                )));
+            }
+            Err(e) => {
+                return Err(setu_types::SetuError::InvalidData(e.to_string()));
+            }
+        };
 
         // Broadcast the new event
         // We broadcast regardless of whether we are the leader, as all validators
@@ -346,24 +349,27 @@ impl ConsensusEngine {
         }
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
-        let event_id = self.dag_manager
-            .add_event_with_retry(event.clone())
-            .await
-            .map_err(|e| match e {
-                DagManagerError::MissingParent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Missing parent: {}", id))
-                }
-                DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed } => {
-                    setu_types::SetuError::InvalidData(format!(
-                        "Parent {} too old: depth_diff {} > max {}",
-                        parent_id, depth_diff, max_allowed
-                    ))
-                }
-                DagManagerError::DuplicateEvent(id) => {
-                    setu_types::SetuError::InvalidData(format!("Duplicate event: {}", id))
-                }
-                _ => setu_types::SetuError::InvalidData(e.to_string()),
-            })?;
+        // DuplicateEvent is treated as success (idempotent operation)
+        let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
+            Ok(id) => id,
+            Err(DagManagerError::DuplicateEvent(id)) => {
+                // Idempotent: event already exists (common during network sync)
+                debug!(event_id = %id, "Event already exists in DAG (idempotent, from network)");
+                return Ok(id);
+            }
+            Err(DagManagerError::MissingParent(id)) => {
+                return Err(setu_types::SetuError::InvalidData(format!("Missing parent: {}", id)));
+            }
+            Err(DagManagerError::ParentTooOld { parent_id, depth_diff, max_allowed }) => {
+                return Err(setu_types::SetuError::InvalidData(format!(
+                    "Parent {} too old: depth_diff {} > max {}",
+                    parent_id, depth_diff, max_allowed
+                )));
+            }
+            Err(e) => {
+                return Err(setu_types::SetuError::InvalidData(e.to_string()));
+            }
+        };
 
         // Note: We do NOT broadcast the event here since it came from the network
         
@@ -929,6 +935,16 @@ impl ConsensusEngine {
     /// Get the current VLC snapshot
     pub async fn get_vlc_snapshot(&self) -> VLCSnapshot {
         self.vlc.read().await.snapshot()
+    }
+
+    /// Atomically increment VLC and return the new snapshot
+    /// 
+    /// This is the correct method to use when assigning VLC to events,
+    /// as it ensures each event gets a unique logical time.
+    pub async fn tick_and_get_vlc(&self) -> VLCSnapshot {
+        let mut vlc = self.vlc.write().await;
+        vlc.tick();  // VLC::tick() uses the node_id internally
+        vlc.snapshot()
     }
 
     /// Get the current tips of the DAG

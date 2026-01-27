@@ -461,9 +461,16 @@ impl ConsensusValidator {
         self.engine.get_dag_stats().await
     }
     
-    /// Get current VLC snapshot
+    /// Get current VLC snapshot (read-only)
     pub async fn vlc_snapshot(&self) -> setu_vlc::VLCSnapshot {
         self.engine.get_vlc_snapshot().await
+    }
+    
+    /// Atomically increment VLC and return the new snapshot
+    /// 
+    /// Use this when assigning VLC to new events to ensure uniqueness.
+    pub async fn tick_and_get_vlc(&self) -> setu_vlc::VLCSnapshot {
+        self.engine.tick_and_get_vlc().await
     }
     
     /// Get current DAG tips
