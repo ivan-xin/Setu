@@ -47,7 +47,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         let _channel = self.service.register_solver_internal(&request);
 
         // Create registration event
-        let vlc_time = self.service.next_vlc();
+        let vlc_time = self.service.get_vlc_time().await;
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.service.validator_id());
         let vlc_snapshot = setu_vlc::VLCSnapshot {
@@ -87,9 +87,9 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
             }],
         });
 
-        // Add event to DAG
+        // Add event to DAG (async to support consensus submission)
         let event_id = event.id.clone();
-        self.service.add_event_to_dag(event);
+        self.service.add_event_to_dag(event).await;
 
         info!(
             solver_id = %request.solver_id,
@@ -116,7 +116,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         );
 
         // Create registration event
-        let vlc_time = self.service.next_vlc();
+        let vlc_time = self.service.get_vlc_time().await;
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.service.validator_id());
         let vlc_snapshot = setu_vlc::VLCSnapshot {
@@ -166,8 +166,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         };
         self.service.add_validator(validator_info);
 
-        // Add event to DAG
-        self.service.add_event_to_dag(event);
+        // Add event to DAG (async to support consensus submission)
+        self.service.add_event_to_dag(event).await;
 
         info!(
             validator_id = %request.validator_id,

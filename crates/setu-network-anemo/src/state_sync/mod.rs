@@ -6,6 +6,12 @@
 //! This module is modeled after Sui's state_sync system but adapted for Setu's
 //! Event/ConsensusFrame/VLC-based consensus model instead of checkpoints.
 //!
+//! **Note**: This module uses deprecated types from setu-protocol for backward
+//! compatibility. Future versions will use generic types defined in the
+//! application layer.
+
+#![allow(deprecated)]
+
 //! ## Key Differences from Sui's Checkpoint-based Sync
 //!
 //! - **Event Sync**: Sync individual events between nodes
@@ -47,9 +53,11 @@ pub use server::{
     PushEventsRequest, PushEventsResponse,
     PushConsensusFrameRequest, PushConsensusFrameResponse,
     GetSyncStateRequest, GetSyncStateResponse,
-    SerializedEvent, SerializedConsensusFrame, SerializedVote,
 };
 pub use store::{InMemoryStateSyncStore, InMemoryStoreError};
+
+// Re-export from setu-protocol
+pub use setu_protocol::{SerializedEvent, SerializedConsensusFrame, SerializedVote};
 
 use anemo::PeerId;
 use async_trait::async_trait;
@@ -67,6 +75,45 @@ use tokio::sync::RwLock;
 /// 
 /// This trait abstracts the storage operations needed for state sync,
 /// allowing the sync system to work with different storage backends.
+///
+/// ## Three-Layer Query Requirement
+/// 
+/// Production implementations MUST support three-layer query (DAG → EventStore) 
+/// for `get_events_by_ids()` to ensure events can be found even after GC.
+/// 
+/// The query pattern should be:
+/// 1. First query the Active DAG (hot data, pending events)
+/// 2. For DAG misses, query the EventStore (cold data, persisted events)
+/// 
+/// ```ignore
+/// async fn get_events_by_ids(&self, ids: &[String]) -> Result<Vec<SerializedEvent>, Self::Error> {
+///     let mut results = Vec::new();
+///     let mut store_query_ids = Vec::new();
+///     
+///     // Step 1: Query DAG (hot data)
+///     {
+///         let dag = self.dag_manager.dag().read().await;
+///         for id in ids {
+///             if let Some(event) = dag.get_event(id) {
+///                 results.push(serialize(event));
+///             } else {
+///                 store_query_ids.push(id.clone());
+///             }
+///         }
+///     }
+///     
+///     // Step 2: Query EventStore for misses (cold data)
+///     if !store_query_ids.is_empty() {
+///         let store_events = self.event_store.get_events_batch(&store_query_ids).await;
+///         results.extend(store_events.into_iter().map(serialize));
+///     }
+///     
+///     Ok(results)
+/// }
+/// ```
+/// 
+/// This ensures that follower nodes can sync events that have been GC'd from 
+/// the leader's active DAG but are still in persistent storage.
 #[async_trait]
 pub trait StateSyncStore: Clone + Send + Sync + 'static {
     /// Error type for storage operations
@@ -92,6 +139,10 @@ pub trait StateSyncStore: Clone + Send + Sync + 'static {
     ) -> Result<(u32, Vec<String>), Self::Error>;
     
     /// Get events by their IDs
+    /// 
+    /// **IMPORTANT**: Production implementations must use three-layer query
+    /// (DAG → EventStore) to find events that may have been GC'd from the active DAG.
+    /// See trait-level documentation for the required query pattern.
     async fn get_events_by_ids(
         &self,
         event_ids: &[String],

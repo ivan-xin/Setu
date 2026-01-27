@@ -426,6 +426,22 @@ impl Event {
         hasher.update(timestamp.to_le_bytes());
         hex::encode(hasher.finalize())
     }
+    
+    /// Verify that the event ID matches the content (anti-tampering check)
+    /// 
+    /// This should be called when receiving events from untrusted sources
+    /// (e.g., network peers) to ensure the event wasn't tampered with.
+    /// 
+    /// Returns `true` if the ID is valid, `false` if tampered.
+    pub fn verify_id(&self) -> bool {
+        let computed = Self::compute_id(
+            &self.parent_ids,
+            &self.vlc_snapshot,
+            &self.creator,
+            self.timestamp,
+        );
+        computed == self.id
+    }
 
     /// Legacy method for backward compatibility
     pub fn with_transfer(mut self, transfer: Transfer) -> Self {

@@ -9,15 +9,15 @@ use setu_rpc::{
     GetAccountRequest, GetAccountResponse, GetBalanceRequest, GetBalanceResponse,
     GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
-    ProfileInfo, CoinBalance, PowerChange, CreditChange, CredentialInfo,
+    ProfileInfo, CoinBalance, PowerChange, CreditChange,
     SubmitTransferRequest,
 };
-use setu_types::event::{Event, EventType};
+use setu_types::event::{Event};
 use setu_types::registration::UserRegistration;
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 /// User RPC Handler for Validator
 pub struct ValidatorUserHandler {
@@ -169,7 +169,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             .unwrap()
             .as_millis() as u64;
         
-        let vlc_time = self.network_service.next_vlc();
+        let vlc_time = self.network_service.get_vlc_time().await;
         let mut vlc = setu_vlc::VectorClock::new();
         vlc.increment(self.network_service.validator_id());
         let vlc_snapshot = VLCSnapshot {
@@ -236,9 +236,9 @@ impl UserRpcHandler for ValidatorUserHandler {
         info!("           └─ Event ID: {}", &event_id[..20.min(event_id.len())]);
         info!("           └─ VLC Time: {}", vlc_time);
         
-        // Step 6: Add event to DAG
+        // Step 6: Add event to DAG (async to support consensus submission)
         info!("[REG 6/6] 🔗 Adding registration event to DAG...");
-        self.network_service.add_event_to_dag(event.clone());
+        self.network_service.add_event_to_dag(event.clone()).await;
         
         info!("           └─ Event added to DAG");
         

@@ -33,6 +33,13 @@
 
 mod tee;
 mod network_client;
+pub mod http_server;
+
+// Re-export HTTP types from setu-transport
+pub use setu_transport::http::{
+    ExecuteTaskRequest, ExecuteTaskResponse,
+    TeeExecutionResultDto, StateChangeDto, AttestationDto,
+};
 
 // Core exports for solver-tee3 architecture
 pub use tee::{TeeExecutor, TeeExecutionResult};
@@ -46,6 +53,9 @@ pub use network_client::{
     SolverNetworkClient, SolverNetworkConfig, 
     SubmitEventRequest, SubmitEventResponse,
 };
+
+// HTTP server for sync task execution
+pub use http_server::{SolverHandler, create_handler, start_server};
 
 #[cfg(test)]
 mod tests {

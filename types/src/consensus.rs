@@ -133,6 +133,11 @@ impl Anchor {
     }
     
     /// Compute a hash of this anchor for anchor chain tree
+    /// 
+    /// This hash includes all critical fields:
+    /// - id, depth, previous_anchor (chain structure)
+    /// - events_root, global_state_root, anchor_chain_root (Merkle commitments)
+    /// - vlc_snapshot, timestamp (ordering)
     pub fn compute_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.id.as_bytes());
@@ -143,6 +148,9 @@ impl Anchor {
         if let Some(roots) = &self.merkle_roots {
             hasher.update(&roots.events_root);
             hasher.update(&roots.global_state_root);
+            // Include anchor_chain_root to commit to the entire history
+            // This ensures anchors with different histories produce different hashes
+            hasher.update(&roots.anchor_chain_root);
         }
         hasher.update(self.vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(self.timestamp.to_le_bytes());
@@ -189,6 +197,83 @@ impl Vote {
     pub fn with_signature(mut self, signature: Vec<u8>) -> Self {
         self.signature = signature;
         self
+    }
+    
+    /// Sign the vote with a private key (ed25519)
+    /// 
+    /// This creates a signature over the vote content (cf_id + validator_id + approve + timestamp)
+    /// using the validator's private key.
+    pub fn sign(&mut self, private_key: &[u8]) -> Result<(), String> {
+        use ed25519_dalek::{Signer, SigningKey};
+        
+        if private_key.len() != 32 {
+            return Err(format!("Invalid private key length: expected 32, got {}", private_key.len()));
+        }
+        
+        let signing_key = SigningKey::from_bytes(
+            private_key.try_into().map_err(|_| "Failed to convert key")?   
+        );
+        
+        // Create deterministic message to sign
+        let message = self.signing_message();
+        
+        // Sign the message
+        let signature = signing_key.sign(&message);
+        self.signature = signature.to_bytes().to_vec();
+        
+        Ok(())
+    }
+    
+    /// Verify the vote signature with a public key (ed25519)
+    /// 
+    /// Returns true if the signature is valid for the given public key.
+    pub fn verify_signature(&self, public_key: &[u8]) -> bool {
+        use ed25519_dalek::{Verifier, VerifyingKey, Signature as Ed25519Signature};
+        
+        // Check signature is not empty
+        if self.signature.is_empty() {
+            return false;
+        }
+        
+        // Check public key length
+        if public_key.len() != 32 {
+            return false;
+        }
+        
+        // Parse public key
+        let verifying_key = match VerifyingKey::from_bytes(
+            public_key.try_into().unwrap_or(&[0u8; 32])
+        ) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        
+        // Parse signature
+        let signature = match Ed25519Signature::from_slice(&self.signature) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
+        
+        // Create message and verify
+        let message = self.signing_message();
+        verifying_key.verify(&message, &signature).is_ok()
+    }
+    
+    /// Create the deterministic message for signing
+    /// 
+    /// Message format: protocol_id || cf_id || validator_id || approve || timestamp
+    /// 
+    /// The protocol identifier prevents cross-protocol signature attacks where
+    /// a signature from one protocol could be replayed in another context.
+    fn signing_message(&self) -> Vec<u8> {
+        let mut message = Vec::new();
+        // Protocol domain separator (version 1)
+        message.extend_from_slice(b"SETU_VOTE_V1");
+        message.extend_from_slice(self.cf_id.as_bytes());
+        message.extend_from_slice(self.validator_id.as_bytes());
+        message.push(if self.approve { 1 } else { 0 });
+        message.extend_from_slice(&self.timestamp.to_le_bytes());
+        message
     }
 }
 
@@ -248,6 +333,27 @@ impl ConsensusFrame {
         self.approve_count() >= threshold
     }
 
+    /// Check if CF should be rejected (1/3+1 validators rejected)
+    /// 
+    /// In BFT consensus, if f+1 nodes reject a CF (where f = n/3),
+    /// it should be explicitly rejected to prevent indefinite pending.
+    pub fn check_rejection(&self, total_validators: usize) -> bool {
+        let threshold = total_validators / 3 + 1;
+        self.reject_count() >= threshold
+    }
+
+    /// Check if CF has timed out
+    /// 
+    /// Returns true if the CF has been pending longer than the timeout threshold.
+    /// Used for garbage collection of stale CFs that never reached quorum.
+    pub fn is_timeout(&self, timeout_ms: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        now.saturating_sub(self.created_at) > timeout_ms
+    }
+
     pub fn finalize(&mut self) {
         self.status = CFStatus::Finalized;
         self.finalized_at = Some(
@@ -260,6 +366,14 @@ impl ConsensusFrame {
 
     pub fn reject(&mut self) {
         self.status = CFStatus::Rejected;
+    }
+    
+    /// Verify that the CF ID matches the content
+    /// 
+    /// This prevents malicious nodes from constructing CFs with mismatched IDs.
+    pub fn verify_id(&self) -> bool {
+        let expected_id = Self::compute_id(&self.anchor, &self.proposer, self.created_at);
+        self.id == expected_id
     }
 }
 

@@ -24,7 +24,6 @@
 //! ```
 
 use setu_types::event::{Event, ExecutionResult, StateChange};
-use setu_types::SubnetId;
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 
@@ -328,7 +327,7 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::EventType;
+    use setu_types::{EventType, SubnetId};
     use setu_types::event::VLCSnapshot;
     
     fn create_app_event() -> Event {
