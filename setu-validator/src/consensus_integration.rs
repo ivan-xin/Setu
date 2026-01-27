@@ -466,9 +466,24 @@ impl ConsensusValidator {
         self.engine.get_vlc_snapshot().await
     }
     
+    /// Allocate a logical time using lock-free atomic counter (FAST PATH)
+    /// 
+    /// This is the preferred method for high-performance local event creation.
+    /// It uses an atomic counter instead of acquiring the VLC write lock,
+    /// providing O(1) performance even under high concurrency.
+    /// 
+    /// Use this for `get_vlc_time()` in submit_transfer path.
+    #[inline]
+    pub fn allocate_logical_time(&self) -> u64 {
+        self.engine.allocate_logical_time()
+    }
+    
     /// Atomically increment VLC and return the new snapshot
     /// 
     /// Use this when assigning VLC to new events to ensure uniqueness.
+    /// 
+    /// NOTE: For high-performance scenarios where only logical_time is needed,
+    /// prefer `allocate_logical_time()` which is lock-free.
     pub async fn tick_and_get_vlc(&self) -> setu_vlc::VLCSnapshot {
         self.engine.tick_and_get_vlc().await
     }
