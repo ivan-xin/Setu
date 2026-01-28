@@ -1,246 +1,100 @@
-//! Setu Solver - Execution node
+//! Setu Solver - Execution node (solver-tee3 Architecture)
 //!
-//! The solver is responsible for:
-//! - Receiving Transfer intents
-//! - Executing computations
-//! - Generating events
-//! - Broadcasting to the network
+//! In solver-tee3 architecture, Solver acts as a **pass-through** layer:
+//!
+//! ## Responsibilities
+//! - Receives fully-prepared `SolverTask` from Validator
+//! - Passes task to TEE for execution
+//! - Returns `TeeExecutionResult` (with attestation) to Validator
+//!
+//! ## What Solver does NOT do
+//! - Coin selection (done by Validator's TaskPreparer)
+//! - State reads (included in SolverTask's read_set)
+//! - VLC management (handled by Validator)
+//! - Event creation (Validator creates Event from result)
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Validator (TaskPreparer)
+//!     │
+//!     │ SolverTask
+//!     ▼
+//! Solver (TeeExecutor)  ← This crate
+//!     │
+//!     │ StfInput
+//!     ▼
+//! TEE (EnclaveRuntime)
+//!     │
+//!     │ StfOutput
+//!     ▼
+//! TeeExecutionResult → Validator
+//! ```
 
-mod executor;
-mod dependency;
 mod tee;
+mod network_client;
+pub mod http_server;
 
-pub use executor::Executor;
-pub use dependency::{DependencyTracker, DependencyStats};
-pub use tee::{TeeEnvironment, TeeProof, EnclaveInfo};
+// Re-export HTTP types from setu-transport
+pub use setu_transport::http::{
+    ExecuteTaskRequest, ExecuteTaskResponse,
+    TeeExecutionResultDto, StateChangeDto, AttestationDto,
+};
 
-use core_types::Transfer;
-use setu_core::{NodeConfig, ShardManager};
-use setu_types::event::{Event, EventType, EventId};
-use setu_vlc::{VLCSnapshot, VectorClock};
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{info, error, debug};
+// Core exports for solver-tee3 architecture
+pub use tee::{TeeExecutor, TeeExecutionResult};
+pub use setu_enclave::{
+    EnclaveInfo, Attestation, SolverTask,
+    ResolvedInputs, ResolvedObject, GasBudget, GasUsage,
+};
 
-/// Solver node
-pub struct Solver {
-    config: NodeConfig,
-    shard_manager: Arc<ShardManager>,
-    transfer_rx: mpsc::UnboundedReceiver<Transfer>,
-    event_tx: mpsc::UnboundedSender<Event>,
-    /// Executor for running transfers
-    executor: Executor,
-    /// Dependency tracker for building DAG
-    dependency_tracker: DependencyTracker,
-    /// TEE environment for secure execution
-    tee: TeeEnvironment,
-    /// Current VLC state
-    vlc: VectorClock,
-}
+// Network client for communication with Validator
+pub use network_client::{
+    SolverNetworkClient, SolverNetworkConfig, 
+    SubmitEventRequest, SubmitEventResponse,
+};
 
-impl Solver {
-    /// Create a new solver with channels
-    pub fn new(
-        config: NodeConfig,
-        transfer_rx: mpsc::UnboundedReceiver<Transfer>,
-        event_tx: mpsc::UnboundedSender<Event>,
-    ) -> Self {
-        info!(
-            node_id = %config.node_id,
-            "Creating solver node"
-        );
-        
-        let shard_manager = Arc::new(ShardManager::new());
-        let executor = Executor::new(config.node_id.clone());
-        let dependency_tracker = DependencyTracker::new(config.node_id.clone());
-        let tee = TeeEnvironment::new(config.node_id.clone());
-        let vlc = VectorClock::new();
-        
-        Self {
-            config,
-            shard_manager,
-            transfer_rx,
-            event_tx,
-            executor,
-            dependency_tracker,
-            tee,
-            vlc,
-        }
-    }
+// HTTP server for sync task execution
+pub use http_server::{SolverHandler, create_handler, start_server};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use setu_types::event::{Event, EventType, VLCSnapshot};
+    use setu_types::SubnetId;
     
-    /// Run the solver
-    pub async fn run(mut self) {
-        info!(
-            node_id = %self.config.node_id,
-            port = self.config.network.port,
-            "Solver started, waiting for transfers..."
-        );
+    #[tokio::test]
+    async fn test_solver_tee3_flow() {
+        // Create TeeExecutor
+        let executor = TeeExecutor::new("test-solver".to_string());
         
-        // Main loop: receive transfers and process them
-        while let Some(transfer) = self.transfer_rx.recv().await {
-            info!(
-                transfer_id = %transfer.id,
-                from = %transfer.from,
-                to = %transfer.to,
-                amount = %transfer.amount,
-                "Received transfer"
-            );
-            
-            // Execute the transfer
-            match self.execute_transfer(&transfer).await {
-                Ok(event) => {
-                    info!(
-                        event_id = %event.id,
-                        "Transfer executed successfully, generated event"
-                    );
-                    
-                    // Send event to validator
-                    if let Err(e) = self.event_tx.send(event) {
-                        error!("Failed to send event: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to execute transfer: {}", e);
-                }
-            }
-        }
-        
-        info!("Solver stopped");
-    }
-    
-    /// Execute a transfer and generate an event
-    async fn execute_transfer(&mut self, transfer: &Transfer) -> anyhow::Result<Event> {
-        info!(
-            transfer_id = %transfer.id,
-            "Starting transfer execution pipeline"
-        );
-        
-        // Step 1: Find dependencies
-        let parent_ids = self.find_dependencies(transfer).await;
-        debug!(
-            transfer_id = %transfer.id,
-            dependencies_count = parent_ids.len(),
-            "Dependencies resolved"
-        );
-        
-        // Step 2: Execute in TEE
-        let execution_result = self.execute_in_tee(transfer).await?;
-        debug!(
-            transfer_id = %transfer.id,
-            success = execution_result.success,
-            "TEE execution completed"
-        );
-        
-        // Step 3: Apply state changes
-        self.apply_state_changes(&execution_result.state_changes).await?;
-        debug!(
-            transfer_id = %transfer.id,
-            changes_count = execution_result.state_changes.len(),
-            "State changes applied"
-        );
-        
-        // Step 4: Generate TEE proof
-        let _proof = self.generate_proof(transfer, &execution_result).await?;
-        debug!(
-            transfer_id = %transfer.id,
-            "TEE proof generated"
-        );
-        
-        // Step 5: Update VLC
-        let vlc_snapshot = self.update_vlc(transfer);
-        debug!(
-            transfer_id = %transfer.id,
-            logical_time = vlc_snapshot.logical_time,
-            "VLC updated"
-        );
-        
-        // Step 6: Create event
-        let mut event = Event::new(
+        // Create a test event
+        let event = Event::new(
             EventType::Transfer,
-            parent_ids.clone(),
-            vlc_snapshot,
-            self.config.node_id.clone(),
+            vec![],
+            VLCSnapshot::default(),
+            "test-creator".to_string(),
         );
         
-        // Attach transfer and execution result
-        event = event.with_transfer(setu_types::event::Transfer {
-            from: transfer.from.clone(),
-            to: transfer.to.clone(),
-            amount: transfer.amount as u64,
-        });
-        event.set_execution_result(execution_result);
+        // Create SolverTask (normally prepared by Validator's TaskPreparer)
+        let task_id = SolverTask::generate_task_id(&event, &[0u8; 32]);
+        let task = SolverTask::new(
+            task_id,
+            event,
+            ResolvedInputs::new(),
+            [0u8; 32],
+            SubnetId::ROOT,
+        ).with_gas_budget(GasBudget::default());
         
-        // Step 7: Record event in dependency tracker
-        let resources = vec![
-            format!("account:{}", transfer.from),
-            format!("account:{}", transfer.to),
-        ];
-        self.dependency_tracker.record_event(event.id.clone(), resources);
+        // Execute via TeeExecutor (Solver's main entry point)
+        let result = executor.execute_solver_task(task).await;
         
-        // Add dependency edges
-        for parent_id in &parent_ids {
-            self.dependency_tracker.add_dependency(event.id.clone(), parent_id.clone());
-        }
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_success());
+        assert_eq!(result.events_processed, 1);
         
-        info!(
-            event_id = %event.id,
-            transfer_id = %transfer.id,
-            "Transfer execution pipeline completed"
-        );
-        
-        Ok(event)
-    }
-    
-    /// Find dependencies for a transfer
-    async fn find_dependencies(&self, transfer: &Transfer) -> Vec<EventId> {
-        self.dependency_tracker.find_dependencies(transfer).await
-    }
-    
-    /// Execute transfer in TEE environment
-    async fn execute_in_tee(&self, transfer: &Transfer) -> anyhow::Result<setu_types::event::ExecutionResult> {
-        self.executor.execute_in_tee(transfer).await
-    }
-    
-    /// Apply state changes to local storage
-    async fn apply_state_changes(&self, changes: &[setu_types::event::StateChange]) -> anyhow::Result<()> {
-        self.executor.apply_state_changes(changes).await
-    }
-    
-    /// Generate TEE proof for execution
-    async fn generate_proof(
-        &self,
-        transfer: &Transfer,
-        result: &setu_types::event::ExecutionResult,
-    ) -> anyhow::Result<TeeProof> {
-        self.tee.generate_proof(transfer, result).await
-    }
-    
-    /// Update VLC and return snapshot
-    fn update_vlc(&mut self, _transfer: &Transfer) -> VLCSnapshot {
-        // Increment logical clock
-        self.vlc.increment(&self.config.node_id);
-        
-        // Note: We would merge with transfer's VLC here if Transfer had a VectorClock field
-        // For now, we just increment our own clock
-        
-        // Create snapshot
-        let mut snapshot = VLCSnapshot::new_with_clock(self.vlc.clone());
-        snapshot.logical_time += 1;
-        snapshot
-    }
-    
-    /// Get dependency tracker statistics
-    pub fn dependency_stats(&self) -> DependencyStats {
-        self.dependency_tracker.stats()
-    }
-    
-    /// Get TEE enclave information
-    pub fn enclave_info(&self) -> EnclaveInfo {
-        self.tee.enclave_info()
-    }
-    
-    /// Get node ID
-    pub fn node_id(&self) -> &str {
-        &self.config.node_id
+        // Attestation should be included
+        assert!(result.attestation.is_mock());
     }
 }

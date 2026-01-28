@@ -86,6 +86,11 @@ impl BinaryMerkleProof {
         self.siblings.len()
     }
 
+    /// Get the sibling nodes in this proof
+    pub fn siblings(&self) -> &[Node] {
+        &self.siblings
+    }
+
     /// Verify the proof given a root hash and leaf data.
     ///
     /// # Arguments

@@ -1,0 +1,132 @@
+version: '3.8'
+
+# Multi-validator setup for testing consensus
+services:
+  # Validator Node 1 (Leader)
+  validator-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: setu-validator-1
+    hostname: validator-1
+    ports:
+      - "8080:8080"  # HTTP API
+      - "8081:8081"  # P2P Network
+    environment:
+      - VALIDATOR_ID=validator-1
+      - VALIDATOR_HTTP_PORT=8080
+      - VALIDATOR_LISTEN_ADDR=0.0.0.0
+      - VALIDATOR_P2P_PORT=8081
+      - IS_LEADER=true
+      - RUST_LOG=info,setu_validator=debug,consensus=debug
+      - DB_PATH=/data/db
+      - LOG_PATH=/data/log
+    volumes:
+      - validator-1-data:/data
+    networks:
+      - setu-network
+    restart: unless-stopped
+
+  # Validator Node 2
+  validator-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: setu-validator-2
+    hostname: validator-2
+    ports:
+      - "8082:8080"  # HTTP API
+      - "8083:8081"  # P2P Network
+    environment:
+      - VALIDATOR_ID=validator-2
+      - VALIDATOR_HTTP_PORT=8080
+      - VALIDATOR_LISTEN_ADDR=0.0.0.0
+      - VALIDATOR_P2P_PORT=8081
+      - IS_LEADER=false
+      - PEER_VALIDATORS=validator-1:8081
+      - RUST_LOG=info,setu_validator=debug,consensus=debug
+      - DB_PATH=/data/db
+      - LOG_PATH=/data/log
+    volumes:
+      - validator-2-data:/data
+    networks:
+      - setu-network
+    depends_on:
+      - validator-1
+    restart: unless-stopped
+
+  # Validator Node 3
+  validator-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: setu-validator-3
+    hostname: validator-3
+    ports:
+      - "8084:8080"  # HTTP API
+      - "8085:8081"  # P2P Network
+    environment:
+      - VALIDATOR_ID=validator-3
+      - VALIDATOR_HTTP_PORT=8080
+      - VALIDATOR_LISTEN_ADDR=0.0.0.0
+      - VALIDATOR_P2P_PORT=8081
+      - IS_LEADER=false
+      - PEER_VALIDATORS=validator-1:8081,validator-2:8081
+      - RUST_LOG=info,setu_validator=debug,consensus=debug
+      - DB_PATH=/data/db
+      - LOG_PATH=/data/log
+    volumes:
+      - validator-3-data:/data
+    networks:
+      - setu-network
+    depends_on:
+      - validator-1
+      - validator-2
+    restart: unless-stopped
+
+  # Solver Node
+  solver-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.solver
+    container_name: setu-solver-1
+    hostname: solver-1
+    ports:
+      - "9001:9001"
+    environment:
+      - SOLVER_ID=solver-1
+      - SOLVER_PORT=9001
+      - SOLVER_LISTEN_ADDR=0.0.0.0
+      - SOLVER_CAPACITY=100
+      - VALIDATOR_ADDRESS=validator-1
+      - VALIDATOR_HTTP_PORT=8080
+      - AUTO_REGISTER=true
+      - RUST_LOG=info,setu_solver=debug
+      - LOG_PATH=/data/log
+    volumes:
+      - solver-1-data:/data
+    networks:
+      - setu-network
+    depends_on:
+      - validator-1
+      - validator-2
+      - validator-3
+    restart: unless-stopped
+
+networks:
+  setu-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  validator-1-data:
+    driver: local
+  validator-2-data:
+    driver: local
+  validator-3-data:
+    driver: local
+  solver-1-data:
+    driver: local
+

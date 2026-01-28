@@ -2,10 +2,11 @@
 //!
 //! Merkle tree implementations for the Setu network.
 //!
-//! This crate provides two types of Merkle trees:
+//! This crate provides three types of Merkle trees:
 //!
 //! - [`binary::BinaryMerkleTree`]: A simple binary Merkle tree for ordered data commitments
 //! - [`sparse::SparseMerkleTree`]: A 256-bit sparse Merkle tree for key-value storage
+//! - [`aggregation::SubnetAggregationTree`]: Aggregates subnet state roots into global state
 //!
 //! ## Design Philosophy
 //!
@@ -16,16 +17,29 @@
 //!
 //! - **Sparse Merkle Tree**: Used for object state storage (Coin, Profile, Credential, etc.),
 //!   where keys are 256-bit identifiers and we need efficient non-inclusion proofs.
+//!
+//! - **Subnet Aggregation Tree**: Used to aggregate all subnet state roots into a single
+//!   global state root for each anchor in the DAG consensus.
+//!
+//! ## Storage
+//!
+//! The [`storage`] module provides traits for persisting Merkle tree nodes and state roots.
+//! An in-memory implementation is provided for testing, while production systems should
+//! implement the traits with a persistent backend like RocksDB.
 
+pub mod aggregation;
 pub mod binary;
 pub mod error;
 pub mod hash;
 pub mod sparse;
+pub mod storage;
 
+pub use aggregation::{SubnetAggregationProof, SubnetAggregationTree, SubnetStateEntry};
 pub use binary::{BinaryMerkleProof, BinaryMerkleTree};
 pub use error::{MerkleError, MerkleResult};
-pub use hash::HashValue;
-pub use sparse::{SparseMerkleProof, SparseMerkleTree};
+pub use hash::{HashValue, sha256};
+pub use sparse::{IncrementalSparseMerkleTree, SparseMerkleProof, SparseMerkleTree};
+pub use storage::{InMemoryMerkleStore, MerkleNodeStore, MerkleRootStore, MerkleStore};
 
 /// The length of hash digests used in merkle trees (32 bytes = 256 bits)
 pub const HASH_LENGTH: usize = 32;

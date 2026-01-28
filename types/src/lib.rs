@@ -1,9 +1,13 @@
 // ========== Core Modules ==========
 pub mod event;
+pub mod transfer;       // Transfer and routing types
+pub mod registration;   // Registration types
 pub mod consensus;
 pub mod node;
 pub mod object;
 pub mod subnet;          // Subnet (sub-application) types
+pub mod merkle;          // Merkle tree types for state commitment
+pub mod task;            // Task types for Validator → Solver communication
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -11,13 +15,30 @@ pub mod profile;        // Profile & Credential (identity)
 pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
 
-// Export commonly used types
-pub use event::{Event, EventId, EventStatus, EventType, Transfer};
+// Re-export VLC types from setu-vlc (single source of truth)
+pub use setu_vlc::{VectorClock, VLCSnapshot};
+
+// Export from transfer module
+pub use transfer::{
+    Transfer, TransferId, ClockKey, ResourceKey, TransferType, AssignedVlc,
+};
+
+// Export from registration module
+pub use registration::{
+    ValidatorRegistration, SolverRegistration, Unregistration, NodeType,
+    SubnetRegistration, SubnetResourceLimits,
+    UserRegistration, PowerConsumption, TaskSubmission,
+};
+
+// Export from event module
+pub use event::{
+    Event, EventId, EventStatus, EventType, EventPayload,
+    ExecutionResult, StateChange,
+};
+
+// Export from consensus module
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
 pub use node::*;
-
-// Re-export VLC types from setu-vlc
-pub use setu_vlc::{VectorClock, VLCSnapshot};
 
 // ========== Object Model Exports ==========
 pub use object::{Object, ObjectId, Address, ObjectDigest, ObjectType, ObjectMetadata, Ownership, generate_object_id};
@@ -36,13 +57,36 @@ pub use profile::{
 pub use relation::{
     RelationGraph, RelationGraphData, Relation,
     create_social_graph, create_professional_graph,
+    // User relation network
+    relation_type, UserRelationNetwork, UserRelationNetworkObject,
+    SubnetInteractionSummary, create_user_relation_network,
 };
 
 // Subnet related
-pub use subnet::{SubnetId, SubnetConfig, UserSubnetMembership, CrossSubnetContext};
+pub use subnet::{
+    SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext,
+    // Subnet interaction tracking
+    InteractionType, SubnetInteraction, LocalRelation, UserSubnetActivity,
+};
+
+// Merkle tree types
+pub use merkle::{
+    HashValue, ObjectStateValue, SubnetStateRoot, AnchorMerkleRoots,
+    MerkleExecutionResult, CrossSubnetLock, CrossSubnetLockStatus,
+    object_type, ZERO_HASH,
+};
 
 // Aggregated views
 pub use account_view::AccountView;
+
+// Task types for Validator → Solver communication
+pub use task::{
+    SolverTask, ResolvedInputs, OperationType, ResolvedObject,
+    ReadSetEntry, MerkleProof,
+    Attestation, AttestationType, AttestationData,
+    AttestationError, AttestationResult, VerifiedAttestation,
+    GasBudget, GasUsage,
+};
 
 // Error types
 pub type SetuResult<T> = Result<T, SetuError>;

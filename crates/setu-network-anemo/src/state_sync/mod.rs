@@ -6,6 +6,12 @@
 //! This module is modeled after Sui's state_sync system but adapted for Setu's
 //! Event/ConsensusFrame/VLC-based consensus model instead of checkpoints.
 //!
+//! **Note**: This module uses deprecated types from setu-protocol for backward
+//! compatibility. Future versions will use generic types defined in the
+//! application layer.
+
+#![allow(deprecated)]
+
 //! ## Key Differences from Sui's Checkpoint-based Sync
 //!
 //! - **Event Sync**: Sync individual events between nodes
@@ -37,17 +43,189 @@
 mod builder;
 pub mod metrics;
 mod server;
+mod store;
 
 pub use builder::{Builder, UnstartedStateSync};
 pub use server::{StateSync, StateSyncServer, Server};
+pub use server::{
+    GetEventsRequest, GetEventsResponse,
+    GetConsensusFramesRequest, GetConsensusFramesResponse,
+    PushEventsRequest, PushEventsResponse,
+    PushConsensusFrameRequest, PushConsensusFrameResponse,
+    GetSyncStateRequest, GetSyncStateResponse,
+};
+pub use store::{InMemoryStateSyncStore, InMemoryStoreError};
+
+// Re-export from setu-protocol
+pub use setu_protocol::{SerializedEvent, SerializedConsensusFrame, SerializedVote};
 
 use anemo::PeerId;
+use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+// ============================================================================
+// StateSyncStore Trait
+// ============================================================================
+
+/// Storage trait for state synchronization
+/// 
+/// This trait abstracts the storage operations needed for state sync,
+/// allowing the sync system to work with different storage backends.
+///
+/// ## Three-Layer Query Requirement
+/// 
+/// Production implementations MUST support three-layer query (DAG → EventStore) 
+/// for `get_events_by_ids()` to ensure events can be found even after GC.
+/// 
+/// The query pattern should be:
+/// 1. First query the Active DAG (hot data, pending events)
+/// 2. For DAG misses, query the EventStore (cold data, persisted events)
+/// 
+/// ```ignore
+/// async fn get_events_by_ids(&self, ids: &[String]) -> Result<Vec<SerializedEvent>, Self::Error> {
+///     let mut results = Vec::new();
+///     let mut store_query_ids = Vec::new();
+///     
+///     // Step 1: Query DAG (hot data)
+///     {
+///         let dag = self.dag_manager.dag().read().await;
+///         for id in ids {
+///             if let Some(event) = dag.get_event(id) {
+///                 results.push(serialize(event));
+///             } else {
+///                 store_query_ids.push(id.clone());
+///             }
+///         }
+///     }
+///     
+///     // Step 2: Query EventStore for misses (cold data)
+///     if !store_query_ids.is_empty() {
+///         let store_events = self.event_store.get_events_batch(&store_query_ids).await;
+///         results.extend(store_events.into_iter().map(serialize));
+///     }
+///     
+///     Ok(results)
+/// }
+/// ```
+/// 
+/// This ensures that follower nodes can sync events that have been GC'd from 
+/// the leader's active DAG but are still in persistent storage.
+#[async_trait]
+pub trait StateSyncStore: Clone + Send + Sync + 'static {
+    /// Error type for storage operations
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    // ===== Event Storage =====
+    
+    /// Get events starting from a sequence number
+    /// 
+    /// Returns (events, has_more, highest_seq)
+    async fn get_events_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedEvent>, bool, u64), Self::Error>;
+    
+    /// Store events received from peers
+    /// 
+    /// Returns (accepted_count, rejected_ids)
+    async fn store_events(
+        &self,
+        events: Vec<SerializedEvent>,
+    ) -> Result<(u32, Vec<String>), Self::Error>;
+    
+    /// Get events by their IDs
+    /// 
+    /// **IMPORTANT**: Production implementations must use three-layer query
+    /// (DAG → EventStore) to find events that may have been GC'd from the active DAG.
+    /// See trait-level documentation for the required query pattern.
+    async fn get_events_by_ids(
+        &self,
+        event_ids: &[String],
+    ) -> Result<Vec<SerializedEvent>, Self::Error>;
+    
+    /// Get the highest event sequence number
+    async fn highest_event_seq(&self) -> u64;
+
+    // ===== ConsensusFrame Storage =====
+    
+    /// Get consensus frames starting from a sequence number
+    /// 
+    /// Returns (frames, has_more, highest_seq)
+    async fn get_cfs_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedConsensusFrame>, bool, u64), Self::Error>;
+    
+    /// Store a consensus frame with its votes
+    /// 
+    /// Returns whether the CF was accepted
+    async fn store_cf(
+        &self,
+        frame: SerializedConsensusFrame,
+        votes: Vec<SerializedVote>,
+    ) -> Result<(bool, Option<String>), Self::Error>;
+    
+    /// Get the highest finalized CF sequence number
+    async fn highest_finalized_cf_seq(&self) -> u64;
+}
+
+// Blanket implementation for Arc<S> to allow sharing store across components
+#[async_trait]
+impl<S: StateSyncStore> StateSyncStore for Arc<S> {
+    type Error = S::Error;
+
+    async fn get_events_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedEvent>, bool, u64), Self::Error> {
+        (**self).get_events_from_seq(start_seq, limit).await
+    }
+
+    async fn store_events(
+        &self,
+        events: Vec<SerializedEvent>,
+    ) -> Result<(u32, Vec<String>), Self::Error> {
+        (**self).store_events(events).await
+    }
+
+    async fn get_events_by_ids(
+        &self,
+        event_ids: &[String],
+    ) -> Result<Vec<SerializedEvent>, Self::Error> {
+        (**self).get_events_by_ids(event_ids).await
+    }
+
+    async fn highest_event_seq(&self) -> u64 {
+        (**self).highest_event_seq().await
+    }
+
+    async fn get_cfs_from_seq(
+        &self,
+        start_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<SerializedConsensusFrame>, bool, u64), Self::Error> {
+        (**self).get_cfs_from_seq(start_seq, limit).await
+    }
+
+    async fn store_cf(
+        &self,
+        frame: SerializedConsensusFrame,
+        votes: Vec<SerializedVote>,
+    ) -> Result<(bool, Option<String>), Self::Error> {
+        (**self).store_cf(frame, votes).await
+    }
+
+    async fn highest_finalized_cf_seq(&self) -> u64 {
+        (**self).highest_finalized_cf_seq().await
+    }
+}
 
 /// Peer synchronization state tracking
 ///
@@ -241,7 +419,7 @@ pub struct StateSyncEventLoop<S> {
 
 impl<S> StateSyncEventLoop<S>
 where
-    S: Clone + Send + Sync + 'static,
+    S: StateSyncStore,
 {
     pub(crate) fn new(
         config: StateSyncConfig,

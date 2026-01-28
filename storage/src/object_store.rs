@@ -1,7 +1,8 @@
 //! Object Store trait for Coin/Profile/Credential/RelationGraph storage operations
 use setu_types::{
-    ObjectId, Address,
+    ObjectId, Address, SubnetId, CoinType,
     Coin, Profile, Credential, RelationGraph, AccountView,
+    UserRelationNetworkObject, UserSubnetActivity,
     SetuResult,
 };
 
@@ -19,6 +20,12 @@ pub trait ObjectStore {
     
     /// Get all coins owned by an address
     fn get_coins_by_owner(&self, owner: &Address) -> SetuResult<Vec<Coin>>;
+    
+    /// Get coins owned by an address filtered by coin type
+    /// 
+    /// This is essential for multi-subnet scenarios where each subnet
+    /// may have its own token type.
+    fn get_coins_by_owner_and_type(&self, owner: &Address, coin_type: &CoinType) -> SetuResult<Vec<Coin>>;
     
     /// Update a coin (replaces existing)
     fn update_coin(&self, coin: &Coin) -> SetuResult<()>;
@@ -79,6 +86,37 @@ pub trait ObjectStore {
     
     /// Delete a relation graph and clean up indexes
     fn delete_graph(&self, id: &ObjectId) -> SetuResult<()>;
+    
+    // ========== UserRelationNetwork operations ==========
+    
+    /// Store a user relation network
+    fn store_user_relation_network(&self, network: &UserRelationNetworkObject) -> SetuResult<ObjectId>;
+    
+    /// Get a user relation network by user address
+    fn get_user_relation_network(&self, user: &Address) -> SetuResult<Option<UserRelationNetworkObject>>;
+    
+    /// Update a user relation network
+    fn update_user_relation_network(&self, network: &UserRelationNetworkObject) -> SetuResult<()>;
+    
+    /// Delete a user relation network
+    fn delete_user_relation_network(&self, user: &Address) -> SetuResult<()>;
+    
+    // ========== UserSubnetActivity operations ==========
+    
+    /// Store user subnet activity
+    fn store_user_subnet_activity(&self, activity: &UserSubnetActivity) -> SetuResult<()>;
+    
+    /// Get user subnet activity for a specific subnet
+    fn get_user_subnet_activity(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<Option<UserSubnetActivity>>;
+    
+    /// Get all subnet activities for a user
+    fn get_user_all_subnet_activities(&self, user: &Address) -> SetuResult<Vec<UserSubnetActivity>>;
+    
+    /// Update user subnet activity
+    fn update_user_subnet_activity(&self, activity: &UserSubnetActivity) -> SetuResult<()>;
+    
+    /// Delete user subnet activity
+    fn delete_user_subnet_activity(&self, user: &Address, subnet_id: &SubnetId) -> SetuResult<()>;
     
     // ========== Aggregation ==========
     

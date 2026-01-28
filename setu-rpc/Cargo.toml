@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 # Workspace dependencies
-core-types = { path = "../crates/core-types" }
 setu-types = { path = "../types" }
 
 # Anemo for RPC
@@ -21,6 +20,9 @@ bytes = "1.5"
 tokio = { version = "1.40", features = ["full"] }
 tower = { version = "0.4", features = ["util"] }
 async-trait = "0.1"
+
+# HTTP client for CLI
+reqwest = { version = "0.11", features = ["json"] }
 
 # Error handling
 thiserror = "1.0"

@@ -32,6 +32,10 @@ pub enum MerkleError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
+    /// Storage backend error
+    #[error("Storage error: {0}")]
+    StorageError(String),
+
     /// Invalid input
     #[error("Invalid input: {0}")]
     InvalidInput(String),

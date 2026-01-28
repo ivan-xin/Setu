@@ -147,6 +147,38 @@ impl SetuDB {
         WriteBatch::default()
     }
     
+    // ========== Raw byte key operations (for composite keys) ==========
+    
+    /// Put a value with raw byte key
+    pub fn put_raw<V>(&self, cf: ColumnFamily, key: &[u8], value: &V) -> Result<()>
+    where
+        V: Serialize,
+    {
+        let cf_handle = self.cf_handle(cf)?;
+        let value_bytes = Self::encode_value(value)?;
+        self.db.put_cf(cf_handle, key, value_bytes)?;
+        Ok(())
+    }
+    
+    /// Get a value by raw byte key
+    pub fn get_raw<V>(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<V>>
+    where
+        V: DeserializeOwned,
+    {
+        let cf_handle = self.cf_handle(cf)?;
+        match self.db.get_cf(cf_handle, key)? {
+            Some(bytes) => Ok(Some(Self::decode_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+    
+    /// Delete by raw byte key
+    pub fn delete_raw(&self, cf: ColumnFamily, key: &[u8]) -> Result<()> {
+        let cf_handle = self.cf_handle(cf)?;
+        self.db.delete_cf(cf_handle, key)?;
+        Ok(())
+    }
+    
     /// Add a put operation to a write batch
     pub fn batch_put<K, V>(
         &self,
@@ -208,6 +240,24 @@ impl SetuDB {
                     .0;
                 let value = Self::decode_value(&value_bytes)?;
                 Ok((key, value))
+            }))
+    }
+    
+    /// Iterate over all values in a column family (ignoring keys)
+    /// Useful when you only need values and keys use different encoding
+    pub fn iter_values<V>(&self, cf: ColumnFamily) -> Result<impl Iterator<Item = Result<V>> + '_>
+    where
+        V: DeserializeOwned,
+    {
+        let cf_handle = self.cf_handle(cf)?;
+        
+        Ok(self
+            .db
+            .iterator_cf(cf_handle, IteratorMode::Start)
+            .map(|result| {
+                let (_key_bytes, value_bytes) = result?;
+                let value = Self::decode_value(&value_bytes)?;
+                Ok(value)
             }))
     }
     

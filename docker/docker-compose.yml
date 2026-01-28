@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  # Validator Node
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: setu-validator
+    hostname: validator
+    ports:
+      - "8080:8080"  # HTTP API
+      - "8081:8081"  # P2P Network
+    environment:
+      - VALIDATOR_ID=validator-1
+      - VALIDATOR_HTTP_PORT=8080
+      - VALIDATOR_LISTEN_ADDR=0.0.0.0
+      - VALIDATOR_P2P_PORT=8081
+      - RUST_LOG=info,setu_validator=debug,consensus=debug
+      - DB_PATH=/data/db
+      - LOG_PATH=/data/log
+    volumes:
+      - validator-data:/data
+    networks:
+      - setu-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Solver Node 1
+  solver-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.solver
+    container_name: setu-solver-1
+    hostname: solver-1
+    ports:
+      - "9001:9001"
+    environment:
+      - SOLVER_ID=solver-1
+      - SOLVER_PORT=9001
+      - SOLVER_LISTEN_ADDR=0.0.0.0
+      - SOLVER_CAPACITY=100
+      - VALIDATOR_ADDRESS=validator
+      - VALIDATOR_HTTP_PORT=8080
+      - AUTO_REGISTER=true
+      - RUST_LOG=info,setu_solver=debug
+      - LOG_PATH=/data/log
+    volumes:
+      - solver-1-data:/data
+    networks:
+      - setu-network
+    depends_on:
+      validator:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Solver Node 2 (optional, can be scaled)
+  solver-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.solver
+    container_name: setu-solver-2
+    hostname: solver-2
+    ports:
+      - "9002:9001"
+    environment:
+      - SOLVER_ID=solver-2
+      - SOLVER_PORT=9001
+      - SOLVER_LISTEN_ADDR=0.0.0.0
+      - SOLVER_CAPACITY=100
+      - VALIDATOR_ADDRESS=validator
+      - VALIDATOR_HTTP_PORT=8080
+      - AUTO_REGISTER=true
+      - RUST_LOG=info,setu_solver=debug
+      - LOG_PATH=/data/log
+    volumes:
+      - solver-2-data:/data
+    networks:
+      - setu-network
+    depends_on:
+      validator:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - multi-solver  # Only start with --profile multi-solver
+
+networks:
+  setu-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  validator-data:
+    driver: local
+  solver-1-data:
+    driver: local
+  solver-2-data:
+    driver: local
+

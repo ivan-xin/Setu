@@ -4,12 +4,16 @@ members = [
     "storage",                # RocksDB-based object storage
     "crates/setu-vlc",        # VLC Hybrid Logical Clock Library
     "crates/setu-merkle",     # Merkle tree implementations (Binary + Sparse)
-    "crates/core-types",
     "crates/setu-core",       # Shared core library
     "crates/setu-keys",       # Cryptographic key management
+    "crates/setu-protocol",   # Protocol message definitions
     "crates/setu-network-anemo", # Anemo-based P2P network (production)
     "crates/setu-router-core", # Core routing strategies
+    "crates/setu-runtime",    # Simple runtime executor (pre-Move VM)
+    "crates/setu-enclave",    # TEE Enclave abstraction (Mock + Nitro)
+    "crates/setu-transport",  # HTTP/WS/gRPC transport for Validator↔Solver
     "consensus",
+    "api",                    # HTTP API layer
     "setu-validator",         # Validator node (with embedded router)
     "setu-solver",            # Solver node
     "setu-rpc",               # RPC layer

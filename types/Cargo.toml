@@ -3,6 +3,10 @@ name = "setu-types"
 version.workspace = true
 edition = "2021"
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 serde = { workspace = true }
 sha2 = "0.10"
@@ -11,3 +15,4 @@ thiserror = "1.0"
 bincode = "2.0"
 bcs = "0.1"
 setu-vlc = { path = "../crates/setu-vlc" }
+ed25519-dalek = { version = "2.1", features = ["serde"] }
