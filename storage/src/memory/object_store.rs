@@ -12,7 +12,7 @@
 //! let retrieved = store.get_coin(&coin.metadata.id)?;
 //! ```
 
-use crate::object_store::ObjectStore;
+use crate::backends::object::ObjectStore;
 use dashmap::DashMap;
 use setu_types::{
     Address, AccountView, Coin, CoinType, Credential, ObjectId,

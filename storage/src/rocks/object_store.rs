@@ -1,7 +1,7 @@
 //! RocksDB implementation of ObjectStore
 
-use crate::object_store::ObjectStore;
-use crate::rocks::{SetuDB, ColumnFamily, StorageOperation, IntoSetuResult};
+use crate::backends::object::ObjectStore;
+use crate::rocks::core::{SetuDB, ColumnFamily, StorageOperation, IntoSetuResult};
 use rocksdb::WriteBatch;
 use setu_types::{
     ObjectId, Address, SubnetId, CoinType,

@@ -20,7 +20,7 @@
 //! - `meta:latest` -> AnchorId (latest anchor ID)
 //! - `meta:count` -> u64 (total anchor count)
 
-use crate::rocks::{SetuDB, ColumnFamily, spawn_db_op};
+use crate::rocks::core::{SetuDB, ColumnFamily, spawn_db_op};
 use setu_types::{Anchor, AnchorId, SetuResult, SetuError};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -292,7 +292,7 @@ impl std::fmt::Debug for RocksDBAnchorStore {
 // Implement AnchorStoreBackend trait
 // ============================================================================
 
-use crate::anchor_store_backend::AnchorStoreBackend;
+use crate::backends::anchor::AnchorStoreBackend;
 use async_trait::async_trait;
 
 #[async_trait]
