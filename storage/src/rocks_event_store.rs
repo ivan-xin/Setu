@@ -18,7 +18,7 @@
 //! - `creator:{creator}:{event_id}` -> () (creator index)
 //! - `status:{status}:{event_id}` -> () (status index)
 
-use crate::event_store::BatchStoreResult;
+use crate::storage_types::BatchStoreResult;
 use crate::rocks::{SetuDB, ColumnFamily};
 use setu_types::{Event, EventId, EventStatus, SetuResult, SetuError};
 use std::collections::HashMap;
