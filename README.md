@@ -13,7 +13,7 @@ Setu is a next-generation distributed consensus network designed for high throug
 
 ### Key Features
 
-- **DAG-Based Consensus**: DAG-BFT consensus with leader rotation (Mysticeti-style leaderless mode planned)
+- **DAG-Based Consensus**: DAG-BFT consensus with leader rotation
 - **VLC Hybrid Clock**: Vector Logical Clock for causal ordering in distributed events
 - **TEE Execution**: Trusted Execution Environment (AWS Nitro) for secure computation
 - **Subnet Architecture**: Multi-subnet support for horizontal scalability *(in development)*
