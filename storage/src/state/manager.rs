@@ -12,7 +12,7 @@
 //! - State changes are batched and committed at each anchor
 
 use setu_merkle::{
-    HashValue, SparseMerkleTree, SparseMerkleProof,
+    HashValue, IncrementalSparseMerkleTree, SparseMerkleProof,
     MerkleStore, SubnetAggregationTree, SubnetStateEntry,
 };
 use setu_types::{SubnetId, AnchorMerkleRoots};
@@ -26,8 +26,8 @@ use sha2::{Sha256, Digest};
 pub struct SubnetStateSMT {
     /// The subnet this SMT belongs to
     subnet_id: SubnetId,
-    /// The underlying Sparse Merkle Tree
-    tree: SparseMerkleTree,
+    /// The underlying Sparse Merkle Tree (incremental O(log N) updates)
+    tree: IncrementalSparseMerkleTree,
     /// Number of objects in this subnet
     object_count: u64,
     /// Last anchor where this subnet was updated
@@ -39,7 +39,7 @@ impl SubnetStateSMT {
     pub fn new(subnet_id: SubnetId) -> Self {
         Self {
             subnet_id,
-            tree: SparseMerkleTree::new(),
+            tree: IncrementalSparseMerkleTree::new(),
             object_count: 0,
             last_updated_anchor: 0,
         }
