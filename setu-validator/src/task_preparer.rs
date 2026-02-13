@@ -111,6 +111,38 @@ impl TaskPreparer {
         }
         
         let state_provider = Arc::new(MerkleStateProvider::new(state_manager));
+        
+        // For testing: we don't need to rebuild index since we just created fresh state
+        // For production with persisted state, use new_with_state_manager() which calls rebuild
+        
+        Self::new(validator_id, state_provider)
+    }
+    
+    /// Create a TaskPreparer from an existing GlobalStateManager (production use)
+    /// 
+    /// This is used when loading state from persistent storage (RocksDB).
+    /// It will rebuild the coin_type_index from the Merkle Tree state.
+    /// 
+    /// ## Performance
+    /// - Rebuild time: ~1 second per 1M objects
+    /// - Only needs to run once at startup
+    pub fn new_with_state_manager(
+        validator_id: String,
+        state_manager: Arc<std::sync::RwLock<setu_storage::GlobalStateManager>>,
+    ) -> Self {
+        use setu_storage::MerkleStateProvider;
+        
+        let merkle_provider = MerkleStateProvider::new(state_manager);
+        
+        // Rebuild coin_type_index from persisted Merkle Tree state
+        // This is critical for multi-token support after restart
+        let indexed_count = merkle_provider.rebuild_coin_type_index();
+        tracing::info!(
+            indexed_count = indexed_count,
+            "Rebuilt coin_type_index from Merkle Tree at startup"
+        );
+        
+        let state_provider = Arc::new(merkle_provider);
         Self::new(validator_id, state_provider)
     }
     

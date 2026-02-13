@@ -17,6 +17,7 @@ consensus = { path = "../consensus" }
 setu-router-core = { path = "../crates/setu-router-core" }
 setu-rpc = { path = "../setu-rpc" }
 setu-transport = { path = "../crates/setu-transport" }
+setu-runtime = { path = "../crates/setu-runtime" }
 # Note: setu-enclave dependency removed - Validator now uses setu-types::task directly
 setu-storage = { path = "../storage" }
 setu-api = { path = "../api" }

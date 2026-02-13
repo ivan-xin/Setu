@@ -36,6 +36,7 @@ mod router_manager;
 mod network;
 pub mod task_preparer;
 mod user_handler;
+pub mod infra_executor;
 pub mod consensus_integration;
 pub mod broadcaster;
 pub mod network_adapter;
@@ -50,6 +51,7 @@ pub use network::{
 };
 pub use task_preparer::{TaskPreparer, TaskPrepareError};
 pub use user_handler::ValidatorUserHandler;
+pub use infra_executor::InfraExecutor;
 
 // Re-export consensus integration types
 pub use consensus_integration::{
