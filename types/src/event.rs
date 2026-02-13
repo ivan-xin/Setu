@@ -655,7 +655,7 @@ mod tests {
             .with_tps(1000)
             .with_storage(1024 * 1024 * 1024);
         
-        let registration = SubnetRegistration::new("subnet-1", "DeFi App", "alice")
+        let registration = SubnetRegistration::new("subnet-1", "DeFi App", "alice", "DEFI")
             .with_limits(limits)
             .with_solvers(vec!["solver-1".to_string(), "solver-2".to_string()]);
         

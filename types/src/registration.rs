@@ -307,7 +307,27 @@ impl Default for TokenConfig {
 }
 
 impl SubnetRegistration {
-    pub fn new(subnet_id: impl Into<String>, name: impl Into<String>, owner: impl Into<String>) -> Self {
+    /// Create a new subnet registration with required token symbol
+    /// 
+    /// Every subnet MUST have a native token (1:1 binding).
+    /// This ensures users can always specify the coin_type when transacting.
+    /// 
+    /// # Arguments
+    /// * `subnet_id` - Unique subnet identifier
+    /// * `name` - Human-readable subnet name
+    /// * `owner` - Owner address
+    /// * `token_symbol` - Token symbol (REQUIRED, e.g., "GAME", "SOCIAL")
+    /// 
+    /// # Example
+    /// ```rust,ignore
+    /// let subnet = SubnetRegistration::new("gaming-subnet", "Gaming", "owner", "GAME");
+    /// ```
+    pub fn new(
+        subnet_id: impl Into<String>,
+        name: impl Into<String>,
+        owner: impl Into<String>,
+        token_symbol: impl Into<String>,
+    ) -> Self {
         Self {
             subnet_id: subnet_id.into(),
             name: name.into(),
@@ -318,10 +338,10 @@ impl SubnetRegistration {
             assigned_solvers: vec![],
             subnet_type: SubnetType::App,
             parent_subnet_id: None,
-            // Token fields default to None
-            token_symbol: None,
+            // Token symbol is REQUIRED (1 subnet : 1 token)
+            token_symbol: Some(token_symbol.into()),
             initial_token_supply: None,
-            token_config: None,
+            token_config: Some(TokenConfig::default()),
             user_airdrop_amount: None,
         }
     }
@@ -356,17 +376,28 @@ impl SubnetRegistration {
         self
     }
     
-    /// Configure subnet token
+    /// Configure initial token supply for the subnet
+    /// 
+    /// Note: token_symbol is already set in `new()` (required).
+    /// This method only sets the initial supply to mint to subnet owner.
     /// 
     /// # Arguments
-    /// * `symbol` - Token symbol (e.g., "MYAPP")
     /// * `initial_supply` - Initial tokens minted to subnet owner
     /// 
     /// # Example
     /// ```rust,ignore
-    /// let subnet = SubnetRegistration::new("subnet-1", "My App", "owner-addr")
-    ///     .with_token("MYAPP", 1_000_000_00000000); // 1M tokens with 8 decimals
+    /// let subnet = SubnetRegistration::new("subnet-1", "My App", "owner-addr", "MYAPP")
+    ///     .with_initial_supply(1_000_000_00000000); // 1M tokens with 8 decimals
     /// ```
+    pub fn with_initial_supply(mut self, initial_supply: u64) -> Self {
+        self.initial_token_supply = Some(initial_supply);
+        self
+    }
+    
+    /// Legacy method for backwards compatibility
+    /// 
+    /// Deprecated: Use `new()` with token_symbol parameter instead.
+    #[deprecated(since = "0.8.0", note = "token_symbol is now required in new()")]
     pub fn with_token(mut self, symbol: impl Into<String>, initial_supply: u64) -> Self {
         self.token_symbol = Some(symbol.into());
         self.initial_token_supply = Some(initial_supply);
@@ -651,11 +682,12 @@ mod tests {
     
     #[test]
     fn test_subnet_registration() {
-        let reg = SubnetRegistration::new("subnet-1", "My App", "alice")
+        let reg = SubnetRegistration::new("subnet-1", "My App", "alice", "MYAPP")
             .with_type(SubnetType::App)
             .with_max_users(1000);
         assert_eq!(reg.subnet_id, "subnet-1");
         assert_eq!(reg.subnet_type, SubnetType::App);
+        assert_eq!(reg.token_symbol, Some("MYAPP".to_string()));
     }
     
     #[test]

@@ -180,27 +180,30 @@ pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String
     Coin::new_with_type(owner, value, CoinType::new(coin_type))
 }
 
-/// Generate deterministic coin ObjectId for an address and coin type
+/// Generate deterministic coin ObjectId for an address and subnet
 /// 
-/// Convention: coin_object_id = SHA256("coin:" || address || [":" || coin_type])
+/// Convention: coin_object_id = SHA256("coin:" || address || [":" || subnet_id])
 /// 
 /// This is the canonical ID generation used by both storage layer and runtime.
-/// For backwards compatibility, "SETU" type uses legacy format without suffix.
+/// Each subnet has exactly one native token (1:1 binding), so subnet_id
+/// uniquely identifies the token type.
+/// 
+/// For backwards compatibility, "ROOT" subnet uses legacy format without suffix.
 /// 
 /// # Arguments
 /// * `owner` - Owner address (will be converted to hex string)
-/// * `coin_type` - Coin type (e.g., "SETU", "USDC", "SUBNET_TOKEN")
+/// * `subnet_id` - Subnet ID (e.g., "ROOT", "gaming-subnet")
 /// 
 /// # Returns
 /// Deterministic 32-byte ObjectId
-pub fn deterministic_coin_id(owner: &Address, coin_type: &str) -> ObjectId {
+pub fn deterministic_coin_id(owner: &Address, subnet_id: &str) -> ObjectId {
     let mut hasher = Sha256::new();
     hasher.update(b"coin:");
     hasher.update(owner.to_string().as_bytes());
-    // For backwards compatibility: SETU uses legacy format without coin_type suffix
-    if coin_type != CoinType::NATIVE {
+    // For backwards compatibility: ROOT subnet uses legacy format without suffix
+    if subnet_id != "ROOT" && subnet_id != CoinType::NATIVE {
         hasher.update(b":");
-        hasher.update(coin_type.as_bytes());
+        hasher.update(subnet_id.as_bytes());
     }
     ObjectId::new(hasher.finalize().into())
 }
@@ -208,14 +211,14 @@ pub fn deterministic_coin_id(owner: &Address, coin_type: &str) -> ObjectId {
 /// Generate deterministic coin ObjectId from string address
 /// 
 /// Convenience function for when you have a string address instead of Address.
-pub fn deterministic_coin_id_from_str(owner: &str, coin_type: &str) -> ObjectId {
+pub fn deterministic_coin_id_from_str(owner: &str, subnet_id: &str) -> ObjectId {
     let mut hasher = Sha256::new();
     hasher.update(b"coin:");
     hasher.update(owner.as_bytes());
-    // For backwards compatibility: SETU uses legacy format without coin_type suffix
-    if coin_type != CoinType::NATIVE {
+    // For backwards compatibility: ROOT subnet uses legacy format without suffix
+    if subnet_id != "ROOT" && subnet_id != CoinType::NATIVE {
         hasher.update(b":");
-        hasher.update(coin_type.as_bytes());
+        hasher.update(subnet_id.as_bytes());
     }
     ObjectId::new(hasher.finalize().into())
 }
