@@ -47,7 +47,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// CoinState from storage layer - matches storage/src/state_provider.rs
 /// 
@@ -230,7 +230,6 @@ impl MockEnclave {
     /// in concurrent execution. For solver-tee3 mode, use simulate_execution_isolated().
     /// 
     /// This method is kept for backward compatibility with non-read_set executions.
-    #[allow(dead_code)]
     async fn simulate_execution(
         &self, 
         input: &StfInput,
@@ -323,6 +322,7 @@ impl MockEnclave {
     /// This is the core STF (State Transition Function) execution.
     /// For transfer events, uses resolved_inputs.primary_coin() to get the coin_id
     /// that Validator has already selected.
+    /// For registration events, handles subnet/user registration with token logic.
     /// For other events, records them in legacy state.
     /// 
     /// NOTE: This method uses self.runtime (shared). For concurrent execution,
@@ -338,6 +338,22 @@ impl MockEnclave {
         // Check if this is a transfer event
         if let Some(transfer) = &event.transfer {
             return self.execute_transfer_via_runtime(event, transfer, resolved_inputs, diff).await;
+        }
+        
+        // Infrastructure events (SubnetRegister, UserRegister) should NEVER reach TEE.
+        // They are executed directly by Validator via InfraExecutor.
+        // If we receive such events here, it indicates a routing bug.
+        // See: types/src/event.rs - EventType::is_validator_executed()
+        match &event.payload {
+            setu_types::event::EventPayload::SubnetRegister(_) => {
+                warn!(event_id = %event.id, "SubnetRegister event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("SubnetRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::UserRegister(_) => {
+                warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            _ => {}
         }
         
         // For non-transfer events, record in legacy state
@@ -364,6 +380,21 @@ impl MockEnclave {
             return self.execute_transfer_with_local_runtime(
                 event, transfer, resolved_inputs, diff, local_runtime
             ).await;
+        }
+        
+        // Infrastructure events (SubnetRegister, UserRegister) should NEVER reach TEE.
+        // They are executed directly by Validator via InfraExecutor.
+        // If we receive such events here, it indicates a routing bug.
+        match &event.payload {
+            setu_types::event::EventPayload::SubnetRegister(_) => {
+                warn!(event_id = %event.id, "SubnetRegister event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("SubnetRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::UserRegister(_) => {
+                warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            _ => {}
         }
         
         // For non-transfer events, record in legacy state
@@ -504,6 +535,11 @@ impl MockEnclave {
         Ok(())
     }
     
+    // NOTE: Subnet & User Registration handlers have been removed.
+    // These are infrastructure events that should NEVER reach TEE.
+    // They are executed directly by Validator via InfraExecutor.
+    // See: setu_validator::InfraExecutor
+    
     /// Record that an event was processed (for non-transfer events)
     fn record_event_processed(
         &self,
@@ -543,6 +579,9 @@ impl MockEnclave {
     }
     
     /// Compute hash of output for attestation user_data
+    /// 
+    /// Reserved for future use: binding attestation to output commitment
+    #[allow(dead_code)]
     fn compute_output_hash(
         subnet_id: &setu_types::SubnetId,
         pre_state_root: &[u8; 32],
