@@ -106,6 +106,8 @@ impl EventType {
                 | EventType::ValidatorUnregister
                 | EventType::SolverRegister
                 | EventType::SolverUnregister
+                | EventType::SubnetRegister
+                | EventType::UserRegister
         )
     }
     
