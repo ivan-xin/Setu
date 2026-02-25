@@ -243,6 +243,14 @@ impl MerkleStateProvider {
         tracker.clear();
     }
 
+    /// Get reference to modification_tracker (for batch snapshot creation)
+    /// 
+    /// This is used by `BatchStateSnapshot` to efficiently fetch all
+    /// modification events in a single lock acquisition.
+    pub(crate) fn modification_tracker(&self) -> &Arc<RwLock<HashMap<[u8; 32], String>>> {
+        &self.modification_tracker
+    }
+
     /// Register a subnet for an address (called when creating/updating coins)
     /// 
     /// Despite the name "coin_type", this stores subnet_id internally.
@@ -346,7 +354,8 @@ impl MerkleStateProvider {
     }
 
     /// Convert SparseMerkleProof to SimpleMerkleProof
-    fn convert_proof(key: &HashValue, smt_proof: &SparseMerkleProof) -> SimpleMerkleProof {
+    /// Made pub(crate) to allow access from batch_snapshot module
+    pub(crate) fn convert_proof(key: &HashValue, smt_proof: &SparseMerkleProof) -> SimpleMerkleProof {
         // Extract siblings from the proof
         // SparseMerkleProof stores siblings top-down (root to leaf)
         let siblings: Vec<[u8; 32]> = smt_proof
@@ -575,8 +584,12 @@ pub fn get_or_create_coin(
     let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, subnet_id);
     let object_id = ObjectId::new(object_id_bytes);
     
-    // Check if coin already exists
-    if provider.get_object(&object_id).is_some() {
+    // Resolve the correct subnet to query
+    // Coins are stored in their respective subnet's SMT (physical isolation)
+    let target_subnet = MerkleStateProvider::resolve_subnet_id(subnet_id);
+    
+    // Check if coin already exists in the correct subnet
+    if provider.get_object_from_subnet(&object_id_bytes, &target_subnet).is_some() {
         return (object_id, false);
     }
     
