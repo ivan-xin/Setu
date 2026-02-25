@@ -257,6 +257,10 @@ async fn main() -> anyhow::Result<()> {
     
     info!("└─────────────────────────────────────────────────────────────┘");
 
+    // Start background reservation cleanup task (prevents memory accumulation)
+    let _cleanup_handle = network_service.start_reservation_cleanup_task();
+    info!("Background reservation cleanup task started (60s interval)");
+
     // Spawn HTTP server
     let http_service = network_service.clone();
     let http_handle = tokio::spawn(async move {

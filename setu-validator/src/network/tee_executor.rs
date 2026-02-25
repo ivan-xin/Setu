@@ -12,10 +12,16 @@
 //! - Non-blocking spawn for immediate transfer response
 //! - Semaphore limits concurrent TEE calls (default: 100)
 //! - Direct DashMap updates avoid mutex contention
+//!
+//! ## Panic Safety
+//!
+//! Uses ReservationGuard (RAII) to ensure coin reservations are released
+//! even if the TEE execution task panics.
 
 use super::types::*;
 use super::solver_client::{ExecuteTaskRequest, ExecuteTaskResponse};
 use crate::ConsensusValidator;
+use crate::coin_reservation::{CoinReservationManager, ReservationHandle};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use setu_types::event::Event;
@@ -25,6 +31,52 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
+
+/// RAII guard for coin reservation release
+/// 
+/// Ensures the reservation is released even if the task panics.
+/// Uses `Option::take()` pattern to allow explicit release or auto-release on drop.
+struct ReservationGuard {
+    manager: Option<Arc<CoinReservationManager>>,
+    handle: Option<ReservationHandle>,
+    transfer_id: String,
+}
+
+impl ReservationGuard {
+    fn new(
+        manager: Option<Arc<CoinReservationManager>>,
+        handle: Option<ReservationHandle>,
+        transfer_id: String,
+    ) -> Self {
+        Self { manager, handle, transfer_id }
+    }
+
+    /// Explicitly release the reservation (called on normal completion)
+    fn release(&mut self) {
+        if let (Some(mgr), Some(handle)) = (self.manager.take(), self.handle.take()) {
+            mgr.release(&handle);
+            debug!(
+                transfer_id = %self.transfer_id,
+                coin_id = %hex::encode(handle.coin_id.as_bytes()),
+                "Released coin reservation after TEE task completion"
+            );
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        // Auto-release on drop (panic safety)
+        if let (Some(mgr), Some(handle)) = (self.manager.take(), self.handle.take()) {
+            mgr.release(&handle);
+            warn!(
+                transfer_id = %self.transfer_id,
+                coin_id = %hex::encode(handle.coin_id.as_bytes()),
+                "Reservation released via Drop (possible panic or early return)"
+            );
+        }
+    }
+}
 
 /// TEE Executor handles parallel TEE task execution
 pub struct TeeExecutor {
@@ -46,6 +98,8 @@ pub struct TeeExecutor {
     semaphore: Arc<Semaphore>,
     /// Count of pending TEE tasks
     pending_count: Arc<AtomicU64>,
+    /// Coin reservation manager for preventing cross-batch double-spending
+    coin_reservation_manager: Option<Arc<CoinReservationManager>>,
 }
 
 impl TeeExecutor {
@@ -70,7 +124,19 @@ impl TeeExecutor {
             validator_id,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             pending_count: Arc::new(AtomicU64::new(0)),
+            coin_reservation_manager: None,
         }
+    }
+
+    /// Set the coin reservation manager for cross-batch double-spend prevention
+    pub fn with_coin_reservation_manager(mut self, manager: Arc<CoinReservationManager>) -> Self {
+        self.coin_reservation_manager = Some(manager);
+        self
+    }
+
+    /// Get the coin reservation manager reference (if set)
+    pub fn coin_reservation_manager(&self) -> Option<&Arc<CoinReservationManager>> {
+        self.coin_reservation_manager.as_ref()
     }
 
     /// Spawn an async TEE task (non-blocking)
@@ -85,6 +151,26 @@ impl TeeExecutor {
         solver_id: String,
         task: SolverTask,
     ) {
+        self.spawn_tee_task_with_reservation(transfer_id, solver_id, task, None);
+    }
+
+    /// Spawn an async TEE task with coin reservation (non-blocking)
+    ///
+    /// Similar to `spawn_tee_task`, but also releases the coin reservation
+    /// after task completion (success or failure).
+    ///
+    /// ## Cross-batch Double-spend Prevention
+    ///
+    /// When using `BatchTaskPreparer`, coins are reserved via `CoinReservationManager`
+    /// before task preparation. This method ensures reservations are released after
+    /// TEE execution completes, regardless of success or failure.
+    pub fn spawn_tee_task_with_reservation(
+        &self,
+        transfer_id: String,
+        solver_id: String,
+        task: SolverTask,
+        reservation: Option<ReservationHandle>,
+    ) {
         // Clone Arc-wrapped fields for the spawned task
         let semaphore = Arc::clone(&self.semaphore);
         let pending_count = Arc::clone(&self.pending_count);
@@ -95,6 +181,7 @@ impl TeeExecutor {
         let dag_events = Arc::clone(&self.dag_events);
         let consensus = self.consensus.clone();
         let validator_id = self.validator_id.clone();
+        let reservation_mgr = self.coin_reservation_manager.clone();
 
         tokio::spawn(async move {
             Self::execute_tee_task_internal(
@@ -110,6 +197,8 @@ impl TeeExecutor {
                 dag_events,
                 consensus,
                 validator_id,
+                reservation_mgr,
+                reservation,
             )
             .await;
         });
@@ -119,6 +208,12 @@ impl TeeExecutor {
     ///
     /// This is a static method to avoid lifetime issues with spawn.
     /// All shared state is passed explicitly as Arc-wrapped parameters.
+    /// 
+    /// ## Panic Safety
+    /// 
+    /// Uses ReservationGuard (RAII) to ensure coin reservations are released
+    /// even if this function panics at any point.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_tee_task_internal(
         transfer_id: String,
         solver_id: String,
@@ -132,8 +227,18 @@ impl TeeExecutor {
         dag_events: Arc<RwLock<Vec<String>>>,
         consensus: Option<Arc<ConsensusValidator>>,
         validator_id: String,
+        reservation_mgr: Option<Arc<CoinReservationManager>>,
+        reservation: Option<ReservationHandle>,
     ) {
         let task_id_hex = hex::encode(&task.task_id[..8]);
+
+        // Create RAII guard for panic-safe reservation release
+        // The guard will automatically release the reservation on drop (including panic)
+        let mut reservation_guard = ReservationGuard::new(
+            reservation_mgr,
+            reservation,
+            transfer_id.clone(),
+        );
 
         // 1. Acquire semaphore permit (backpressure control)
         let _permit = match semaphore.acquire().await {
@@ -143,6 +248,7 @@ impl TeeExecutor {
             }
             Err(_) => {
                 // Semaphore closed - service shutting down
+                // reservation_guard will release on drop
                 Self::update_tracker_failed(&transfer_status, &transfer_id, "Service shutting down");
                 return;
             }
@@ -295,6 +401,10 @@ impl TeeExecutor {
                 );
             }
         }
+
+        // Explicitly release coin reservation via RAII guard
+        // This is a normal release (not panic). The guard handles both cases.
+        reservation_guard.release();
 
         pending_count.fetch_sub(1, Ordering::Relaxed);
     }
