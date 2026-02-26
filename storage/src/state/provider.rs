@@ -30,6 +30,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::debug;
 
+// Re-export CoinState from setu_types (single source of truth)
+pub use setu_types::CoinState;
+
 // ============================================================================
 // Core Types
 // ============================================================================
@@ -43,59 +46,9 @@ pub struct CoinInfo {
     pub version: u64,
     /// Subnet ID that owns this coin type (1 subnet : 1 token binding)
     /// 
-    /// Stored internally as "coin_type" for backwards compatibility.
     /// For ROOT subnet, this is "ROOT". For other subnets, it's the subnet_id.
-    /// 
     /// To get the display name (e.g., "GAME"), lookup SubnetConfig.token_symbol.
     pub coin_type: String,
-}
-
-/// Coin state as stored in the Merkle tree
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CoinState {
-    pub owner: String,
-    pub balance: u64,
-    pub version: u64,
-    /// Subnet ID that owns this coin type (1 subnet : 1 token)
-    /// 
-    /// Named "coin_type" for backwards compatibility in serialization.
-    /// For ROOT subnet, this is "ROOT". For other subnets, it's the subnet_id.
-    #[serde(default = "default_coin_type")]
-    pub coin_type: String,
-}
-
-fn default_coin_type() -> String {
-    "ROOT".to_string()  // ROOT subnet's native token
-}
-
-impl CoinState {
-    /// Create a new coin state for ROOT subnet
-    pub fn new(owner: String, balance: u64) -> Self {
-        Self::new_with_type(owner, balance, "ROOT".to_string())
-    }
-    
-    /// Create a new coin state with specific subnet_id
-    /// 
-    /// The `subnet_id` parameter determines which subnet this coin belongs to.
-    /// For display purposes, lookup SubnetConfig.token_symbol.
-    pub fn new_with_type(owner: String, balance: u64, subnet_id: String) -> Self {
-        Self {
-            owner,
-            balance,
-            version: 1,
-            coin_type: subnet_id,  // Internally stored as coin_type
-        }
-    }
-
-    /// Serialize for storage (using BCS for consistency with other storage)
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bcs::to_bytes(self).expect("CoinState serialization should not fail")
-    }
-
-    /// Deserialize from storage
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        bcs::from_bytes(bytes).ok()
-    }
 }
 
 /// Merkle proof in a simple, serializable format
