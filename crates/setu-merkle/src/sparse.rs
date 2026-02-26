@@ -890,7 +890,7 @@ impl TreeNode {
 ///
 /// assert_eq!(tree.get(&key), Some(&b"value".to_vec()));
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct IncrementalSparseMerkleTree {
     /// Root hash of the tree
     root_hash: HashValue,
@@ -898,6 +898,32 @@ pub struct IncrementalSparseMerkleTree {
     leaves: HashMap<HashValue, Vec<u8>>,
     /// Node storage: hash -> TreeNode
     nodes: HashMap<HashValue, TreeNode>,
+    /// Dirty leaves tracking: keys that have been inserted/updated since last commit
+    dirty_leaves: std::collections::HashSet<HashValue>,
+    /// Deleted leaves tracking: keys that have been deleted since last commit
+    deleted_leaves: std::collections::HashSet<HashValue>,
+}
+
+/// Leaf changes for batch persistence (B4 scheme)
+#[derive(Debug, Clone, Default)]
+pub struct LeafChanges {
+    /// New or updated leaves: (key, value)
+    pub upserts: Vec<(HashValue, Vec<u8>)>,
+    /// Deleted leaf keys
+    pub deletes: Vec<HashValue>,
+}
+
+impl Clone for IncrementalSparseMerkleTree {
+    fn clone(&self) -> Self {
+        Self {
+            root_hash: self.root_hash,
+            leaves: self.leaves.clone(),
+            nodes: self.nodes.clone(),
+            // Do NOT clone dirty tracking - clones are for temporary calculations
+            dirty_leaves: std::collections::HashSet::new(),
+            deleted_leaves: std::collections::HashSet::new(),
+        }
+    }
 }
 
 impl Default for IncrementalSparseMerkleTree {
@@ -913,7 +939,30 @@ impl IncrementalSparseMerkleTree {
             root_hash: empty_hash(),
             leaves: HashMap::new(),
             nodes: HashMap::new(),
+            dirty_leaves: std::collections::HashSet::new(),
+            deleted_leaves: std::collections::HashSet::new(),
         }
+    }
+
+    /// Create a tree from existing leaves (for crash recovery).
+    ///
+    /// This rebuilds the tree structure from persisted leaf data.
+    /// The dirty tracking is NOT set - recovered data is already persisted.
+    pub fn from_leaves(leaves: HashMap<HashValue, Vec<u8>>) -> Self {
+        let mut tree = Self {
+            root_hash: empty_hash(),
+            leaves: HashMap::new(),
+            nodes: HashMap::new(),
+            dirty_leaves: std::collections::HashSet::new(),
+            deleted_leaves: std::collections::HashSet::new(),
+        };
+        
+        // Insert all leaves (this rebuilds the tree structure)
+        for (key, value) in leaves {
+            tree.insert_without_tracking(key, value);
+        }
+        
+        tree
     }
 
     /// Get the root hash.
@@ -946,6 +995,25 @@ impl IncrementalSparseMerkleTree {
     /// This performs an O(log n) incremental update, only modifying
     /// nodes along the path from the leaf to the root.
     pub fn insert(&mut self, key: HashValue, value: Vec<u8>) -> Option<Vec<u8>> {
+        // Track dirty leaf for persistence (B4 scheme)
+        self.dirty_leaves.insert(key);
+        // Remove from deleted if it was previously marked as deleted
+        self.deleted_leaves.remove(&key);
+        
+        let old_value = self.leaves.insert(key, value.clone());
+        
+        // Compute value hash and create leaf node
+        let value_hash = hash_value(&value);
+        let new_leaf = TreeNode::new_leaf(key, value_hash);
+        
+        // Update the tree incrementally
+        self.root_hash = self.insert_at_node(self.root_hash, &key, new_leaf, 0);
+        
+        old_value
+    }
+
+    /// Insert without dirty tracking (used for recovery from persisted data).
+    fn insert_without_tracking(&mut self, key: HashValue, value: Vec<u8>) -> Option<Vec<u8>> {
         let old_value = self.leaves.insert(key, value.clone());
         
         // Compute value hash and create leaf node
@@ -963,6 +1031,10 @@ impl IncrementalSparseMerkleTree {
     /// This performs an O(log n) incremental update.
     pub fn remove(&mut self, key: &HashValue) -> Option<Vec<u8>> {
         let old_value = self.leaves.remove(key)?;
+        
+        // Track deleted leaf for persistence (B4 scheme)
+        self.dirty_leaves.remove(key);
+        self.deleted_leaves.insert(*key);
         
         // Update the tree incrementally
         self.root_hash = self.remove_at_node(self.root_hash, key, 0);
@@ -1220,6 +1292,11 @@ impl IncrementalSparseMerkleTree {
         self.nodes.len()
     }
 
+    /// Get the number of leaf entries.
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
     /// Clear unused nodes (garbage collection).
     ///
     /// This removes nodes that are no longer reachable from the current root.
@@ -1246,6 +1323,45 @@ impl IncrementalSparseMerkleTree {
     /// Useful when you need ownership of the data.
     pub fn all_leaves(&self) -> Vec<(HashValue, Vec<u8>)> {
         self.leaves.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    // =========================================================================
+    // B4 Scheme: Dirty Data Tracking for Batch Persistence
+    // =========================================================================
+
+    /// Take all pending changes and clear the tracking (called during commit).
+    ///
+    /// Returns `LeafChanges` containing:
+    /// - `upserts`: All leaves that were inserted or updated since last commit
+    /// - `deletes`: All keys that were deleted since last commit
+    ///
+    /// After calling this, `has_pending_changes()` will return false.
+    pub fn take_changes(&mut self) -> LeafChanges {
+        let upserts: Vec<_> = self.dirty_leaves
+            .drain()
+            .filter_map(|k| self.leaves.get(&k).map(|v| (k, v.clone())))
+            .collect();
+        let deletes: Vec<_> = self.deleted_leaves.drain().collect();
+        
+        LeafChanges { upserts, deletes }
+    }
+
+    /// Check if there are any uncommitted changes.
+    ///
+    /// Returns true if there are dirty or deleted leaves that haven't been
+    /// persisted yet.
+    pub fn has_pending_changes(&self) -> bool {
+        !self.dirty_leaves.is_empty() || !self.deleted_leaves.is_empty()
+    }
+
+    /// Get the number of pending upserts.
+    pub fn pending_upsert_count(&self) -> usize {
+        self.dirty_leaves.len()
+    }
+
+    /// Get the number of pending deletes.
+    pub fn pending_delete_count(&self) -> usize {
+        self.deleted_leaves.len()
     }
 
     fn mark_reachable(&self, hash: HashValue, reachable: &mut std::collections::HashSet<HashValue>) {
