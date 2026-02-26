@@ -10,10 +10,18 @@
 //! - ROOT subnet (SubnetId=0) always exists
 //! - All subnet roots are aggregated into a global state root
 //! - State changes are batched and committed at each anchor
+//!
+//! # B4 Scheme: Batch Delayed Persistence
+//!
+//! The B4 scheme delays SMT leaf persistence until Anchor commit:
+//! - Dirty leaves are tracked during transaction execution
+//! - At Anchor commit, all changes are persisted atomically via WriteBatch
+//! - Recovery reconstructs SMT from persisted leaf data
 
 use setu_merkle::{
-    HashValue, IncrementalSparseMerkleTree, SparseMerkleProof,
-    MerkleStore, SubnetAggregationTree, SubnetStateEntry,
+    HashValue, IncrementalSparseMerkleTree, LeafChanges, SparseMerkleProof,
+    B4Store, MerkleStore,
+    SubnetAggregationTree, SubnetStateEntry,
 };
 use setu_types::{SubnetId, AnchorMerkleRoots};
 use setu_types::event::{Event, StateChange, ExecutionResult};
@@ -137,6 +145,50 @@ impl SubnetStateSMT {
     pub fn all_objects(&self) -> Vec<([u8; 32], Vec<u8>)> {
         self.tree.iter_leaves().map(|(k, v)| (*k.as_bytes(), v.clone())).collect()
     }
+
+    // =========================================================================
+    // B4 Scheme: Dirty Data Tracking
+    // =========================================================================
+
+    /// Check if there are uncommitted changes in this subnet's SMT.
+    pub fn has_pending_changes(&self) -> bool {
+        self.tree.has_pending_changes()
+    }
+
+    /// Take all pending changes from the SMT (clears dirty tracking).
+    /// 
+    /// Returns `LeafChanges` containing:
+    /// - `upserts`: All leaves that were inserted or updated
+    /// - `deletes`: All keys that were deleted
+    pub fn take_changes(&mut self) -> LeafChanges {
+        self.tree.take_changes()
+    }
+
+    /// Get the number of pending upserts.
+    pub fn pending_upsert_count(&self) -> usize {
+        self.tree.pending_upsert_count()
+    }
+
+    /// Get the number of pending deletes.
+    pub fn pending_delete_count(&self) -> usize {
+        self.tree.pending_delete_count()
+    }
+
+    /// Reconstruct this SMT from persisted leaf data (B4 recovery).
+    ///
+    /// This creates a new SMT from a HashMap of (object_id -> value),
+    /// typically loaded from the MerkleLeaves column family.
+    pub fn from_persisted_leaves(subnet_id: SubnetId, leaves: HashMap<HashValue, Vec<u8>>) -> Self {
+        let tree = IncrementalSparseMerkleTree::from_leaves(leaves);
+        let object_count = tree.leaf_count() as u64;
+        
+        Self {
+            subnet_id,
+            tree,
+            object_count,
+            last_updated_anchor: 0,
+        }
+    }
 }
 
 /// Global state manager handling all subnets' SMTs.
@@ -152,17 +204,52 @@ impl SubnetStateSMT {
 /// 
 /// Note: The `store` field is not cloned (set to None in clones) since
 /// cloned instances are for temporary calculations only.
+///
+/// ## B4 Scheme: Batch Delayed Persistence
+///
+/// The manager uses the B4 scheme for SMT persistence:
+/// - State changes are tracked as dirty during execution
+/// - All dirty leaves are persisted atomically at Anchor commit
+/// - Recovery reconstructs SMT from persisted leaf data
 pub struct GlobalStateManager {
     /// Per-subnet SMT instances
     subnet_states: HashMap<SubnetId, SubnetStateSMT>,
-    /// Storage backend (optional, for persistence)
-    /// Note: Not cloned - temporary clones don't need persistence
+    /// Storage backend implementing B4Store for atomic batch persistence
     #[allow(dead_code)]
-    store: Option<Arc<dyn MerkleStore>>,
+    store: Option<Arc<dyn B4StoreExt>>,
     /// Current anchor ID
     current_anchor: u64,
 }
 
+/// Extended B4Store trait that combines all required storage capabilities.
+///
+/// The B4 scheme requires:
+/// - B4Store: For atomic batch operations (WriteBatch support)
+/// - MerkleStore: For persisting tree nodes and roots
+pub trait B4StoreExt: B4Store + MerkleStore {}
+
+// Blanket implementation for any type implementing all required traits
+impl<T: B4Store + MerkleStore> B4StoreExt for T {}
+
+/// ⚠️ **WARNING**: Cloning `GlobalStateManager` clears all dirty tracking!
+///
+/// The cloned instance:
+/// - Contains a snapshot of all SMT data (leaves, nodes, roots)
+/// - Has `store` set to `None` (cannot commit)
+/// - Has empty dirty/deleted tracking (pending changes are lost)
+///
+/// **Safe use cases**:
+/// - Computing state roots without modifying original state
+/// - Temporary calculations for validation
+/// - Read-only operations
+///
+/// **Unsafe use case** (will lose data):
+/// ```ignore
+/// let mut manager = GlobalStateManager::new();
+/// manager.upsert_object(subnet, key, value);  // Marks as dirty
+/// let cloned = manager.clone();               // Dirty tracking lost!
+/// // cloned.commit() would NOT persist the upsert
+/// ```
 impl Clone for GlobalStateManager {
     fn clone(&self) -> Self {
         Self {
@@ -187,8 +274,10 @@ impl GlobalStateManager {
         }
     }
     
-    /// Create with a storage backend for persistence
-    pub fn with_store(store: Arc<dyn MerkleStore>) -> Self {
+    /// Create with a storage backend for persistence (B4 scheme).
+    ///
+    /// The store must implement B4Store + MerkleStore.
+    pub fn with_store(store: Arc<dyn B4StoreExt>) -> Self {
         let mut manager = Self::new();
         manager.store = Some(store);
         manager
@@ -287,29 +376,220 @@ impl GlobalStateManager {
         }
     }
     
-    /// Commit current state for an anchor
+    /// Commit current state for an anchor (B4 scheme: atomic batch persistence).
+    ///
+    /// This method:
+    /// 1. Collects all dirty leaves from all subnets' SMTs
+    /// 2. Persists leaves + roots + metadata atomically via single WriteBatch
+    /// 3. Updates internal anchor tracking
+    ///
+    /// ## Atomicity Guarantee
+    ///
+    /// The B4 scheme ensures that either all changes are persisted or none:
+    /// - All dirty leaves are written to MerkleLeaves CF
+    /// - All deleted keys are removed from MerkleLeaves CF  
+    /// - All subnet roots are written to MerkleRoots CF
+    /// - Global root is written to MerkleRoots CF
+    /// - Metadata (last anchor, subnet registry) is updated
+    ///
+    /// All operations use a **single WriteBatch** to guarantee atomicity.
     pub fn commit(&mut self, anchor_id: u64) -> setu_merkle::MerkleResult<()> {
         // Update last anchor for all subnets
         for smt in self.subnet_states.values_mut() {
             smt.set_last_anchor(anchor_id);
         }
         
-        // Persist to storage if available
+        // Persist to storage if available (B4 scheme)
         if let Some(ref store) = self.store {
-            for (subnet_id, smt) in &self.subnet_states {
-                store.put_subnet_root(
+            // ⭐ Create a SINGLE WriteBatch for all operations
+            let mut batch = store.begin_batch()?;
+            
+            // Phase 1: Persist all dirty leaves for each subnet
+            for (subnet_id, smt) in &mut self.subnet_states {
+                if smt.has_pending_changes() {
+                    let changes = smt.take_changes();
+                    
+                    // Batch put upserted leaves (into WriteBatch, not committed yet)
+                    if !changes.upserts.is_empty() {
+                        let upserts: Vec<_> = changes.upserts
+                            .iter()
+                            .map(|(k, v)| (k, v.as_slice()))
+                            .collect();
+                        store.batch_put_leaves_to_batch(
+                            &mut batch,
+                            subnet_id.as_bytes(),
+                            &upserts,
+                        )?;
+                    }
+                    
+                    // Batch delete removed leaves (into WriteBatch, not committed yet)
+                    if !changes.deletes.is_empty() {
+                        let deletes: Vec<_> = changes.deletes.iter().collect();
+                        store.batch_delete_leaves_to_batch(
+                            &mut batch,
+                            subnet_id.as_bytes(),
+                            &deletes,
+                        )?;
+                    }
+                }
+                
+                // Register subnet if it has data (into WriteBatch)
+                if smt.object_count() > 0 {
+                    store.batch_register_subnet(&mut batch, subnet_id.as_bytes())?;
+                }
+                
+                // Store subnet root (into WriteBatch)
+                store.batch_put_subnet_root(
+                    &mut batch,
                     subnet_id.as_bytes(),
                     anchor_id,
                     &smt.root(),
                 )?;
+                
+                // Store last anchor for subnet (into WriteBatch)
+                store.batch_set_last_anchor(&mut batch, subnet_id.as_bytes(), anchor_id)?;
             }
             
+            // Phase 2: Store global root (into WriteBatch)
             let (global_root, _) = self.compute_global_root();
-            store.put_global_root(anchor_id, &global_root)?;
+            store.batch_put_global_root(&mut batch, anchor_id, &global_root)?;
+            
+            // ⭐ Atomic commit: all or nothing
+            store.commit_batch(batch)?;
+            
+            tracing::debug!(
+                anchor_id,
+                subnet_count = self.subnet_states.len(),
+                "B4 commit completed atomically"
+            );
         }
         
         self.current_anchor = anchor_id;
         Ok(())
+    }
+    
+    /// Recover state from persisted data (B4 scheme: startup recovery).
+    ///
+    /// This method reconstructs all subnet SMTs from persisted leaf data.
+    /// It should be called during node startup before processing any new events.
+    ///
+    /// ## Recovery Process
+    ///
+    /// 1. List all registered subnets from MerkleMeta
+    /// 2. For each subnet, load all leaves from MerkleLeaves CF
+    /// 3. Reconstruct SMT from leaves using `IncrementalSparseMerkleTree::from_leaves()`
+    /// 4. Verify reconstructed root matches persisted root (consistency check)
+    /// 5. Restore last anchor info from MerkleMeta
+    ///
+    /// ## Returns
+    ///
+    /// Returns a `RecoverySummary` with statistics about the recovery.
+    pub fn recover(&mut self) -> setu_merkle::MerkleResult<RecoverySummary> {
+        let store = match &self.store {
+            Some(s) => s,
+            None => {
+                tracing::warn!("recover() called without storage backend");
+                return Ok(RecoverySummary::default());
+            }
+        };
+        
+        let mut summary = RecoverySummary::default();
+        
+        // List all registered subnets
+        let subnet_ids = store.list_registered_subnets()?;
+        tracing::info!(subnet_count = subnet_ids.len(), "Recovering subnets from storage");
+        
+        for subnet_id_bytes in subnet_ids {
+            let subnet_id = SubnetId::new(subnet_id_bytes);
+            
+            // Load all leaves for this subnet
+            let leaves = store.load_all_leaves(&subnet_id_bytes)?;
+            let leaf_count = leaves.len();
+            
+            if leaf_count == 0 {
+                tracing::debug!(?subnet_id, "Skipping empty subnet");
+                continue;
+            }
+            
+            // Reconstruct SMT from leaves
+            let mut smt = SubnetStateSMT::from_persisted_leaves(subnet_id, leaves);
+            
+            // Restore last anchor
+            let mut last_anchor = 0u64;
+            if let Some(anchor) = store.get_last_anchor(&subnet_id_bytes)? {
+                last_anchor = anchor;
+                smt.set_last_anchor(anchor);
+                if anchor > self.current_anchor {
+                    self.current_anchor = anchor;
+                }
+            }
+            
+            // ⭐ P1-6: Verify root hash consistency
+            if last_anchor > 0 {
+                if let Some(expected_root) = store.get_subnet_root(&subnet_id_bytes, last_anchor)? {
+                    let actual_root = smt.root();
+                    if actual_root != expected_root {
+                        tracing::error!(
+                            ?subnet_id,
+                            expected = %expected_root,
+                            actual = %actual_root,
+                            "Root hash mismatch during recovery!"
+                        );
+                        return Err(setu_merkle::MerkleError::ConsistencyError(format!(
+                            "Root hash mismatch for subnet {:?}: expected {}, got {}",
+                            subnet_id, expected_root, actual_root
+                        )));
+                    }
+                    tracing::debug!(
+                        ?subnet_id,
+                        root = %actual_root,
+                        "Root hash verified"
+                    );
+                }
+            }
+            
+            tracing::debug!(
+                ?subnet_id,
+                leaf_count,
+                root = %smt.root(),
+                "Recovered subnet SMT"
+            );
+            
+            summary.subnets_recovered += 1;
+            summary.total_leaves += leaf_count;
+            
+            self.subnet_states.insert(subnet_id, smt);
+        }
+        
+        // Ensure ROOT subnet exists
+        if !self.subnet_states.contains_key(&SubnetId::ROOT) {
+            self.subnet_states.insert(SubnetId::ROOT, SubnetStateSMT::new(SubnetId::ROOT));
+        }
+        
+        tracing::info!(
+            subnets = summary.subnets_recovered,
+            leaves = summary.total_leaves,
+            anchor = self.current_anchor,
+            "Recovery complete"
+        );
+        
+        Ok(summary)
+    }
+
+    /// Check if any subnet has uncommitted changes.
+    pub fn has_pending_changes(&self) -> bool {
+        self.subnet_states.values().any(|smt| smt.has_pending_changes())
+    }
+
+    /// Get total pending changes count across all subnets.
+    pub fn total_pending_changes(&self) -> (usize, usize) {
+        let mut upserts = 0;
+        let mut deletes = 0;
+        for smt in self.subnet_states.values() {
+            upserts += smt.pending_upsert_count();
+            deletes += smt.pending_delete_count();
+        }
+        (upserts, deletes)
     }
     
     /// Get the current anchor ID
@@ -575,6 +855,15 @@ impl std::fmt::Display for StateApplyError {
 }
 
 impl std::error::Error for StateApplyError {}
+
+/// Summary of B4 recovery operation
+#[derive(Debug, Clone, Default)]
+pub struct RecoverySummary {
+    /// Number of subnets recovered
+    pub subnets_recovered: usize,
+    /// Total number of leaves loaded
+    pub total_leaves: usize,
+}
 
 /// Summary of state changes applied during anchor processing
 #[derive(Debug, Clone, Default)]

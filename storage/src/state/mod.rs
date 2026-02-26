@@ -11,7 +11,7 @@ pub mod manager;
 pub mod provider;
 pub mod batch_snapshot;
 
-pub use manager::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError};
+pub use manager::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError, RecoverySummary, B4StoreExt};
 pub use provider::{
     StateProvider, MerkleStateProvider,
     CoinInfo, CoinState, SimpleMerkleProof,
