@@ -148,10 +148,6 @@ pub struct MerkleStateProvider {
     /// Object modification tracking (event_id -> object_ids modified)
     /// Simple in-memory tracking for development; can be enhanced later
     modification_tracker: Arc<RwLock<HashMap<[u8; 32], String>>>,
-
-    /// Address to coin types index: address -> set of coin_types
-    /// Enables querying all coins for an address across multiple token types
-    coin_type_index: Arc<RwLock<HashMap<String, std::collections::HashSet<String>>>>,
 }
 
 impl MerkleStateProvider {
@@ -161,7 +157,6 @@ impl MerkleStateProvider {
             state_manager,
             default_subnet: SubnetId::ROOT,
             modification_tracker: Arc::new(RwLock::new(HashMap::new())),
-            coin_type_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -171,7 +166,6 @@ impl MerkleStateProvider {
             state_manager,
             default_subnet: subnet_id,
             modification_tracker: Arc::new(RwLock::new(HashMap::new())),
-            coin_type_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -207,23 +201,26 @@ impl MerkleStateProvider {
     /// Register a subnet for an address (called when creating/updating coins)
     /// 
     /// Despite the name "coin_type", this stores subnet_id internally.
+    /// 
+    /// This updates the GlobalStateManager's authoritative index.
+    /// During normal operation, apply_state_change() handles index updates,
+    /// but this method is useful for manual initialization (genesis, tests).
     pub fn register_coin_type(&self, address: &str, subnet_id: &str) {
-        let mut index = self.coin_type_index.write().unwrap();
-        index
-            .entry(address.to_string())
-            .or_insert_with(std::collections::HashSet::new)
-            .insert(subnet_id.to_string());
+        let mut gsm = self.state_manager.write().unwrap();
+        gsm.register_coin_type(address, subnet_id);
     }
 
     /// Get all registered subnet_ids for an address
     /// 
     /// Returns the list of subnets where this address has coins.
+    /// 
+    /// This method queries the GlobalStateManager's authoritative index,
+    /// which is kept in sync by apply_state_change().
     pub fn get_coin_types_for_address(&self, address: &str) -> Vec<String> {
-        let index = self.coin_type_index.read().unwrap();
-        index
-            .get(address)
-            .map(|types| types.iter().cloned().collect())
-            .unwrap_or_default()
+        let gsm = self.state_manager.read().unwrap();
+        gsm.get_coin_types_for_address(address)
+            .into_iter()
+            .collect()
     }
 
     /// Rebuild the coin_type_index by scanning all objects in the Merkle Tree.
@@ -238,43 +235,17 @@ impl MerkleStateProvider {
     /// # Returns
     /// Number of coin entries indexed
     pub fn rebuild_coin_type_index(&self) -> usize {
-        let state_manager = self.state_manager.read().unwrap();
-        let mut index = self.coin_type_index.write().unwrap();
-        
-        // Clear existing index
-        index.clear();
-        
-        let mut count = 0;
-        
-        // Scan all objects in all subnets
-        for (_subnet_id, _object_id, value) in state_manager.iter_all_objects() {
-            // Try to deserialize as CoinState
-            if let Some(coin_state) = CoinState::from_bytes(value) {
-                // Register this coin type for the owner
-                index
-                    .entry(coin_state.owner.clone())
-                    .or_insert_with(std::collections::HashSet::new)
-                    .insert(coin_state.coin_type.clone());
-                count += 1;
-            }
-            // Non-CoinState objects are skipped (they don't need indexing)
-        }
-        
-        debug!(
-            coin_count = count,
-            address_count = index.len(),
-            "Rebuilt coin_type_index from Merkle Tree"
-        );
-        
+        let mut gsm = self.state_manager.write().unwrap();
+        let count = gsm.rebuild_coin_type_index();
+        debug!(coin_count = count, "Rebuilt coin_type_index from Merkle Tree");
         count
     }
 
     /// Get statistics about the index
     pub fn index_stats(&self) -> (usize, usize) {
-        let index = self.coin_type_index.read().unwrap();
-        let address_count = index.len();
-        let total_entries: usize = index.values().map(|v| v.len()).sum();
-        (address_count, total_entries)
+        // Return GSM's index stats as the authoritative source
+        let gsm = self.state_manager.read().unwrap();
+        gsm.coin_type_index_stats()
     }
 
     // ------------------------------------------------------------------------
@@ -368,12 +339,21 @@ impl MerkleStateProvider {
 
 impl StateProvider for MerkleStateProvider {
     fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo> {
-        // Query all registered coin types (subnet_ids) for this address
-        let coin_types = self.get_coin_types_for_address(address);
+        use setu_types::Address;
         
-        if coin_types.is_empty() {
-            // Fallback: try ROOT subnet coin
-            let coin_object_id = Self::coin_object_id(address);
+        // Normalize address to hex format ("0x...") for consistency.
+        // All indices use hex address as the canonical key.
+        let addr_hex = Address::from(address).to_string();
+        
+        // Use owner_coin_index to find all (object_id, coin_type) pairs for this owner.
+        // This works for both deterministic init coins AND runtime split coins.
+        let manager = self.state_manager.read().unwrap();
+        let coin_objects = manager.get_coin_objects_for_address(&addr_hex);
+        drop(manager);
+        
+        if coin_objects.is_empty() {
+            // Fallback: try deterministic ROOT subnet coin id
+            let coin_object_id = Self::coin_object_id(&addr_hex);
             let target_subnet = SubnetId::ROOT;
             if let Some(data) = self.get_object_from_subnet(&coin_object_id, &target_subnet) {
                 if let Some(coin_state) = CoinState::from_bytes(&data) {
@@ -386,31 +366,32 @@ impl StateProvider for MerkleStateProvider {
                     }];
                 }
             }
-            debug!(address = %address, "No coins found for address");
+            debug!(address = %address, addr_hex = %addr_hex, "No coins found for address");
             return vec![];
         }
 
-        // Collect coins for all registered types - query from CORRECT subnet SMT
+        // Look up each coin object from its subnet SMT
         let mut coins = Vec::new();
-        for coin_type in coin_types {
-            let coin_object_id = Self::coin_object_id_with_type(address, &coin_type);
-            // Physical isolation: query from the correct subnet's SMT
+        for (object_id_bytes, coin_type) in coin_objects {
             let target_subnet = Self::resolve_subnet_id(&coin_type);
-            if let Some(data) = self.get_object_from_subnet(&coin_object_id, &target_subnet) {
+            if let Some(data) = self.get_object_from_subnet(&object_id_bytes, &target_subnet) {
                 if let Some(coin_state) = CoinState::from_bytes(&data) {
-                    coins.push(CoinInfo {
-                        object_id: ObjectId::new(coin_object_id),
-                        owner: coin_state.owner,
-                        balance: coin_state.balance,
-                        version: coin_state.version,
-                        coin_type: coin_state.coin_type,
-                    });
+                    // Only include if still owned by this address
+                    if coin_state.owner == addr_hex {
+                        coins.push(CoinInfo {
+                            object_id: ObjectId::new(object_id_bytes),
+                            owner: coin_state.owner,
+                            balance: coin_state.balance,
+                            version: coin_state.version,
+                            coin_type: coin_state.coin_type,
+                        });
+                    }
                 }
             }
         }
 
         if coins.is_empty() {
-            debug!(address = %address, "No coins found for address");
+            debug!(address = %address, addr_hex = %addr_hex, "No coins found for address (all transferred?)");
         }
         coins
     }
@@ -432,6 +413,14 @@ impl StateProvider for MerkleStateProvider {
     }
 
     fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String> {
+        // First check GSM's modification_tracker (populated by apply_committed_events)
+        {
+            let gsm = self.state_manager.read().unwrap();
+            if let Some(event_id) = gsm.get_last_modifying_event(object_id.as_bytes()) {
+                return Some(event_id.clone());
+            }
+        }
+        // Fallback to local tracker (for backward compatibility)
         let tracker = self.modification_tracker.read().unwrap();
         tracker.get(object_id.as_bytes()).cloned()
     }
@@ -460,16 +449,26 @@ pub fn init_coin(
 /// - "ROOT" for the root subnet's SETU token
 /// - "gaming-subnet" for a gaming app's token
 /// 
-/// Note: This only writes to the Merkle tree. If using MerkleStateProvider,
-/// also call `provider.register_coin_type()` or use `init_coin_with_provider()`.
+/// Note: This function now automatically registers the coin in GSM's index.
+/// For testing without index registration, use `upsert_object` directly.
 pub fn init_coin_with_type(
     state_manager: &mut GlobalStateManager,
     owner: &str,
     balance: u64,
     subnet_id: &str,
 ) -> ObjectId {
-    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, subnet_id);
-    let coin_state = CoinState::new_with_type(owner.to_string(), balance, subnet_id.to_string());
+    use setu_types::Address;
+    
+    // Normalize owner to hex address format ("0x...") for consistency.
+    // Runtime always uses Address::from(s).to_string() as the canonical owner format.
+    // We must use the same format for:
+    //   1. CoinState.owner (stored in SMT)
+    //   2. coin_object_id computation
+    //   3. coin_type_index key
+    let owner_hex = Address::from(owner).to_string();
+    
+    let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(&owner_hex, subnet_id);
+    let coin_state = CoinState::new_with_type(owner_hex.clone(), balance, subnet_id.to_string());
     
     // Physical isolation: store coin in the correct subnet's SMT
     let target_subnet = if subnet_id == "ROOT" {
@@ -486,6 +485,9 @@ pub fn init_coin_with_type(
         object_id_bytes,
         coin_state.to_bytes(),
     );
+    
+    // Register in GSM's coin_type_index for efficient queries
+    state_manager.register_coin_object(&owner_hex, subnet_id, object_id_bytes);
     
     ObjectId::new(object_id_bytes)
 }
@@ -721,6 +723,7 @@ mod tests {
 
         // Initialize multiple coins for multiple users
         // Using subnet_id as the coin namespace
+        // Note: init_coin_with_type now auto-registers to GSM index
         {
             let mut manager = state_manager.write().unwrap();
             init_coin_with_type(&mut manager, "alice", 1000, "ROOT");
@@ -730,19 +733,18 @@ mod tests {
             init_coin_with_type(&mut manager, "charlie", 100, "ROOT");
         }
 
-        // Create provider WITHOUT registering coin types (simulating restart)
+        // Create provider - coins are already indexed in GSM
         let provider = MerkleStateProvider::new(Arc::clone(&state_manager));
 
-        // Before rebuild: alice's coins not found (except ROOT fallback)
+        // Before rebuild: alice's coins ARE found (auto-registered by init_coin_with_type)
         let alice_coins_before = provider.get_coins_for_address("alice");
-        assert_eq!(alice_coins_before.len(), 1); // Only ROOT via fallback
-        assert_eq!(alice_coins_before[0].coin_type, "ROOT");
+        assert_eq!(alice_coins_before.len(), 2); // Both ROOT and defi-subnet
 
-        // Rebuild the index from Merkle Tree
+        // Rebuild the index from Merkle Tree (should be idempotent)
         let indexed_count = provider.rebuild_coin_type_index();
         assert_eq!(indexed_count, 5); // 5 coins total
 
-        // After rebuild: all coins should be found
+        // After rebuild: all coins should still be found
         let alice_coins_after = provider.get_coins_for_address("alice");
         assert_eq!(alice_coins_after.len(), 2);
 

@@ -192,6 +192,11 @@ impl BatchStateSnapshotBuilder {
         self.last_modifying_events.insert(object_id, event_id);
     }
 
+    /// Check if a last modifying event is already recorded for an object
+    fn has_last_modifying_event(&self, object_id: &ObjectId) -> bool {
+        self.last_modifying_events.contains_key(object_id)
+    }
+
     /// Build the final immutable snapshot
     fn build(self) -> BatchStateSnapshot {
         BatchStateSnapshot {
@@ -321,12 +326,27 @@ impl MerkleStateProvider {
         // LOCK #2: modification_tracker - Get parent_ids for DAG causality
         // ══════════════════════════════════════════════════════════════════
         {
+            // Check GSM's modification_tracker first (populated by apply_committed_events)
+            let gsm_arc = self.state_manager();
+            let gsm = gsm_arc.read()
+                .expect("Failed to acquire read lock on GlobalStateManager for batch snapshot");
+            for object_id in &all_object_ids {
+                if let Some(event_id) = gsm.get_last_modifying_event(object_id.as_bytes()) {
+                    builder.add_last_modifying_event((*object_id).clone(), event_id.clone());
+                }
+            }
+            drop(gsm);
+
+            // Fallback: check local modification_tracker for any remaining
             let tracker_arc = self.modification_tracker();
             let tracker = tracker_arc.read()
                 .expect("Failed to acquire read lock on modification_tracker for batch snapshot");
             for object_id in all_object_ids {
-                if let Some(event_id) = tracker.get(object_id.as_bytes()) {
-                    builder.add_last_modifying_event(object_id.clone(), event_id.clone());
+                // Only add if not already found in GSM
+                if !builder.has_last_modifying_event(&object_id) {
+                    if let Some(event_id) = tracker.get(object_id.as_bytes()) {
+                        builder.add_last_modifying_event(object_id.clone(), event_id.clone());
+                    }
                 }
             }
         } // Lock #2 released

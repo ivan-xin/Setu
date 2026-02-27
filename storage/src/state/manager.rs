@@ -25,7 +25,8 @@ use setu_merkle::{
 };
 use setu_types::{SubnetId, AnchorMerkleRoots};
 use setu_types::event::{Event, StateChange, ExecutionResult};
-use std::collections::HashMap;
+use setu_types::coin::CoinState;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use sha2::{Sha256, Digest};
 
@@ -219,6 +220,23 @@ pub struct GlobalStateManager {
     store: Option<Arc<dyn B4StoreExt>>,
     /// Current anchor ID
     current_anchor: u64,
+    /// Coin type index: address -> set of subnet_ids (coin types)
+    /// 
+    /// This index is updated synchronously when state changes are applied,
+    /// enabling efficient coin queries by address. The index maps owner
+    /// addresses to the set of subnet IDs where they have coins.
+    coin_type_index: HashMap<String, HashSet<String>>,
+    /// Owner coin index: owner_address -> set of (object_id, subnet_id) pairs
+    /// 
+    /// This index tracks which object IDs belong to each owner, enabling
+    /// efficient coin lookups even for coins created by runtime split operations
+    /// (whose object_ids are not deterministic).
+    owner_coin_index: HashMap<String, HashSet<([u8; 32], String)>>,
+    /// Modification tracker: object_id -> last modifying event_id
+    /// 
+    /// Updated during apply_committed_events to track which event last modified
+    /// each object. Used by TaskPreparer to derive DAG parent_ids for causal ordering.
+    modification_tracker: HashMap<[u8; 32], String>,
 }
 
 /// Extended B4Store trait that combines all required storage capabilities.
@@ -256,6 +274,10 @@ impl Clone for GlobalStateManager {
             subnet_states: self.subnet_states.clone(),
             store: None,  // Don't clone store - clones are for temporary calculations
             current_anchor: self.current_anchor,
+            // Don't clone indices - clones are for temporary state root calculations only
+            coin_type_index: HashMap::new(),
+            owner_coin_index: HashMap::new(),
+            modification_tracker: HashMap::new(),
         }
     }
 }
@@ -271,6 +293,9 @@ impl GlobalStateManager {
             subnet_states,
             store: None,
             current_anchor: 0,
+            coin_type_index: HashMap::new(),
+            owner_coin_index: HashMap::new(),
+            modification_tracker: HashMap::new(),
         }
     }
     
@@ -636,6 +661,123 @@ impl GlobalStateManager {
             .map(|(subnet_id, obj_id, value)| (subnet_id, obj_id, value.clone()))
             .collect()
     }
+
+    // =========================================================================
+    // Coin Type Index Methods
+    // =========================================================================
+
+    /// Get all coin types (subnet IDs) for an address.
+    /// 
+    /// This is used by MerkleStateProvider to efficiently query coins
+    /// without scanning the entire SMT.
+    /// 
+    /// # Returns
+    /// Set of subnet IDs where the address has coins.
+    pub fn get_coin_types_for_address(&self, address: &str) -> HashSet<String> {
+        self.coin_type_index
+            .get(address)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Register a coin type for an address (manual registration).
+    /// 
+    /// This is primarily used during initialization (e.g., genesis, tests).
+    /// During normal operation, apply_state_change() handles index updates.
+    pub fn register_coin_type(&mut self, address: &str, coin_type: &str) {
+        self.coin_type_index
+            .entry(address.to_string())
+            .or_default()
+            .insert(coin_type.to_string());
+    }
+    
+    /// Register a coin object for an address (includes object_id tracking).
+    /// 
+    /// This tracks both the coin type and the specific object_id,
+    /// enabling efficient lookup of coins even after runtime split operations.
+    pub fn register_coin_object(&mut self, address: &str, coin_type: &str, object_id: [u8; 32]) {
+        self.register_coin_type(address, coin_type);
+        self.owner_coin_index
+            .entry(address.to_string())
+            .or_default()
+            .insert((object_id, coin_type.to_string()));
+    }
+    
+    /// Get all object IDs owned by an address
+    /// 
+    /// Returns (object_id, coin_type) pairs for all coins owned by the address.
+    pub fn get_coin_objects_for_address(&self, address: &str) -> Vec<([u8; 32], String)> {
+        self.owner_coin_index
+            .get(address)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Rebuild the coin_type_index by scanning all objects in all SMTs.
+    /// 
+    /// This should be called at startup after recovering SMT state from storage.
+    /// It ensures the index is consistent with the actual state.
+    /// 
+    /// # Performance
+    /// - O(n) where n is total number of objects
+    /// - ~1 second per 1M objects (in-memory scan)
+    /// 
+    /// # Returns
+    /// Number of coins indexed.
+    pub fn rebuild_coin_type_index(&mut self) -> usize {
+        self.coin_type_index.clear();
+        self.owner_coin_index.clear();
+        
+        // First collect all coin data to avoid borrow conflicts
+        let coin_data: Vec<(String, String, [u8; 32])> = self.iter_all_objects()
+            .filter_map(|(_subnet_id, object_id, value)| {
+                CoinState::from_bytes(value)
+                    .map(|cs| (cs.owner.clone(), cs.coin_type.clone(), object_id))
+            })
+            .collect();
+        
+        // Then update the indices
+        for (owner, coin_type, object_id) in coin_data {
+            self.coin_type_index
+                .entry(owner.clone())
+                .or_default()
+                .insert(coin_type.clone());
+            
+            self.owner_coin_index
+                .entry(owner)
+                .or_default()
+                .insert((object_id, coin_type));
+        }
+        
+        self.coin_type_index.values().map(|v| v.len()).sum()
+    }
+
+    /// Get index statistics for debugging/monitoring.
+    /// 
+    /// # Returns
+    /// (number of addresses, total coin type entries)
+    pub fn coin_type_index_stats(&self) -> (usize, usize) {
+        let address_count = self.coin_type_index.len();
+        let total_entries: usize = self.coin_type_index.values().map(|v| v.len()).sum();
+        (address_count, total_entries)
+    }
+
+    // =========================================================================
+    // Modification Tracking (object_id → last modifying event_id)
+    // =========================================================================
+
+    /// Get the last event that modified a given object
+    pub fn get_last_modifying_event(&self, object_id: &[u8; 32]) -> Option<&String> {
+        self.modification_tracker.get(object_id)
+    }
+
+    /// Record that an event modified specific objects
+    /// 
+    /// This is called during genesis initialization and after state changes
+    /// are applied via apply_committed_events.
+    pub fn record_modification(&mut self, event_id: &str, object_id: [u8; 32]) {
+        self.modification_tracker.insert(object_id, event_id.to_string());
+    }
     
     // =========================================================================
     // StateChange Application Methods (Connecting Solver Output to SMT)
@@ -664,6 +806,22 @@ impl GlobalStateManager {
             Some(value) => {
                 // Insert or update
                 let root = smt.upsert(object_id, value.clone());
+                
+                // Update coin_type_index and owner_coin_index if this is a CoinState
+                // Parse the BCS-serialized CoinState to extract owner and coin_type
+                if let Some(coin_state) = CoinState::from_bytes(value) {
+                    self.coin_type_index
+                        .entry(coin_state.owner.clone())
+                        .or_default()
+                        .insert(coin_state.coin_type.clone());
+                    
+                    // Track owner → object_id mapping
+                    self.owner_coin_index
+                        .entry(coin_state.owner.clone())
+                        .or_default()
+                        .insert((*object_id.as_bytes(), coin_state.coin_type.clone()));
+                }
+                
                 ApplyResult::Updated {
                     object_id: *object_id.as_bytes(),
                     new_root: *root.as_bytes(),
@@ -728,7 +886,7 @@ impl GlobalStateManager {
             }
         });
         
-        for event in &sorted_events {
+        'event_loop: for event in &sorted_events {
             let subnet_id = event.get_subnet_id();
             
             if let Some(result) = &event.execution_result {
@@ -738,10 +896,40 @@ impl GlobalStateManager {
                     continue;
                 }
                 
+                // Conflict detection: verify old_value matches current SMT state
+                // This prevents double-spend where two events read the same stale state.
+                // If any state_change has an old_value that doesn't match current state,
+                // the event's read_set was stale → skip entire event.
+                let smt = self.get_subnet_mut(subnet_id);
+                for change in &result.state_changes {
+                    if let Some(ref expected_old) = change.old_value {
+                        let object_id = Self::parse_state_change_key(&change.key);
+                        let current_value = smt.get(&object_id).cloned();
+                        if current_value.as_ref() != Some(expected_old) {
+                            // Stale read detected: current state differs from what
+                            // the Solver saw when it executed this event.
+                            // This is the double-spend safety net.
+                            tracing::warn!(
+                                event_id = %event.id,
+                                key = %change.key,
+                                "Conflict detected: old_value mismatch, skipping event (stale read)"
+                            );
+                            summary.conflicted_events.push(event.id.clone());
+                            continue 'event_loop;
+                        }
+                    }
+                }
+                
                 let changes_count = result.state_changes.len();
                 
                 // Apply all state changes for this event
                 let new_root = self.apply_execution_result(subnet_id, result);
+                
+                // Update modification_tracker: record event_id for each modified object
+                for change in &result.state_changes {
+                    let object_id = Self::parse_state_change_key(&change.key);
+                    self.modification_tracker.insert(*object_id.as_bytes(), event.id.clone());
+                }
                 
                 // Track in summary
                 summary.record_event(
@@ -872,6 +1060,8 @@ pub struct StateApplySummary {
     pub subnet_stats: HashMap<SubnetId, SubnetApplyStats>,
     /// Events that failed execution (skipped)
     pub failed_events: Vec<String>,
+    /// Events rejected due to stale read (old_value mismatch with current state)
+    pub conflicted_events: Vec<String>,
     /// Total events processed
     pub total_events: usize,
     /// Total state changes applied
@@ -1048,5 +1238,168 @@ mod tests {
         // Should hash the whole key as fallback
         let expected = GlobalStateManager::key_to_object_id(key);
         assert_eq!(parsed, expected);
+    }
+    
+    #[test]
+    fn test_apply_committed_events_conflict_detection() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+        
+        let mut manager = GlobalStateManager::new();
+        
+        // Setup: insert a coin (object) into ROOT subnet
+        let coin_bytes = [0xAA; 32];
+        let coin_key = format!("oid:{}", hex::encode(coin_bytes));
+        let initial_value = vec![1u8; 64]; // balance = 1000 (conceptual)
+        manager.upsert_object(SubnetId::ROOT, coin_bytes, initial_value.clone());
+        
+        // Create two events that both read the SAME initial state (double-spend)
+        let new_value_t1 = vec![2u8; 64]; // balance = 500 after T1
+        let new_value_t2 = vec![3u8; 64]; // balance = 300 after T2
+        
+        // Bob's coin created by T1
+        let bob_coin_bytes = [0xBB; 32];
+        let bob_coin_key = format!("oid:{}", hex::encode(bob_coin_bytes));
+        let bob_value = vec![4u8; 64];
+        
+        // Charlie's coin created by T2
+        let charlie_coin_bytes = [0xCC; 32];
+        let charlie_coin_key = format!("oid:{}", hex::encode(charlie_coin_bytes));
+        let charlie_value = vec![5u8; 64];
+        
+        // Event T1: coin 1000 → 500, create bob's coin (vlc=1)
+        let mut vlc1 = VLCSnapshot::new();
+        vlc1.logical_time = 1;
+        let mut event1 = Event::new(EventType::Transfer, vec![], vlc1, "validator-1".to_string());
+        event1.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![
+                StateChange::update(coin_key.clone(), initial_value.clone(), new_value_t1.clone()),
+                StateChange::insert(bob_coin_key.clone(), bob_value.clone()),
+            ],
+        });
+        event1.status = setu_types::event::EventStatus::Executed;
+        
+        // Event T2: coin 1000 → 300, create charlie's coin (vlc=2)
+        // T2 sees the SAME old_value (initial_value) because coin was released early
+        let mut vlc2 = VLCSnapshot::new();
+        vlc2.logical_time = 2;
+        let mut event2 = Event::new(EventType::Transfer, vec![], vlc2, "validator-1".to_string());
+        event2.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![
+                StateChange::update(coin_key.clone(), initial_value.clone(), new_value_t2.clone()),
+                StateChange::insert(charlie_coin_key.clone(), charlie_value.clone()),
+            ],
+        });
+        event2.status = setu_types::event::EventStatus::Executed;
+        
+        // Apply both events (sorted by VLC: T1 first, then T2)
+        let summary = manager.apply_committed_events(&[event1.clone(), event2.clone()]);
+        
+        // T1 should succeed
+        assert_eq!(summary.total_events, 1, "Only T1 should be applied");
+        assert_eq!(summary.total_changes, 2, "T1 has 2 state changes");
+        
+        // T2 should be detected as conflicted (old_value mismatch)
+        assert_eq!(summary.conflicted_events.len(), 1, "T2 should be conflicted");
+        assert_eq!(summary.conflicted_events[0], event2.id);
+        
+        // Verify final state: only T1's changes applied
+        let smt = manager.root_subnet();
+        let coin_oid = HashValue::from_slice(&coin_bytes).unwrap();
+        let bob_oid = HashValue::from_slice(&bob_coin_bytes).unwrap();
+        let charlie_oid = HashValue::from_slice(&charlie_coin_bytes).unwrap();
+        
+        assert_eq!(smt.get(&coin_oid), Some(&new_value_t1), "Coin should have T1's value (500)");
+        assert_eq!(smt.get(&bob_oid), Some(&bob_value), "Bob's coin should exist");
+        assert_eq!(smt.get(&charlie_oid), None, "Charlie's coin should NOT exist (T2 rejected)");
+    }
+    
+    #[test]
+    fn test_apply_committed_events_no_conflict_when_different_objects() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+        
+        let mut manager = GlobalStateManager::new();
+        
+        // Setup: two different coins
+        let coin_a_bytes = [0xAA; 32];
+        let coin_b_bytes = [0xBB; 32];
+        let coin_a_key = format!("oid:{}", hex::encode(coin_a_bytes));
+        let coin_b_key = format!("oid:{}", hex::encode(coin_b_bytes));
+        let value_a = vec![1u8; 64];
+        let value_b = vec![2u8; 64];
+        
+        manager.upsert_object(SubnetId::ROOT, coin_a_bytes, value_a.clone());
+        manager.upsert_object(SubnetId::ROOT, coin_b_bytes, value_b.clone());
+        
+        let new_a = vec![10u8; 64];
+        let new_b = vec![20u8; 64];
+        
+        // Event 1: modify coin_a
+        let mut vlc1 = VLCSnapshot::new();
+        vlc1.logical_time = 1;
+        let mut event1 = Event::new(EventType::Transfer, vec![], vlc1, "v1".to_string());
+        event1.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(coin_a_key, value_a, new_a.clone())],
+        });
+        event1.status = setu_types::event::EventStatus::Executed;
+        
+        // Event 2: modify coin_b (no conflict)
+        let mut vlc2 = VLCSnapshot::new();
+        vlc2.logical_time = 2;
+        let mut event2 = Event::new(EventType::Transfer, vec![], vlc2, "v1".to_string());
+        event2.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(coin_b_key, value_b, new_b.clone())],
+        });
+        event2.status = setu_types::event::EventStatus::Executed;
+        
+        let summary = manager.apply_committed_events(&[event1, event2]);
+        
+        // Both should succeed - no conflicts
+        assert_eq!(summary.total_events, 2);
+        assert!(summary.conflicted_events.is_empty(), "No conflicts expected");
+        
+        let smt = manager.root_subnet();
+        let oid_a = HashValue::from_slice(&coin_a_bytes).unwrap();
+        let oid_b = HashValue::from_slice(&coin_b_bytes).unwrap();
+        assert_eq!(smt.get(&oid_a), Some(&new_a));
+        assert_eq!(smt.get(&oid_b), Some(&new_b));
+    }
+    
+    #[test]
+    fn test_apply_committed_events_insert_no_false_conflict() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+        
+        let mut manager = GlobalStateManager::new();
+        
+        // Event with only inserts (old_value = None) should never conflict
+        let coin_bytes = [0xDD; 32];
+        let coin_key = format!("oid:{}", hex::encode(coin_bytes));
+        let value = vec![7u8; 64];
+        
+        let mut vlc = VLCSnapshot::new();
+        vlc.logical_time = 1;
+        let mut event = Event::new(EventType::Transfer, vec![], vlc, "v1".to_string());
+        event.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::insert(coin_key, value.clone())],
+        });
+        event.status = setu_types::event::EventStatus::Executed;
+        
+        let summary = manager.apply_committed_events(&[event]);
+        
+        assert_eq!(summary.total_events, 1);
+        assert!(summary.conflicted_events.is_empty());
+        
+        let smt = manager.root_subnet();
+        let oid = HashValue::from_slice(&coin_bytes).unwrap();
+        assert_eq!(smt.get(&oid), Some(&value));
     }
 }
