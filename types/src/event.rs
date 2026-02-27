@@ -136,12 +136,15 @@ impl EventType {
     }
 }
 
+use crate::genesis::GenesisConfig;
+
 // ========== Event Payload ==========
 
 /// Event payload - contains the actual data for different event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
     None,
+    Genesis(GenesisConfig),
     Transfer(Transfer),
     ValidatorRegister(ValidatorRegistration),
     ValidatorUnregister(Unregistration),
@@ -555,6 +558,11 @@ impl Event {
                 vec![format!("task:{}", t.task_id)]
             }
             EventPayload::None => vec![],
+            EventPayload::Genesis(g) => {
+                g.accounts.iter()
+                    .map(|a| format!("account:{}", a.name))
+                    .collect()
+            }
         }
     }
 }
