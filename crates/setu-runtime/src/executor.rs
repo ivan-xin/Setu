@@ -1,10 +1,19 @@
 //! Runtime executor - Simple State Transition Executor
+//!
+//! ## State Serialization Format
+//!
+//! **Important**: All Coin state changes use BCS serialization (via `CoinState`),
+//! not JSON. This ensures compatibility with the storage layer's Merkle tree.
+//!
+//! - Use `coin.to_coin_state_bytes()` for StateChange.new_state
+//! - Non-Coin objects (SubnetMetadata, UserMembership) still use JSON
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
 use setu_types::{
     ObjectId, Address, CoinType, create_typed_coin, deterministic_coin_id,
 };
+// Note: Coin::to_coin_state_bytes() is used via trait method on Object<CoinData>
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::state::StateStore;
 use crate::transaction::{Transaction, TransactionType, TransferTx, QueryTx, QueryType};
@@ -145,8 +154,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
             });
         }
         
-        // 记录旧状态
-        let old_state = serde_json::to_vec(&coin)?;
+        // 记录旧状态 (BCS format for Merkle tree compatibility)
+        let old_state = coin.to_coin_state_bytes();
         
         let mut state_changes = Vec::new();
         let mut created_objects = Vec::new();
@@ -168,7 +177,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 coin.metadata.owner = Some(recipient.clone());
                 coin.metadata.version += 1;
                 
-                let new_state = serde_json::to_vec(&coin)?;
+                // Use BCS serialization for storage compatibility
+                let new_state = coin.to_coin_state_bytes();
                 
                 // 保存更新后的对象
                 self.state.set_object(coin_id, coin)?;
@@ -196,9 +206,9 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 let transferred_balance = coin.data.balance.withdraw(amount)
                     .map_err(|e| RuntimeError::InvalidTransaction(e))?;
                 
-                // 更新原 Coin
+                // 更新原 Coin (BCS format)
                 coin.metadata.version += 1;
-                let new_state = serde_json::to_vec(&coin)?;
+                let new_state = coin.to_coin_state_bytes();
                 self.state.set_object(coin_id, coin.clone())?;
                 
                 state_changes.push(StateChange {
@@ -215,7 +225,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     coin.data.coin_type.as_str(),
                 );
                 let new_coin_id = *new_coin.id();
-                let new_coin_state = serde_json::to_vec(&new_coin)?;
+                // Use BCS serialization for new coin
+                let new_coin_state = new_coin.to_coin_state_bytes();
                 
                 self.state.set_object(new_coin_id, new_coin)?;
                 
@@ -492,7 +503,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let hash: [u8; 32] = hasher.finalize().into();
         let subnet_object_id = ObjectId::new(hash);
         
-        // Note: SubnetMetadata would be stored separately, here we simulate with state_changes
+        // Note: SubnetMetadata is NOT a Coin, so we keep JSON format for it
+        // Only Coin objects use BCS format
         state_changes.push(StateChange {
             change_type: StateChangeType::Create,
             object_id: subnet_object_id,
@@ -514,7 +526,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     supply,
                     subnet_id,  // Use subnet_id as coin_type internally
                 );
-                let coin_state = serde_json::to_vec(&token_coin)?;
+                // Use BCS serialization for Coin storage
+                let coin_state = token_coin.to_coin_state_bytes();
                 
                 self.state.set_object(coin_id, token_coin)?;
                 
@@ -652,12 +665,12 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let existing = self.state.get_object(&coin_id)?;
         
         let (state_change, created) = if let Some(mut existing_coin) = existing {
-            // Add to existing balance
-            let old_state = serde_json::to_vec(&existing_coin)?;
+            // Add to existing balance - use BCS format
+            let old_state = existing_coin.to_coin_state_bytes();
             existing_coin.data.balance.deposit(setu_types::Balance::new(amount))
                 .map_err(|e| RuntimeError::InvalidTransaction(e))?;
             existing_coin.increment_version();
-            let new_state = serde_json::to_vec(&existing_coin)?;
+            let new_state = existing_coin.to_coin_state_bytes();
             
             self.state.set_object(coin_id, existing_coin)?;
             
@@ -668,9 +681,9 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 new_state: Some(new_state),
             }, false)
         } else {
-            // Create new coin
+            // Create new coin - use BCS format
             let coin = create_typed_coin(to.clone(), amount, subnet_id);
-            let new_state = serde_json::to_vec(&coin)?;
+            let new_state = coin.to_coin_state_bytes();
             
             // Store with deterministic ID (not the random ID from create_typed_coin)
             self.state.set_object(coin_id, coin)?;
