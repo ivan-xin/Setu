@@ -1,22 +1,31 @@
 //! TEE parallel execution logic
 //!
 //! This module handles:
-//! - Parallel TEE task execution with Semaphore-controlled concurrency
+//! - Inline Solver execution with Semaphore-controlled concurrency
 //! - HTTP communication with Solver nodes
+//! - Background consensus submission (fire-and-forget)
 //! - Transfer status tracking updates
 //! - Graceful shutdown with pending task completion
 //!
 //! ## TPS Optimizations
 //!
-//! This is the performance-critical path:
-//! - Non-blocking spawn for immediate transfer response
-//! - Semaphore limits concurrent TEE calls (default: 100)
-//! - Direct DashMap updates avoid mutex contention
+//! This is the performance-critical path. The architecture uses a **split execution model**:
+//!
+//! 1. **Inline phase** (`execute_solver_inline`): Solver HTTP call + coin release
+//!    are awaited in the HTTP handler's async context. This ensures coins are
+//!    released before returning to the event loop, preventing tokio starvation.
+//!
+//! 2. **Background phase** (`spawn_post_execution`): Consensus submission +
+//!    local storage are spawned as fire-and-forget (no coin held).
+//!
+//! Previous design spawned the entire TEE pipeline as a background task, which
+//! caused tokio runtime starvation under load: HTTP request handling consumed
+//! all runtime capacity, starving spawned tasks that held coin reservations.
 //!
 //! ## Panic Safety
 //!
 //! Uses ReservationGuard (RAII) to ensure coin reservations are released
-//! even if the TEE execution task panics.
+//! even if the execution panics.
 
 use super::types::*;
 use super::solver_client::{ExecuteTaskRequest, ExecuteTaskResponse};
@@ -139,12 +148,200 @@ impl TeeExecutor {
         self.coin_reservation_manager.as_ref()
     }
 
+    // ============================================
+    // Inline Solver Execution (TPS-optimized)
+    // ============================================
+
+    /// Execute Solver HTTP call inline (awaited in caller's async context)
+    ///
+    /// **This is the primary TPS optimization.** By awaiting the Solver call in
+    /// the HTTP handler instead of spawning a background task, we ensure:
+    ///
+    /// 1. Coins are released in the HTTP handler's context (~2ms after reservation)
+    /// 2. No tokio runtime starvation (no background tasks competing for CPU)
+    /// 3. Natural backpressure: each HTTP connection handles one transfer at a time
+    ///
+    /// Returns `(Event, execution_time_us, events_processed)` on success.
+    /// The coin reservation is released before returning on success.
+    /// On error, the RAII guard releases the reservation on drop.
+    pub async fn execute_solver_inline(
+        &self,
+        transfer_id: &str,
+        solver_id: &str,
+        task: SolverTask,
+        reservation: Option<ReservationHandle>,
+    ) -> Result<(Event, u64, usize), String> {
+        let task_id_hex = hex::encode(&task.task_id[..8]);
+
+        // RAII guard for panic-safe reservation release
+        let mut reservation_guard = ReservationGuard::new(
+            self.coin_reservation_manager.clone(),
+            reservation,
+            transfer_id.to_string(),
+        );
+
+        // 1. Acquire semaphore permit (backpressure)
+        let _permit = self.semaphore.acquire().await
+            .map_err(|_| "Service shutting down".to_string())?;
+
+        debug!(
+            transfer_id = %transfer_id,
+            solver_id = %solver_id,
+            task_id = %task_id_hex,
+            "Executing TEE task inline (permit acquired)"
+        );
+
+        // 2. Get Solver address
+        let solver_url = {
+            match self.solver_info.get(solver_id) {
+                Some(info) => info.execute_task_url(),
+                None => return Err(format!("Solver not found: {}", solver_id)),
+            }
+        };
+
+        let mut event = task.event.clone();
+
+        // 3. Create HTTP request
+        let request = ExecuteTaskRequest {
+            solver_task: task,
+            validator_id: self.validator_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // 4. Execute HTTP call with timeout
+        let result = self.http_client
+            .post(&solver_url)
+            .json(&request)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+
+        match result {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<ExecuteTaskResponse>().await {
+                    Ok(exec_resp) if exec_resp.success => {
+                        if let Some(result_dto) = exec_resp.result {
+                            // 5. Build ExecutionResult
+                            let execution_result = setu_types::event::ExecutionResult {
+                                success: result_dto.events_failed == 0,
+                                message: Some(format!(
+                                    "TEE executed: {} events in {}μs",
+                                    result_dto.events_processed, result_dto.execution_time_us
+                                )),
+                                state_changes: result_dto
+                                    .state_changes
+                                    .iter()
+                                    .map(|sc| setu_types::event::StateChange {
+                                        key: sc.key.clone(),
+                                        old_value: sc.old_value.clone(),
+                                        new_value: sc.new_value.clone(),
+                                    })
+                                    .collect(),
+                            };
+
+                            event.set_execution_result(execution_result);
+                            event.status = setu_types::event::EventStatus::Executed;
+
+                            // 6. Release coin reservation EARLY (before returning)
+                            reservation_guard.release();
+
+                            let exec_time = result_dto.execution_time_us;
+                            let events_proc = result_dto.events_processed;
+
+                            Ok((event, exec_time, events_proc))
+                        } else {
+                            Err("No result in response".to_string())
+                        }
+                    }
+                    Ok(exec_resp) => Err(exec_resp.message),
+                    Err(e) => Err(format!("JSON parse error: {}", e)),
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                Err(format!("HTTP {}: {}", status, body))
+            }
+            Err(e) => Err(format!("Network error: {}", e)),
+        }
+        // reservation_guard drops here, releasing if not already released
+    }
+
+    /// Spawn post-execution work (consensus + storage) as background task
+    ///
+    /// This is fire-and-forget: consensus submission and local storage
+    /// don't hold any coin reservations, so starvation is not an issue.
+    /// Used after `execute_solver_inline()` returns successfully.
+    pub fn spawn_post_execution(
+        &self,
+        transfer_id: String,
+        event: Event,
+        execution_time_us: u64,
+        events_processed: usize,
+    ) {
+        let consensus = self.consensus.clone();
+        let events_store = Arc::clone(&self.events);
+        let dag_events = Arc::clone(&self.dag_events);
+        let transfer_status = Arc::clone(&self.transfer_status);
+        let pending_count = Arc::clone(&self.pending_count);
+
+        pending_count.fetch_add(1, Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            let event_id = event.id.clone();
+
+            // Submit to consensus (if enabled)
+            if let Some(ref consensus_validator) = consensus {
+                match consensus_validator.submit_event(event.clone()).await {
+                    Ok(_) => {
+                        info!(
+                            event_id = %&event_id[..20.min(event_id.len())],
+                            "Event submitted to consensus DAG"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            event_id = %&event_id[..20.min(event_id.len())],
+                            error = %e,
+                            "Failed to submit event to consensus"
+                        );
+                    }
+                }
+            }
+
+            // Store locally
+            events_store.insert(event_id.clone(), event);
+            dag_events.write().push(event_id.clone());
+
+            // Update tracker to success
+            Self::update_tracker_success(
+                &transfer_status,
+                &transfer_id,
+                &event_id,
+                execution_time_us,
+                events_processed,
+            );
+
+            info!(
+                transfer_id = %transfer_id,
+                event_id = %&event_id[..20.min(event_id.len())],
+                "TEE task completed successfully"
+            );
+
+            pending_count.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    // ============================================
+    // Legacy Spawn-based Execution (for batch mode)
+    // ============================================
+
     /// Spawn an async TEE task (non-blocking)
     ///
-    /// This is the key optimization for TPS:
-    /// - submit_transfer returns immediately after spawning
-    /// - TEE execution happens in background with Semaphore-controlled concurrency
-    /// - Status is updated via transfer_id lookup (not find())
+    /// **Note**: For single transfers, prefer `execute_solver_inline()` +
+    /// `spawn_post_execution()` to avoid tokio runtime starvation.
+    /// This method is kept for batch transfer processing where multiple
+    /// tasks are spawned together.
     pub fn spawn_tee_task(
         &self,
         transfer_id: String,
@@ -156,8 +353,11 @@ impl TeeExecutor {
 
     /// Spawn an async TEE task with coin reservation (non-blocking)
     ///
+    /// **Note**: For single transfers, prefer `execute_solver_inline()` +
+    /// `spawn_post_execution()` to avoid tokio runtime starvation.
+    ///
     /// Similar to `spawn_tee_task`, but also releases the coin reservation
-    /// after task completion (success or failure).
+    /// after task completion (success or failure). Used by batch processing.
     ///
     /// ## Cross-batch Double-spend Prevention
     ///
@@ -322,6 +522,12 @@ impl TeeExecutor {
                             event.set_execution_result(execution_result);
                             event.status = setu_types::event::EventStatus::Executed;
 
+                            // 5b. Release coin reservation early (after Solver success)
+                            // Safety: apply_committed_events() validates old_value against
+                            // current SMT state, so conflicting events from the same coin
+                            // will be rejected at CF commit time.
+                            reservation_guard.release();
+
                             // 6. Submit to consensus (if enabled)
                             if let Some(ref consensus_validator) = consensus {
                                 match consensus_validator.submit_event(event.clone()).await {
@@ -402,8 +608,9 @@ impl TeeExecutor {
             }
         }
 
-        // Explicitly release coin reservation via RAII guard
-        // This is a normal release (not panic). The guard handles both cases.
+        // Fallback release: if Solver failed or response was invalid,
+        // the early release in step 5b was never reached.
+        // ReservationGuard::release() is idempotent (no-ops if already released).
         reservation_guard.release();
 
         pending_count.fetch_sub(1, Ordering::Relaxed);

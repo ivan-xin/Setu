@@ -209,24 +209,67 @@ impl TransferHandler {
                 .push(transfer_id.clone());
         }
 
-        // Step 6: Spawn async TEE task with reservation handle for release on completion
+        // Step 6: Execute Solver INLINE (await) → release coin → spawn consensus
+        //
+        // Key TPS optimization: By awaiting the Solver call here instead of spawning
+        // a background task, we prevent tokio runtime starvation. Under high load,
+        // spawned tasks get starved by HTTP request handling, causing coins to remain
+        // reserved indefinitely → retry storm → total starvation.
+        //
+        // With inline execution:
+        // - Coin held for ~2ms (Solver call time only)
+        // - Natural backpressure (HTTP connection blocks until Solver responds)
+        // - No retry storm (coin released before HTTP response)
         if let Some(ref sid) = solver_id {
-            tee_executor.spawn_tee_task_with_reservation(
-                transfer_id.clone(), 
-                sid.clone(), 
-                solver_task,
-                Some(reservation_handle),
-            );
-        }
+            match tee_executor.execute_solver_inline(
+                &transfer_id, sid, solver_task, Some(reservation_handle),
+            ).await {
+                Ok((event, execution_time_us, events_processed)) => {
+                    // Fire-and-forget: consensus + storage (no coin held)
+                    tee_executor.spawn_post_execution(
+                        transfer_id.clone(), event, execution_time_us, events_processed,
+                    );
 
-        info!(transfer_id = %transfer_id, solver_id = ?solver_id, "Transfer submitted with reservation (TEE execution spawned)");
+                    info!(transfer_id = %transfer_id, solver_id = ?solver_id, "Transfer executed inline, consensus spawned");
 
-        SubmitTransferResponse {
-            success: true,
-            message: "Transfer submitted, awaiting TEE execution".to_string(),
-            transfer_id: Some(transfer_id),
-            solver_id,
-            processing_steps: steps,
+                    SubmitTransferResponse {
+                        success: true,
+                        message: "Transfer executed, consensus pending".to_string(),
+                        transfer_id: Some(transfer_id),
+                        solver_id,
+                        processing_steps: steps,
+                    }
+                }
+                Err(e) => {
+                    error!(transfer_id = %transfer_id, error = %e, "Inline TEE execution failed");
+                    // Update existing tracker to failed
+                    if let Some(mut tracker) = transfer_status.get_mut(&transfer_id) {
+                        tracker.status = "failed".to_string();
+                        tracker.processing_steps.push(ProcessingStep {
+                            step: "tee_execution".to_string(),
+                            status: "failed".to_string(),
+                            details: Some(e.clone()),
+                            timestamp: now,
+                        });
+                    }
+                    SubmitTransferResponse {
+                        success: false,
+                        message: format!("TEE execution failed: {}", e),
+                        transfer_id: Some(transfer_id),
+                        solver_id,
+                        processing_steps: steps,
+                    }
+                }
+            }
+        } else {
+            // Shouldn't reach here (routing above returns early on failure)
+            SubmitTransferResponse {
+                success: true,
+                message: "Transfer submitted".to_string(),
+                transfer_id: Some(transfer_id),
+                solver_id,
+                processing_steps: steps,
+            }
         }
     }
 
