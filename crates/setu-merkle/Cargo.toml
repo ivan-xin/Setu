@@ -13,6 +13,9 @@ bincode = "2.0.0-rc.3"
 # Cryptography - BLAKE3 for high-performance hashing (3-5x faster than SHA256)
 blake3 = "1.5"
 
+# Persistent data structures - O(1) clone via structural sharing (C1 optimization)
+im = "15.1"
+
 # Utilities
 thiserror = "1.0"
 hex = "0.4"
