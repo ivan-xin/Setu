@@ -696,6 +696,13 @@ mod tests {
         });
         event
     }
+
+    /// Generate a canonical "oid:{hex}" key for tests.
+    /// Hashes the seed with BLAKE3 to produce a deterministic 32-byte ObjectId.
+    fn test_oid_key(seed: &str) -> String {
+        let hash = setu_types::hash_utils::setu_hash(seed.as_bytes());
+        format!("oid:{}", hex::encode(hash))
+    }
     
     #[test]
     fn test_prepare_build_does_not_modify_state() {
@@ -714,7 +721,7 @@ mod tests {
             SubnetId::ROOT,
             vec![
                 StateChange {
-                    key: "balance:alice".to_string(),
+                    key: test_oid_key("balance:alice"),
                     old_value: Some(vec![0; 8]),
                     new_value: Some(vec![100; 8]),
                 },
@@ -753,7 +760,7 @@ mod tests {
         let event = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -792,7 +799,7 @@ mod tests {
         let event = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -823,7 +830,7 @@ mod tests {
         let event1 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -831,7 +838,7 @@ mod tests {
         let event2 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:bob".to_string(),
+                key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
             }],
@@ -868,7 +875,7 @@ mod tests {
             create_event_with_result(
                 SubnetId::ROOT,
                 vec![StateChange {
-                    key: "balance:alice".to_string(),
+                    key: test_oid_key("balance:alice"),
                     old_value: None,
                     new_value: Some(vec![100; 8]),
                 }],
@@ -876,7 +883,7 @@ mod tests {
             create_event_with_result(
                 app_subnet,
                 vec![StateChange {
-                    key: "nft:token1".to_string(),
+                    key: test_oid_key("nft:token1"),
                     old_value: None,
                     new_value: Some(vec![1; 32]),
                 }],
@@ -912,7 +919,7 @@ mod tests {
         let event1 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -927,7 +934,7 @@ mod tests {
         let event2 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:bob".to_string(),
+                key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
             }],

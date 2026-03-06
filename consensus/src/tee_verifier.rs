@@ -334,7 +334,7 @@ mod tests {
             message: None,
             state_changes: vec![
                 StateChange {
-                    key: "balance:alice".to_string(),
+                    key: format!("oid:{}", hex::encode(setu_types::hash_utils::setu_hash(b"balance:alice"))),
                     old_value: Some(vec![100]),
                     new_value: Some(vec![90]),
                 },
@@ -381,7 +381,7 @@ mod tests {
     fn test_write_set_commitment() {
         let changes = vec![
             StateChange {
-                key: "balance:alice".to_string(),
+                key: format!("oid:{}", hex::encode(setu_types::hash_utils::setu_hash(b"balance:alice"))),
                 old_value: Some(vec![100]),
                 new_value: Some(vec![90]),
             },
@@ -395,7 +395,7 @@ mod tests {
         // Different changes should produce different commitment
         let changes2 = vec![
             StateChange {
-                key: "balance:bob".to_string(),
+                key: format!("oid:{}", hex::encode(setu_types::hash_utils::setu_hash(b"balance:bob"))),
                 old_value: Some(vec![50]),
                 new_value: Some(vec![60]),
             },
