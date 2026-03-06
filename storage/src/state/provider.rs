@@ -263,7 +263,7 @@ impl MerkleStateProvider {
     }
 
     /// Generate object ID for ROOT subnet coin
-    /// Format: SHA256("coin:" || address || ":ROOT")
+    /// Format: BLAKE3("SETU_COIN_ID:" || canonical_address || ":ROOT")
     fn coin_object_id(address: &str) -> [u8; 32] {
         Self::coin_object_id_with_type(address, "ROOT")
     }
@@ -420,26 +420,13 @@ impl StateProvider for MerkleStateProvider {
 
 /// Resolve an owner string to a canonical hex address.
 ///
+/// Delegates to [`setu_types::Address::normalize`] — the single source of truth
+/// for address canonicalization.
+///
 /// In production: only accepts valid hex addresses ("0x" + 64 hex chars).
 /// In test builds: also accepts plain names (e.g., "alice") via `Address::from_str_id`.
 pub(crate) fn resolve_owner_address(owner: &str) -> String {
-    use setu_types::Address;
-    
-    // Try hex first
-    if let Ok(addr) = Address::from_hex(owner) {
-        return addr.to_string();
-    }
-    
-    // In test builds, fall back to from_str_id
-    #[cfg(any(test, feature = "test-utils"))]
-    {
-        return Address::from_str_id(owner).to_string();
-    }
-    
-    #[cfg(not(any(test, feature = "test-utils")))]
-    {
-        panic!("resolve_owner_address: invalid hex address '{}'. In production, only hex addresses are accepted.", owner);
-    }
+    setu_types::Address::normalize(owner).to_string()
 }
 
 /// Initialize a coin in the state (for testing/genesis)

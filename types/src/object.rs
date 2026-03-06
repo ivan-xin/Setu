@@ -139,7 +139,34 @@ impl Address {
         let hash = blake3::hash(id.as_bytes());
         Self(*hash.as_bytes())
     }
-    
+
+    /// Resolve an arbitrary string to a canonical `Address`.
+    ///
+    /// - If `s` is a valid hex address (`"0x" + 64 hex chars`, or bare 64 hex chars`),
+    ///   it is parsed directly.
+    /// - In test builds (`#[cfg(test)]` or `feature = "test-utils"`), non-hex strings
+    ///   (e.g., `"alice"`) are hashed via `from_str_id`.
+    /// - In production, non-hex strings cause a panic.
+    ///
+    /// This function is **idempotent**: `normalize(normalize(x).to_string()) == normalize(x)`.
+    pub fn normalize(s: &str) -> Self {
+        // Try hex first
+        if let Ok(addr) = Self::from_hex(s) {
+            return addr;
+        }
+
+        // In test builds, fall back to from_str_id
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            return Self::from_str_id(s);
+        }
+
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            panic!("Address::normalize: invalid hex address '{}'. In production, only hex addresses are accepted.", s);
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
