@@ -500,9 +500,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 .as_millis() as u64,
         });
         
-        // Generate deterministic ObjectId from subnet key
-        let hash = blake3::hash(subnet_key.as_bytes());
-        let subnet_object_id = ObjectId::new(*hash.as_bytes());
+        // Generate deterministic ObjectId from subnet key (domain-separated)
+        let subnet_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(b"SETU_SUBNET_META:", subnet_key.as_bytes())
+        );
         
         // Note: SubnetMetadata is NOT a Coin, so we keep JSON format for it
         // Only Coin objects use BCS format
@@ -597,9 +598,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 .as_millis() as u64,
         });
         
-        // Generate deterministic ObjectId from membership key
-        let hash = blake3::hash(membership_key.as_bytes());
-        let membership_object_id = ObjectId::new(*hash.as_bytes());
+        // Generate deterministic ObjectId from membership key (domain-separated)
+        let membership_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes())
+        );
         
         state_changes.push(StateChange {
             change_type: StateChangeType::Create,
