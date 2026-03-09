@@ -71,14 +71,23 @@ pub enum EventType {
     PowerConsume,
     /// Task submission event
     TaskSubmit,
-    /// Agent chat event (future)
+    /// Agent chat event
     AgentChat,
-    /// SBT/Relationship event (future)
+    /// SBT/Relationship event
     Relationship,
+    /// Smart contract / custom module function call
+    /// Not bound to Move — also usable for WASM or other execution engines
+    ContractCall,
+    /// Smart contract / module publish
+    ContractPublish,
 }
 
 impl EventType {
-    /// Check if this event type requires execution by Solver
+    /// Check if this event type requires execution (by Solver or Validator)
+    ///
+    /// NOTE: Despite the name, this function means "requires execution" (not
+    /// specifically Solver execution). All events that need state changes return true.
+    /// Use `is_root_event()` / `is_validator_executed()` to distinguish who executes.
     pub fn requires_solver_execution(&self) -> bool {
         matches!(
             self,
@@ -91,11 +100,19 @@ impl EventType {
                 | EventType::UserRegister
                 | EventType::PowerConsume
                 | EventType::TaskSubmit
+                | EventType::AgentChat
+                | EventType::Relationship
+                | EventType::ContractCall
+                | EventType::ContractPublish
         )
     }
     
     /// Check if this event should be routed to ROOT subnet
     /// These events are executed by validators directly, not solvers
+    ///
+    /// NOTE: `ContractPublish` is classified as a root event in Phase 1
+    /// (all module publishes go through ROOT / Validator). When per-subnet
+    /// contract deployment is needed, move it out and add subnet-aware routing.
     pub fn is_root_event(&self) -> bool {
         matches!(
             self,
@@ -107,6 +124,7 @@ impl EventType {
                 | EventType::SolverUnregister
                 | EventType::SubnetRegister
                 | EventType::UserRegister
+                | EventType::ContractPublish
         )
     }
     
@@ -131,6 +149,8 @@ impl EventType {
             EventType::TaskSubmit => "TaskSubmit",
             EventType::AgentChat => "AgentChat",
             EventType::Relationship => "Relationship",
+            EventType::ContractCall => "ContractCall",
+            EventType::ContractPublish => "ContractPublish",
         }
     }
 }
@@ -153,6 +173,29 @@ pub enum EventPayload {
     UserRegister(UserRegistration),
     PowerConsume(PowerConsumption),
     TaskSubmit(TaskSubmission),
+    /// Agent chat interaction
+    AgentChat {
+        agent_id: String,
+        message: String,
+    },
+    /// Social graph / relationship operation
+    Relationship {
+        from: String,
+        to: String,
+        relation_type: String,
+    },
+    /// Smart contract / module function call (Phase 1: generic structure)
+    ContractCall {
+        /// Target contract/module identifier (e.g., "0x1::coin::transfer")
+        target: String,
+        /// Call arguments (BCS or JSON serialized)
+        args: Vec<Vec<u8>>,
+    },
+    /// Smart contract / module publish
+    ContractPublish {
+        /// Compiled module bytecode
+        modules: Vec<Vec<u8>>,
+    },
 }
 
 impl Default for EventPayload {
@@ -556,6 +599,19 @@ impl Event {
             }
             EventPayload::TaskSubmit(t) => {
                 vec![format!("task:{}", t.task_id)]
+            }
+            EventPayload::AgentChat { agent_id, .. } => {
+                vec![format!("agent:{}", agent_id)]
+            }
+            EventPayload::Relationship { from, to, .. } => {
+                vec![format!("user:{}", from), format!("user:{}", to)]
+            }
+            EventPayload::ContractCall { target, .. } => {
+                vec![format!("contract:{}", target)]
+            }
+            EventPayload::ContractPublish { .. } => {
+                // Publisher is sender, captured by event.sender
+                vec![]
             }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
