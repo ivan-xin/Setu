@@ -19,10 +19,9 @@
 
 use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
 use setu_vlc::VLCSnapshot;
-use setu_storage::{EventStore, EventStoreBackend, subnet_state::GlobalStateManager};
+use setu_storage::{EventStore, EventStoreBackend, SharedStateManager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock as StdRwLock;
 use tokio::sync::{mpsc, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
@@ -130,7 +129,7 @@ impl ConsensusEngine {
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         
@@ -211,7 +210,7 @@ impl ConsensusEngine {
         config: ConsensusConfig,
         validator_id: String,
         validator_set: ValidatorSet,
-        state_manager: Arc<StdRwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
         event_store: Arc<dyn EventStoreBackend>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1000);

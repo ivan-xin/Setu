@@ -4,9 +4,10 @@ use setu_types::{
 use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
 use crate::vlc::VLC;
+use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Decision outcome for a ConsensusFrame
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +141,7 @@ impl ConsensusManager {
     pub fn with_shared_state_manager(
         config: ConsensusConfig, 
         validator_id: String,
-        state_manager: Arc<RwLock<GlobalStateManager>>,
+        state_manager: Arc<SharedStateManager>,
     ) -> Self {
         Self {
             config: config.clone(),
@@ -347,9 +348,21 @@ impl ConsensusManager {
                             }
                         }
                     } else {
-                        // Follower path: we didn't create this CF
-                        tracing::info!(cf_id = %cf_id, "Follower path: no pending_build, syncing metadata only");
-                        // For now, just sync metadata. Full state sync requires events from DAG
+                        // Follower path: state was already applied in apply_cf_state_changes
+                        tracing::info!(cf_id = %cf_id, "Follower path: committing pre-applied state");
+                        {
+                            let anchor_id = self.anchor_builder.anchor_depth() + 1;
+                            let mut guard = self.anchor_builder.shared.lock_write();
+                            match guard.commit(anchor_id) {
+                                Ok(()) => {
+                                    self.anchor_builder.shared.publish_snapshot(&guard);
+                                }
+                                Err(e) => {
+                                    tracing::error!(cf_id = %cf_id, error = %e,
+                                        "Follower commit failed — state NOT published");
+                                }
+                            }
+                        }
                         self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
                     }
                     
@@ -485,7 +498,7 @@ impl ConsensusManager {
     }
     
     /// Get the shared GlobalStateManager
-    pub fn shared_state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
+    pub fn shared_state_manager(&self) -> Arc<SharedStateManager> {
         self.anchor_builder.shared_state_manager()
     }
     
@@ -534,10 +547,35 @@ impl ConsensusManager {
     /// When a follower receives a CF from the leader, it needs to apply
     /// the same state changes to maintain consistency. This method:
     /// 1. Gets the events referenced in the CF's anchor
-    /// 2. Applies their state changes to the local SMT
-    /// 3. Verifies the resulting state root matches the anchor's merkle_roots
+    /// 2. Verifies the resulting state root matches the anchor's merkle_roots
+    /// 3. Only if verified, applies changes to the real write GSM
     /// 
     /// Returns true if state was applied and verified successfully.
+    ///
+    /// ## F1 fix: verify-before-mutate pattern
+    ///
+    /// Previously, events were applied directly to the write GSM and then the
+    /// root was verified. If verification failed (Byzantine leader, missing events,
+    /// or bug-induced state divergence), the write GSM was left in a dirty state
+    /// with no rollback, causing cascading errors for all subsequent anchors.
+    ///
+    /// New approach: clone write GSM → apply to clone → verify root → if OK,
+    /// apply to real write GSM. On failure, the real write GSM is untouched.
+    ///
+    /// ## Why clone from write GSM (not read snapshot)?
+    ///
+    /// Multiple CFs can arrive before the first is finalized. Each CF's
+    /// `apply_cf_state_changes` pre-applies events to the write GSM, but
+    /// `publish_snapshot` only happens at finalization. So the write GSM may
+    /// contain pre-applied changes from prior CFs that the read snapshot lacks.
+    /// Verifying against the read snapshot would miss those changes.
+    ///
+    /// ## Cost
+    ///
+    /// One extra `apply_committed_events` call per anchor (clone vs real).
+    /// Acceptable because: im::HashMap clone is O(1) (structural sharing),
+    /// the apply is deterministic, and this runs once per anchor (~every 10 VLC
+    /// ticks) not per-transaction.
     pub fn apply_cf_state_changes(&mut self, dag: &Dag, cf: &setu_types::ConsensusFrame) -> bool {
         // Get events from the anchor's event_ids
         let events: Vec<setu_types::Event> = cf.anchor.event_ids
@@ -553,25 +591,51 @@ impl ConsensusManager {
                        .unwrap_or(true);
         }
         
-        // Apply state changes from these events
-        self.anchor_builder.with_state_manager_mut(|gsm| {
-            let _ = gsm.apply_committed_events(&events);
-        });
+        let merkle_roots_clone = cf.anchor.merkle_roots.clone();
         
-        // Verify the resulting global state root matches the anchor's
-        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
-            let local_root = self.get_global_root();
-            if local_root != merkle_roots.global_state_root {
-                eprintln!(
-                    "State root mismatch! Local: {:?}, Anchor: {:?}",
-                    hex::encode(local_root),
-                    hex::encode(merkle_roots.global_state_root)
-                );
-                return false;
+        // Hold write Mutex for the entire operation to prevent interleaving
+        // with other writers (e.g., infra_executor). Readers are unaffected
+        // because the ArcSwap read path is lock-free.
+        let mut guard = self.anchor_builder.shared.lock_write();
+        
+        // Phase 1: Verify on a temporary clone of the write GSM.
+        // clone() copies subnet_states (im::HashMap O(1)) and clears indexes,
+        // which is fine — verification only needs SMT state, not indexes.
+        let verified = {
+            let mut temp = (*guard).clone();
+            temp.apply_committed_events(&events);
+            
+            if let Some(ref merkle_roots) = merkle_roots_clone {
+                let (local_root, _) = temp.compute_global_root_bytes();
+                if local_root != merkle_roots.global_state_root {
+                    tracing::error!(
+                        local_root = %hex::encode(local_root),
+                        anchor_root = %hex::encode(merkle_roots.global_state_root),
+                        event_count = events.len(),
+                        "State root mismatch — write GSM NOT mutated (F1 safety)"
+                    );
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
             }
+        }; // temp dropped
+        
+        if !verified {
+            // guard dropped here — real write GSM completely untouched
+            return false;
         }
         
+        // Phase 2: Verified — apply to real write GSM.
+        // Deterministic: same events + same base state → identical result.
+        // R9 guarantee preserved: no window between verify and mutate because
+        // we hold the Mutex continuously from Phase 1 through Phase 2.
+        let _ = guard.apply_committed_events(&events);
+        
         true
+        // guard dropped, Mutex released
     }
     
     /// Verify a ConsensusFrame's merkle roots without applying state

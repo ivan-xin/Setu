@@ -23,9 +23,9 @@ use setu_types::{
     Anchor, AnchorMerkleRoots, ConsensusConfig, ConsensusFrame, Event, EventId, SubnetId,
     event::StateChange,
 };
-use setu_storage::{GlobalStateManager, StateApplySummary, StateApplyError};
+use setu_storage::{GlobalStateManager, SharedStateManager, StateApplySummary, StateApplyError};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // ============================================================================
 // Types for Deferred Commit Mode
@@ -183,8 +183,8 @@ impl From<setu_merkle::MerkleError> for AnchorBuildError {
 /// Anchor Builder with integrated Merkle tree management
 pub struct AnchorBuilder {
     config: ConsensusConfig,
-    /// Global state manager (shared across components)
-    state_manager: Arc<RwLock<GlobalStateManager>>,
+    /// Shared state manager (read-write separated)
+    pub(crate) shared: Arc<SharedStateManager>,
     /// Last created anchor
     last_anchor: Option<Anchor>,
     /// Current anchor depth
@@ -206,7 +206,7 @@ impl AnchorBuilder {
     pub fn new(config: ConsensusConfig) -> Self {
         Self {
             config,
-            state_manager: Arc::new(RwLock::new(GlobalStateManager::new())),
+            shared: Arc::new(SharedStateManager::new(GlobalStateManager::new())),
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
@@ -218,10 +218,10 @@ impl AnchorBuilder {
     /// Create with a shared GlobalStateManager
     /// 
     /// This allows sharing state between components (e.g., TaskPreparer and ConsensusValidator)
-    pub fn with_shared_state_manager(config: ConsensusConfig, state_manager: Arc<RwLock<GlobalStateManager>>) -> Self {
+    pub fn with_shared_state_manager(config: ConsensusConfig, state_manager: Arc<SharedStateManager>) -> Self {
         Self {
             config,
-            state_manager,
+            shared: state_manager,
             last_anchor: None,
             anchor_depth: 0,
             last_fold_vlc: 0,
@@ -236,9 +236,9 @@ impl AnchorBuilder {
         delta >= self.config.vlc_delta_threshold
     }
     
-    /// Get the shared global state manager
-    pub fn shared_state_manager(&self) -> Arc<RwLock<GlobalStateManager>> {
-        Arc::clone(&self.state_manager)
+    /// Get the shared state manager
+    pub fn shared_state_manager(&self) -> Arc<SharedStateManager> {
+        Arc::clone(&self.shared)
     }
     
     /// Restore AnchorBuilder state from storage after restart
@@ -267,8 +267,7 @@ impl AnchorBuilder {
     where
         F: FnOnce(&mut GlobalStateManager) -> R,
     {
-        let mut guard = self.state_manager.write()
-            .expect("GlobalStateManager lock poisoned");
+        let mut guard = self.shared.lock_write();
         f(&mut guard)
     }
     
@@ -277,9 +276,8 @@ impl AnchorBuilder {
     where
         F: FnOnce(&GlobalStateManager) -> R,
     {
-        let guard = self.state_manager.read()
-            .expect("GlobalStateManager lock poisoned");
-        f(&guard)
+        let snapshot = self.shared.load_snapshot();
+        f(&snapshot)
     }
 
     // ========================================================================
@@ -456,21 +454,17 @@ impl AnchorBuilder {
             });
         }
         
-        // Apply state changes to SMT
+        // Apply state changes to SMT and commit in a single write lock
         let events = pending.all_events();
-        let state_summary = {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
-            guard.apply_committed_events(&events)
-        };
-        
-        // Commit state
         let anchor_id = self.anchor_depth + 1;
-        {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
+        let state_summary = {
+            let mut guard = self.shared.lock_write();
+            let summary = guard.apply_committed_events(&events);
             guard.commit(anchor_id)?;
-        }
+            // Publish snapshot while still holding Mutex (atomic consistency)
+            self.shared.publish_snapshot(&guard);
+            summary
+        };
         
         // Update AnchorBuilder state
         self.last_anchor = Some(pending.anchor);
@@ -516,20 +510,16 @@ impl AnchorBuilder {
             }
         }
         
-        // 3. Apply state changes
-        let state_summary = {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
-            guard.apply_committed_events(events)
-        };
-        
-        // 4. Commit and update metadata
+        // 3. Apply state changes and commit in a single write lock
         let anchor_id = self.anchor_depth + 1;
-        {
-            let mut guard = self.state_manager.write()
-                .expect("GlobalStateManager lock poisoned");
+        let state_summary = {
+            let mut guard = self.shared.lock_write();
+            let summary = guard.apply_committed_events(events);
             guard.commit(anchor_id)?;
-        }
+            // Publish snapshot while still holding Mutex
+            self.shared.publish_snapshot(&guard);
+            summary
+        };
         self.synchronize_finalized_anchor(&cf.anchor);
         
         Ok(state_summary)
@@ -561,11 +551,10 @@ impl AnchorBuilder {
         &self,
         pending_changes: &HashMap<SubnetId, Vec<StateChangeEntry>>,
     ) -> ([u8; 32], HashMap<SubnetId, [u8; 32]>) {
-        // Clone the state manager for temporary computation
+        // Clone from read snapshot (lock-free, no Mutex needed)
         let mut temp_manager = {
-            let guard = self.state_manager.read()
-                .expect("GlobalStateManager lock poisoned");
-            guard.clone()
+            let snapshot = self.shared.load_snapshot_arc();
+            (*snapshot).clone()  // Use existing clone() (clears indexes), temp calc only needs subnet_states
         };
         
         // Apply pending changes to the clone
@@ -642,16 +631,14 @@ impl AnchorBuilder {
     
     /// Get a subnet's current state root
     pub fn get_subnet_root(&self, subnet_id: &SubnetId) -> Option<[u8; 32]> {
-        let guard = self.state_manager.read()
-            .expect("GlobalStateManager lock poisoned");
-        guard.get_subnet_root_bytes(subnet_id)
+        let snapshot = self.shared.load_snapshot();
+        snapshot.get_subnet_root_bytes(subnet_id)
     }
     
     /// Get the current global state root
     pub fn get_global_root(&self) -> [u8; 32] {
-        let guard = self.state_manager.read()
-            .expect("GlobalStateManager lock poisoned");
-        let (root, _) = guard.compute_global_root_bytes();
+        let snapshot = self.shared.load_snapshot();
+        let (root, _) = snapshot.compute_global_root_bytes();
         root
     }
     
