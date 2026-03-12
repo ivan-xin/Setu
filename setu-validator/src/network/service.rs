@@ -140,6 +140,9 @@ impl ValidatorNetworkService {
         // Create HTTP client for sync Solver calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .pool_max_idle_per_host(200)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -161,7 +164,7 @@ impl ValidatorNetworkService {
             Arc::clone(&dag_events),
             None, // No consensus
             validator_id.clone(),
-            100, // Max concurrent TEE calls
+            200, // Max concurrent TEE calls
         ).with_coin_reservation_manager(Arc::clone(&coin_reservation_manager));
 
         // Create BatchTaskPreparer from TaskPreparer's state
@@ -215,6 +218,9 @@ impl ValidatorNetworkService {
         // Create HTTP client for sync Solver calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .pool_max_idle_per_host(200)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -236,7 +242,7 @@ impl ValidatorNetworkService {
             Arc::clone(&dag_events),
             Some(Arc::clone(&consensus_validator)),
             validator_id.clone(),
-            100, // Max concurrent TEE calls
+            200, // Max concurrent TEE calls
         ).with_coin_reservation_manager(Arc::clone(&coin_reservation_manager));
 
         // Use the passed-in batch_task_preparer (shares state with TaskPreparer)

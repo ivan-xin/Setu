@@ -1011,8 +1011,9 @@ impl GlobalStateManager {
                             summary.conflicted_events.push(event.id.clone());
                             continue 'event_loop;
                         }
-                    } else {
-                        // R15: Create operation (old_value is None) — defense-in-depth.
+                    } else if change.new_value.is_some() {
+                        // R15: Create operation (old_value=None, new_value=Some)
+                        // — defense-in-depth.
                         // If the key already exists in SMT or pending_writes, something
                         // is wrong (duplicate coin ID or replayed creation).
                         let exists_in_pending = pending_writes.get(&object_id)
@@ -1029,6 +1030,10 @@ impl GlobalStateManager {
                             continue 'event_loop;
                         }
                     }
+                    // else: old_value=None, new_value=None → Delete with lost
+                    // old_value (from tee.rs StateDiff.deletes conversion).
+                    // No conflict check possible without old_value; deletion is
+                    // idempotent so applying it unconditionally is safe.
 
                     // Record this write in pending_writes so subsequent changes
                     // within the same event see the updated value.
@@ -1115,9 +1120,11 @@ impl GlobalStateManager {
                 key = %key,
                 "Invalid oid: format — hex decode failed or wrong length"
             );
-        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") {
+        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") || key.starts_with("event:") {
             // Known non-object metadata key prefixes.
             // These don't have a native 32-byte ObjectId, so we hash the key.
+            // "event:" keys are produced by MockTeeEnclave::record_event_processed()
+            // to track processed events in the state tree.
             let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
             return HashValue::from_slice(&hash).expect("32 bytes");
         } else {
@@ -1346,10 +1353,19 @@ mod tests {
     
     #[test]
     #[should_panic(expected = "unexpected key format")]
-    fn test_parse_state_change_key_legacy_format() {
-        // Legacy format without "oid:" prefix should panic (debug_assert)
-        let key = "event:some-event-id";
+    fn test_parse_state_change_key_unknown_prefix() {
+        // Unknown prefix should panic via debug_assert
+        let key = "unknown:some-id";
         let _parsed = GlobalStateManager::parse_state_change_key(key);
+    }
+
+    #[test]
+    fn test_parse_state_change_key_event_prefix() {
+        // "event:" is a known metadata prefix — should return setu_hash of key
+        let key = "event:some-event-id";
+        let parsed = GlobalStateManager::parse_state_change_key(key);
+        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
+        assert_eq!(parsed.as_bytes(), &expected);
     }
     
     #[test]
