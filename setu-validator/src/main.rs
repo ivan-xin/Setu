@@ -26,6 +26,7 @@ use setu_types::{
 use setu_keys::{load_keypair};
 use std::sync::Arc;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::{info, error, warn, Level};
 use tracing_subscriber;
 
@@ -514,8 +515,20 @@ async fn main() -> anyhow::Result<()> {
             info!("HTTP server stopped");
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
+            info!("Received Ctrl+C, initiating graceful shutdown...");
         }
+    }
+
+    // ── Graceful shutdown sequence ──
+    // Step 1: Stop batch collector (drain pending entries)
+    info!("Step 1: Stopping batch collector...");
+    network_service.shutdown_batch_collector().await;
+
+    // Step 2: Wait for pending post-execution tasks (consensus + storage)
+    info!("Step 2: Waiting for pending tasks...");
+    match network_service.wait_for_pending_tee_tasks(Duration::from_secs(10)).await {
+        Ok(()) => info!("All pending tasks completed"),
+        Err(e) => warn!("Shutdown timeout: {}", e),
     }
 
     info!("Validator shutdown complete");

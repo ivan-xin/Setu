@@ -337,6 +337,11 @@ impl ValidatorNetworkService {
         self.tee_executor.wait_for_pending_tasks(timeout).await
     }
 
+    /// Gracefully shutdown the batch collector (if enabled)
+    pub async fn shutdown_batch_collector(&self) {
+        self.tee_executor.shutdown_batch_collector().await;
+    }
+
     /// Start background cleanup task for expired coin reservations
     /// 
     /// This spawns a background task that periodically cleans up expired reservations

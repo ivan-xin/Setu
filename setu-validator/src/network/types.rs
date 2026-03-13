@@ -68,6 +68,11 @@ impl SolverInfo {
     pub fn execute_task_url(&self) -> String {
         format!("{}/api/v1/execute-task", self.http_url())
     }
+
+    /// Get batch execute-task endpoint URL
+    pub fn execute_batch_url(&self) -> String {
+        format!("{}/api/v1/execute-task-batch", self.http_url())
+    }
 }
 
 /// Helper to get current timestamp in seconds

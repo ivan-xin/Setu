@@ -240,6 +240,40 @@ pub struct EnclaveInfoDto {
     pub is_simulated: bool,
 }
 
+// ============================================
+// Batch Request/Response Types
+// ============================================
+
+/// Request to execute multiple SolverTasks in a single HTTP call
+///
+/// Sent by Validator to Solver via `POST /api/v1/execute-task-batch`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteBatchRequest {
+    /// Batch of tasks to execute
+    pub tasks: Vec<ExecuteTaskRequest>,
+    /// Batch ID for correlation and logging
+    pub batch_id: String,
+}
+
+/// Response containing results for a batch of tasks
+///
+/// Each result corresponds to the task at the same index in the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteBatchResponse {
+    /// Per-task results, aligned by index with request.tasks
+    pub results: Vec<ExecuteTaskResponse>,
+    /// Overall batch success (true if ALL tasks succeeded)
+    pub all_success: bool,
+    /// Number of successfully executed tasks
+    pub success_count: usize,
+    /// Number of failed tasks
+    pub failure_count: usize,
+    /// Batch ID (echoed from request)
+    pub batch_id: String,
+    /// Total batch execution time in microseconds
+    pub total_execution_time_us: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
