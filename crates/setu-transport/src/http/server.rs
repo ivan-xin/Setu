@@ -7,7 +7,10 @@ use crate::http::types::{
 };
 use async_trait::async_trait;
 use axum::{
+    body::Bytes,
     extract::State,
+    http::{header, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -53,11 +56,28 @@ pub fn create_router<H: SolverHttpHandler>(handler: Arc<H>) -> Router {
         .with_state(handler)
 }
 
-/// Handle POST /api/v1/execute-task
+/// Handle POST /api/v1/execute-task (bincode)
 async fn handle_execute_task<H: SolverHttpHandler>(
     State(handler): State<Arc<H>>,
-    Json(request): Json<ExecuteTaskRequest>,
-) -> Json<ExecuteTaskResponse> {
+    body: Bytes,
+) -> impl IntoResponse {
+    let request: ExecuteTaskRequest = match bincode::deserialize(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            error!("Failed to deserialize bincode request: {}", e);
+            let err_resp = ExecuteTaskResponse::error(
+                format!("bincode deserialize error: {}", e),
+                0,
+            );
+            let bytes = bincode::serialize(&err_resp).unwrap_or_default();
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                bytes,
+            );
+        }
+    };
+
     let task_id_hex = hex::encode(&request.solver_task.task_id[..8]);
     
     info!(
@@ -83,7 +103,12 @@ async fn handle_execute_task<H: SolverHttpHandler>(
         );
     }
 
-    Json(response)
+    let bytes = bincode::serialize(&response).unwrap_or_default();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
 }
 
 /// Handle GET /health

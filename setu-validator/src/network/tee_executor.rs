@@ -242,17 +242,23 @@ impl TeeExecutor {
             request_id: uuid::Uuid::new_v4().to_string(),
         };
 
-        // 4. Execute HTTP call with timeout
+        // 4. Execute HTTP call with timeout (bincode)
+        let body = bincode::serialize(&request)
+            .map_err(|e| format!("bincode serialize error: {}", e))?;
+
         let result = self.http_client
             .post(&solver_url)
-            .json(&request)
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
             .timeout(Duration::from_secs(30))
             .send()
             .await;
 
         match result {
             Ok(response) if response.status().is_success() => {
-                match response.json::<ExecuteTaskResponse>().await {
+                let bytes = response.bytes().await
+                    .map_err(|e| format!("Failed to read response bytes: {}", e))?;
+                match bincode::deserialize::<ExecuteTaskResponse>(&bytes) {
                     Ok(exec_resp) if exec_resp.success => {
                         if let Some(result_dto) = exec_resp.result {
                             // 5. Build ExecutionResult
@@ -288,7 +294,7 @@ impl TeeExecutor {
                         }
                     }
                     Ok(exec_resp) => Err(exec_resp.message),
-                    Err(e) => Err(format!("JSON parse error: {}", e)),
+                    Err(e) => Err(format!("bincode parse error: {}", e)),
                 }
             }
             Ok(response) => {
@@ -522,17 +528,43 @@ impl TeeExecutor {
             request_id: uuid::Uuid::new_v4().to_string(),
         };
 
-        // 4. Execute HTTP call with timeout
+        // 4. Execute HTTP call with timeout (bincode)
+        let body = match bincode::serialize(&request) {
+            Ok(b) => b,
+            Err(e) => {
+                Self::update_tracker_failed(
+                    &transfer_status,
+                    &transfer_id,
+                    &format!("bincode serialize error: {}", e),
+                );
+                pending_count.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
         let result = http_client
             .post(&solver_url)
-            .json(&request)
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
             .timeout(Duration::from_secs(30))
             .send()
             .await;
 
         match result {
             Ok(response) if response.status().is_success() => {
-                match response.json::<ExecuteTaskResponse>().await {
+                let bytes = match response.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        Self::update_tracker_failed(
+                            &transfer_status,
+                            &transfer_id,
+                            &format!("Failed to read response bytes: {}", e),
+                        );
+                        pending_count.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                match bincode::deserialize::<ExecuteTaskResponse>(&bytes) {
                     Ok(exec_resp) if exec_resp.success => {
                         if let Some(result_dto) = exec_resp.result {
                             // 5a. Success: Build ExecutionResult and set on Event
@@ -619,7 +651,7 @@ impl TeeExecutor {
                         Self::update_tracker_failed(
                             &transfer_status,
                             &transfer_id,
-                            &format!("JSON parse error: {}", e),
+                            &format!("bincode parse error: {}", e),
                         );
                     }
                 }
@@ -760,17 +792,21 @@ pub async fn send_solver_task_sync(
         request_id: uuid::Uuid::new_v4().to_string(),
     };
 
-    // Send HTTP request and wait for response
+    // Send HTTP request and wait for response (bincode)
     info!(
         solver_id = %solver_id,
         url = %solver_url,
         task_id = %task_id_hex,
-        "Sending sync HTTP request to Solver"
+        "Sending sync HTTP request to Solver (bincode)"
     );
+
+    let body = bincode::serialize(&request)
+        .map_err(|e| format!("bincode serialize error: {}", e))?;
 
     let response = http_client
         .post(&solver_url)
-        .json(&request)
+        .header("Content-Type", "application/octet-stream")
+        .body(body)
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -787,11 +823,11 @@ pub async fn send_solver_task_sync(
         return Err(format!("Solver HTTP error: {} - {}", status, body));
     }
 
-    // Parse response
-    let exec_response: ExecuteTaskResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Solver response: {}", e))?;
+    // Parse response (bincode)
+    let resp_bytes = response.bytes().await
+        .map_err(|e| format!("Failed to read response bytes: {}", e))?;
+    let exec_response: ExecuteTaskResponse = bincode::deserialize(&resp_bytes)
+        .map_err(|e| format!("Failed to parse Solver response (bincode): {}", e))?;
 
     if !exec_response.success {
         error!(

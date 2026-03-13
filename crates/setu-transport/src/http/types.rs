@@ -51,7 +51,6 @@ pub struct ExecuteTaskResponse {
     /// Human-readable message describing outcome
     pub message: String,
     /// TEE execution result (present on success)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<TeeExecutionResultDto>,
     /// Total execution time in microseconds
     pub execution_time_us: u64,
@@ -117,10 +116,8 @@ pub struct StateChangeDto {
     /// State key
     pub key: String,
     /// Previous value (None if key didn't exist)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub old_value: Option<Vec<u8>>,
     /// New value (None if key is being deleted)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub new_value: Option<Vec<u8>>,
 }
 
