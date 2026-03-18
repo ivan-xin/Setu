@@ -482,7 +482,26 @@ impl ConsensusManager {
     pub fn should_fold(&self, vlc: &VLC) -> bool {
         self.anchor_builder.should_fold(vlc)
     }
-    
+
+    /// Dynamically update validator_count (affects quorum calculation).
+    ///
+    /// Called when validators are added/removed from the consensus set.
+    pub fn update_validator_count(&mut self, count: usize) {
+        let old_count = self.config.validator_count;
+        self.config.validator_count = count;
+        tracing::info!(
+            old_count = old_count,
+            new_count = count,
+            new_quorum = (count * 2) / 3 + 1,
+            "Validator count updated"
+        );
+    }
+
+    /// Get the current validator_count.
+    pub fn validator_count(&self) -> usize {
+        self.config.validator_count
+    }
+
     // =========================================================================
     // New methods for Merkle tree access
     // =========================================================================

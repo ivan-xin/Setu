@@ -389,6 +389,18 @@ impl ConsensusValidator {
     pub fn anchor_store(&self) -> Arc<dyn AnchorStoreBackend> {
         Arc::clone(&self.anchor_store)
     }
+
+    /// Add a remote validator to the consensus set.
+    ///
+    /// Updates both the local ValidatorSet copy and the engine's copy,
+    /// plus ConsensusManager.validator_count for quorum calculation.
+    pub async fn add_peer_validator(&self, node_info: setu_types::NodeInfo) {
+        let info = ValidatorInfo::new(node_info, false);
+        // 1. Update local ValidatorSet (ConsensusValidator's own copy)
+        self.validator_set.write().await.add_validator(info.clone());
+        // 2+3. Update engine's ValidatorSet + ConsensusManager.validator_count
+        self.engine.add_consensus_validator(info).await;
+    }
     
     /// Recover state from persistent storage after restart
     /// 
