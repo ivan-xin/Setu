@@ -166,6 +166,20 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         };
         self.service.add_validator(validator_info);
 
+        // Linkage: also update consensus layer (ValidatorSet + validator_count)
+        if let Some(cv) = self.service.consensus_validator() {
+            let peer_node_info = setu_types::NodeInfo::new_validator(
+                request.validator_id.clone(),
+                request.address.clone(),
+                request.port,
+            );
+            cv.add_peer_validator(peer_node_info).await;
+            info!(
+                "Consensus layer updated: validator {} added",
+                request.validator_id
+            );
+        }
+
         // Add event to DAG (async to support consensus submission)
         self.service.add_event_to_dag(event).await;
 
