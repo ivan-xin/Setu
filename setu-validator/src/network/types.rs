@@ -102,7 +102,7 @@ pub struct SubnetInfo {
     pub name: String,
     pub owner: String,
     pub subnet_type: String,
-    pub token_symbol: Option<String>,
+    pub token_symbol: String,
     pub status: String,
     pub registered_at: u64,
 }

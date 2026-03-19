@@ -727,7 +727,7 @@ impl ValidatorNetworkService {
                         name: reg.name.clone(),
                         owner: reg.owner.clone(),
                         subnet_type: format!("{:?}", reg.subnet_type),
-                        token_symbol: reg.token_symbol.clone(),
+                        token_symbol: reg.token_symbol.clone().unwrap_or_default(),
                         status: "active".to_string(),
                         registered_at: event.timestamp / 1000,
                     },

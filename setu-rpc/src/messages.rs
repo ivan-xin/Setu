@@ -392,6 +392,7 @@ pub struct RegisterSubnetRequest {
     /// Airdrop amount for new users joining this subnet
     pub user_airdrop_amount: Option<u64>,
     /// Solver IDs to assign to this subnet
+    #[serde(default)]
     pub assigned_solvers: Vec<String>,
 }
 
@@ -424,7 +425,7 @@ pub struct SubnetListItem {
     pub name: String,
     pub owner: String,
     pub subnet_type: String,
-    pub token_symbol: Option<String>,
+    pub token_symbol: String,
     pub status: String,
 }
 

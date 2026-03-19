@@ -355,15 +355,14 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         let event_id = event.id.clone();
 
         // Track subnet locally
-        let now = current_timestamp_secs();
         self.service.add_subnet(SubnetInfo {
             subnet_id: request.subnet_id.clone(),
             name: request.name.clone(),
             owner: request.owner.clone(),
             subnet_type: format!("{:?}", registration.subnet_type),
-            token_symbol: Some(request.token_symbol.clone()),
+            token_symbol: request.token_symbol.clone(),
             status: "active".to_string(),
-            registered_at: now,
+            registered_at: event.timestamp / 1000,
         });
 
         // Add event to DAG

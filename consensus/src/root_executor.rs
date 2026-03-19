@@ -14,6 +14,7 @@ use setu_merkle::blake3_hash;
 use setu_types::{
     Event, EventType, SubnetId, 
     ObjectStateValue, object_type, HashValue as TypesHash, ZERO_HASH,
+    event::EventPayload,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -236,13 +237,28 @@ impl RootSubnetExecutor {
     
     /// Execute subnet registration
     fn execute_subnet_register(&mut self, event: &Event) -> Result<RootExecutionResult, RootExecutorError> {
-        let key = self.generate_subnet_key(&event.id);
-        
+        // Extract SubnetRegistration from payload
+        let registration = match &event.payload {
+            EventPayload::SubnetRegister(reg) => reg,
+            _ => return Err(RootExecutorError::MissingPayload),
+        };
+
+        // Use subnet_id as key (not event.id)
+        let key = self.generate_subnet_key(&registration.subnet_id);
+
+        // Use registration.owner as state owner (not event.creator which is the validator)
+        let owner_bytes = self.address_to_bytes(&registration.owner);
+
+        // Hash the full registration data for data_hash
+        let registration_bytes = serde_json::to_vec(registration)
+            .unwrap_or_else(|_| registration.subnet_id.as_bytes().to_vec());
+        let data_hash = *blake3_hash(&registration_bytes).as_bytes();
+
         let state = ObjectStateValue::new(
-            self.address_to_bytes(&event.creator),
+            owner_bytes,
             1,
             object_type::SUBNET_CONFIG,
-            *blake3_hash(event.id.as_bytes()).as_bytes(),
+            data_hash,
             SubnetId::ROOT,
         );
         
