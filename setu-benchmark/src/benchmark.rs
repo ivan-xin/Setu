@@ -18,31 +18,39 @@ fn generate_transfer_batch(
     start_seq: u64,
     batch_size: u64,
     seed_addresses: &[String],
+    subnet_ids: &[String],
 ) -> Vec<BenchTransferRequest> {
     (0..batch_size)
         .map(|i| {
             let seq = start_seq + i;
-            generate_single_transfer(config, seq, seed_addresses)
+            generate_single_transfer(config, seq, seed_addresses, subnet_ids)
         })
         .collect()
 }
 
-/// Generate a single transfer request based on config
-fn generate_single_transfer(config: &BenchmarkConfig, seq: u64, seed_addresses: &[String]) -> BenchTransferRequest {
+/// Generate a single transfer request based on config.
+/// If subnet_ids is non-empty, assigns subnet_id round-robin by seq.
+fn generate_single_transfer(config: &BenchmarkConfig, seq: u64, seed_addresses: &[String], subnet_ids: &[String]) -> BenchTransferRequest {
+    let subnet_id = if !subnet_ids.is_empty() {
+        Some(subnet_ids[seq as usize % subnet_ids.len()].clone())
+    } else {
+        None
+    };
+
     if config.use_test_accounts {
-        // Use init_accounts if specified, otherwise fall back to seed accounts
         let num_accounts = if config.init_accounts > 0 {
             Some(config.init_accounts)
         } else {
             None
         };
-        generate_transfer_with_n_accounts(config.amount, seq, num_accounts, seed_addresses)
+        generate_transfer_with_n_accounts(config.amount, seq, num_accounts, seed_addresses, subnet_id)
     } else {
         generate_transfer(
             &config.sender_prefix,
             &config.receiver_prefix,
             config.amount,
             seq,
+            subnet_id,
         )
     }
 }
@@ -58,6 +66,7 @@ async fn execute_transfer_with_retry(
     config: &BenchmarkConfig,
     seq: u64,
     seed_addresses: &[String],
+    subnet_ids: &[String],
 ) -> Option<RequestMetrics> {
     let max_retries = 20u32;
     let base_delay_ms = 3u64;
@@ -69,7 +78,7 @@ async fn execute_transfer_with_retry(
         } else {
             seq.wrapping_add(attempt as u64 * 7)
         };
-        let request = generate_single_transfer(config, effective_seq, seed_addresses);
+        let request = generate_single_transfer(config, effective_seq, seed_addresses, subnet_ids);
         let result = client.submit_transfer(request).await;
 
         if result.success {
@@ -101,10 +110,21 @@ pub struct BenchmarkRunner {
     config: BenchmarkConfig,
     /// Seed account addresses loaded from genesis.json
     seed_addresses: Vec<String>,
+    /// One client per validator URL (for multi-validator distribution)
+    clients: Vec<Arc<BenchClient>>,
+    /// Subnet IDs to cycle through (empty = no subnet assignment)
+    subnet_ids: Vec<String>,
 }
 
 impl BenchmarkRunner {
-    pub fn new(config: BenchmarkConfig) -> Self {
+    pub fn new(mut config: BenchmarkConfig) -> Self {
+        // Auto-enable use_test_accounts when init_accounts > 0
+        // (otherwise init-accounts funds user accounts but benchmark uses random addresses)
+        if config.init_accounts > 0 && !config.use_test_accounts {
+            info!("Auto-enabling --use-test-accounts because --init-accounts > 0");
+            config.use_test_accounts = true;
+        }
+
         // Load seed addresses from genesis.json
         let seed_addresses = match load_seed_addresses_from_genesis(&config.genesis_file) {
             Ok(addrs) => {
@@ -120,28 +140,54 @@ impl BenchmarkRunner {
                 ]
             }
         };
-        Self { config, seed_addresses }
+
+        // Build clients for each validator URL
+        let urls = config.get_validator_urls();
+        let clients: Vec<Arc<BenchClient>> = urls.iter()
+            .map(|url| {
+                Arc::new(BenchClient::new(
+                    url.clone(),
+                    config.timeout,
+                    config.keep_alive,
+                ).expect(&format!("Failed to create client for {}", url)))
+            })
+            .collect();
+        info!("Created {} benchmark client(s)", clients.len());
+
+        let subnet_ids = config.get_subnet_ids();
+        if !subnet_ids.is_empty() {
+            info!("Subnet round-robin: {:?}", subnet_ids);
+        }
+
+        Self { config, seed_addresses, clients, subnet_ids }
+    }
+
+    /// Get the client for a given sequence number (round-robin across validators)
+    fn client_for_seq(&self, seq: u64) -> &Arc<BenchClient> {
+        &self.clients[seq as usize % self.clients.len()]
+    }
+
+    /// Get the primary client (first validator, used for init/warmup)
+    fn primary_client(&self) -> &Arc<BenchClient> {
+        &self.clients[0]
     }
 
     /// Run the benchmark
     pub async fn run(&self) -> Result<BenchmarkSummary> {
-        // Create client
-        let client = Arc::new(BenchClient::new(
-            self.config.validator_url.clone(),
-            self.config.timeout,
-            self.config.keep_alive,
-        )?);
+        let client = self.primary_client().clone();
 
-        // Health check
-        info!("Checking validator connectivity...");
-        match client.health_check().await {
-            Ok(true) => info!("✓ Validator is reachable"),
-            Ok(false) => {
-                warn!("⚠ Validator returned non-success status, continuing anyway...");
-            }
-            Err(e) => {
-                error!("✗ Failed to connect to validator: {}", e);
-                bail!("Cannot connect to validator at {}", self.config.validator_url);
+        // Health check all validators
+        for (i, c) in self.clients.iter().enumerate() {
+            info!("Checking validator {} connectivity...", i + 1);
+            match c.health_check().await {
+                Ok(true) => info!("✓ Validator {} is reachable", i + 1),
+                Ok(false) => {
+                    warn!("⚠ Validator {} returned non-success status, continuing anyway...", i + 1);
+                }
+                Err(e) => {
+                    error!("✗ Failed to connect to validator {}: {}", i + 1, e);
+                    bail!("Cannot connect to validator {}", i + 1);
+                }
             }
         }
 
@@ -165,24 +211,27 @@ impl BenchmarkRunner {
         // Run actual benchmark
         info!("");
         info!("Starting benchmark...");
+        if self.clients.len() > 1 {
+            info!("Mode: MULTI-VALIDATOR ({} validators)", self.clients.len());
+        }
         if self.config.use_batch {
             info!("Mode: BATCH (batch_size={})", self.config.batch_size);
         }
         info!("═══════════════════════════════════════════════════════════");
 
         let result = if self.config.use_batch {
-            // Batch mode
+            // Batch mode (uses primary client only for batch API)
             match self.config.mode {
                 BenchmarkMode::Burst => self.run_burst_batch_mode(&client).await,
                 BenchmarkMode::Sustained => self.run_sustained_batch_mode(&client).await,
                 BenchmarkMode::Ramp => self.run_ramp_batch_mode(&client).await,
             }
         } else {
-            // Single request mode
+            // Single request mode (distributes across all clients)
             match self.config.mode {
-                BenchmarkMode::Burst => self.run_burst_mode(&client).await,
-                BenchmarkMode::Sustained => self.run_sustained_mode(&client).await,
-                BenchmarkMode::Ramp => self.run_ramp_mode(&client).await,
+                BenchmarkMode::Burst => self.run_burst_mode().await,
+                BenchmarkMode::Sustained => self.run_sustained_mode().await,
+                BenchmarkMode::Ramp => self.run_ramp_mode().await,
             }
         }?;
 
@@ -207,9 +256,10 @@ impl BenchmarkRunner {
                 let sem = semaphore.clone();
                 let config = self.config.clone();
                 let seed_addrs = self.seed_addresses.clone();
+                let subnet_ids = self.subnet_ids.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let _ = execute_transfer_with_retry(&client, &config, warmup_seq_offset + i, &seed_addrs).await;
+                    let _ = execute_transfer_with_retry(&client, &config, warmup_seq_offset + i, &seed_addrs, &subnet_ids).await;
                 }
             })
             .collect();
@@ -470,7 +520,10 @@ impl BenchmarkRunner {
     /// Includes retry logic for coin reservation conflicts:
     /// Each coin can only be reserved by one transfer at a time.
     /// When all of a sender's coins are reserved, we retry with backoff.
-    async fn run_burst_mode(&self, client: &Arc<BenchClient>) -> Result<BenchmarkSummary> {
+    ///
+    /// In multi-validator mode, transactions are distributed round-robin
+    /// across all configured validators.
+    async fn run_burst_mode(&self) -> Result<BenchmarkSummary> {
         let total = self.config.total;
         let concurrency = self.config.concurrency as usize;
         let metrics = MetricsCollector::new();
@@ -510,15 +563,17 @@ impl BenchmarkRunner {
 
         let tasks: Vec<_> = (0..total)
             .map(|i| {
-                let client = client.clone();
+                // Round-robin client selection for multi-validator distribution
+                let client = self.client_for_seq(i).clone();
                 let sem = semaphore.clone();
                 let metrics = metrics.clone();
                 let config = self.config.clone();
                 let seed_addrs = self.seed_addresses.clone();
+                let subnet_ids = self.subnet_ids.clone();
                 let counter = counter.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    if let Some(result) = execute_transfer_with_retry(&client, &config, i, &seed_addrs).await {
+                    if let Some(result) = execute_transfer_with_retry(&client, &config, i, &seed_addrs, &subnet_ids).await {
                         metrics.record(result).await;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -538,7 +593,7 @@ impl BenchmarkRunner {
     }
 
     /// Sustained mode: maintain target TPS for duration
-    async fn run_sustained_mode(&self, client: &Arc<BenchClient>) -> Result<BenchmarkSummary> {
+    async fn run_sustained_mode(&self) -> Result<BenchmarkSummary> {
         let target_tps = self.config.target_tps;
         let duration = Duration::from_secs(self.config.duration);
         let concurrency = self.config.concurrency as usize;
@@ -597,16 +652,17 @@ impl BenchmarkRunner {
             let current_seq = seq;
             seq += 1;
 
-            let client = client.clone();
+            let client = self.client_for_seq(current_seq).clone();
             let sem = semaphore.clone();
             let metrics_clone = metrics.clone();
             let config = self.config.clone();
             let seed_addrs = self.seed_addresses.clone();
+            let subnet_ids = self.subnet_ids.clone();
             let counter_clone = counter.clone();
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                if let Some(result) = execute_transfer_with_retry(&client, &config, current_seq, &seed_addrs).await {
+                if let Some(result) = execute_transfer_with_retry(&client, &config, current_seq, &seed_addrs, &subnet_ids).await {
                     metrics_clone.record(result).await;
                 }
                 counter_clone.fetch_add(1, Ordering::Relaxed);
@@ -623,7 +679,7 @@ impl BenchmarkRunner {
     }
 
     /// Ramp mode: gradually increase load
-    async fn run_ramp_mode(&self, client: &Arc<BenchClient>) -> Result<BenchmarkSummary> {
+    async fn run_ramp_mode(&self) -> Result<BenchmarkSummary> {
         let mut current_tps = self.config.ramp_start;
         let step = self.config.ramp_step;
         let step_duration = Duration::from_secs(self.config.ramp_step_duration);
@@ -651,17 +707,18 @@ impl BenchmarkRunner {
             while step_start.elapsed() < step_duration && start.elapsed() < total_duration {
                 request_interval.tick().await;
 
-                let client = client.clone();
+                let client = self.client_for_seq(seq).clone();
                 let sem = semaphore.clone();
                 let metrics_clone = metrics.clone();
                 let config = self.config.clone();
                 let seed_addrs = self.seed_addresses.clone();
+                let subnet_ids = self.subnet_ids.clone();
                 let counter_clone = counter.clone();
                 let s = seq;
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    if let Some(result) = execute_transfer_with_retry(&client, &config, s, &seed_addrs).await {
+                    if let Some(result) = execute_transfer_with_retry(&client, &config, s, &seed_addrs, &subnet_ids).await {
                         metrics_clone.record(result).await;
                     }
                     counter_clone.fetch_add(1, Ordering::Relaxed);
@@ -747,6 +804,7 @@ impl BenchmarkRunner {
                 let metrics = metrics.clone();
                 let config = self.config.clone();
                 let seed_addrs = self.seed_addresses.clone();
+                let subnet_ids = self.subnet_ids.clone();
                 let counter = counter.clone();
                 let start_seq = batch_idx * batch_size;
                 // Handle last batch which may be smaller
@@ -754,7 +812,7 @@ impl BenchmarkRunner {
 
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let requests = generate_transfer_batch(&config, start_seq, actual_batch_size, &seed_addrs);
+                    let requests = generate_transfer_batch(&config, start_seq, actual_batch_size, &seed_addrs, &subnet_ids);
                     let results = client.submit_transfers_batch(requests).await;
                     for result in results {
                         metrics.record(result).await;
@@ -849,12 +907,13 @@ impl BenchmarkRunner {
             let metrics_clone = metrics.clone();
             let config = self.config.clone();
             let seed_addrs = self.seed_addresses.clone();
+            let subnet_ids = self.subnet_ids.clone();
             let counter_clone = counter.clone();
             let bs = batch_size;
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                let requests = generate_transfer_batch(&config, current_seq, bs, &seed_addrs);
+                let requests = generate_transfer_batch(&config, current_seq, bs, &seed_addrs, &subnet_ids);
                 let results = client.submit_transfers_batch(requests).await;
                 for result in results {
                     metrics_clone.record(result).await;
@@ -918,13 +977,14 @@ impl BenchmarkRunner {
                 let metrics_clone = metrics.clone();
                 let config = self.config.clone();
                 let seed_addrs = self.seed_addresses.clone();
+                let subnet_ids = self.subnet_ids.clone();
                 let counter_clone = counter.clone();
                 let current_seq = seq;
                 let bs = batch_size;
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let requests = generate_transfer_batch(&config, current_seq, bs, &seed_addrs);
+                    let requests = generate_transfer_batch(&config, current_seq, bs, &seed_addrs, &subnet_ids);
                     let results = client.submit_transfers_batch(requests).await;
                     for result in results {
                         metrics_clone.record(result).await;

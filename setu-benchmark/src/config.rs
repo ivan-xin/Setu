@@ -20,9 +20,21 @@ pub enum BenchmarkMode {
 #[command(name = "setu-benchmark")]
 #[command(about = "TPS Benchmark tool for Setu network", long_about = None)]
 pub struct BenchmarkConfig {
-    /// Validator HTTP API URL
+    /// Validator HTTP API URL (single validator mode)
     #[arg(short = 'u', long, default_value = "http://127.0.0.1:8080")]
     pub validator_url: String,
+
+    /// Comma-separated list of validator URLs for multi-validator load distribution.
+    /// When set, transactions are distributed round-robin across these validators.
+    /// Overrides --validator-url.
+    #[arg(long, default_value = "")]
+    pub validator_urls: String,
+
+    /// Comma-separated list of subnet IDs to assign to transactions.
+    /// Transactions cycle through these subnets in round-robin fashion.
+    /// Example: "subnet-app-1,subnet-app-2,subnet-app-3"
+    #[arg(long, default_value = "")]
+    pub subnets: String,
 
     /// Benchmark mode
     #[arg(short = 'm', long, value_enum, default_value = "burst")]
@@ -139,9 +151,46 @@ pub struct BenchmarkConfig {
 }
 
 impl BenchmarkConfig {
+    /// Parse validator URLs: if --validator-urls is set, split by comma;
+    /// otherwise use the single --validator-url.
+    pub fn get_validator_urls(&self) -> Vec<String> {
+        if !self.validator_urls.is_empty() {
+            self.validator_urls.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![self.validator_url.clone()]
+        }
+    }
+
+    /// Parse subnet IDs from --subnets option.
+    pub fn get_subnet_ids(&self) -> Vec<String> {
+        if !self.subnets.is_empty() {
+            self.subnets.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
     pub fn print_config(&self) {
         info!("Configuration:");
-        info!("  Validator URL:    {}", self.validator_url);
+        let urls = self.get_validator_urls();
+        if urls.len() > 1 {
+            info!("  Validator URLs:   {} validators", urls.len());
+            for (i, url) in urls.iter().enumerate() {
+                info!("    [{}] {}", i + 1, url);
+            }
+        } else {
+            info!("  Validator URL:    {}", self.validator_url);
+        }
+        let subnet_ids = self.get_subnet_ids();
+        if !subnet_ids.is_empty() {
+            info!("  Subnets:          {:?}", subnet_ids);
+        }
         info!("  Mode:             {:?}", self.mode);
         info!("  Concurrency:      {}", self.concurrency);
         

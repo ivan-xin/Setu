@@ -297,6 +297,7 @@ pub fn generate_transfer(
     receiver_prefix: &str,
     amount: u64,
     seq: u64,
+    subnet_id: Option<String>,
 ) -> BenchTransferRequest {
     BenchTransferRequest {
         from: name_to_hex_address(&format!("{}_{}", sender_prefix, seq % 1000)),
@@ -305,7 +306,7 @@ pub fn generate_transfer(
         transfer_type: "flux".to_string(),
         preferred_solver: None,
         shard_id: None,
-        subnet_id: None,
+        subnet_id,
         // Use unique resource key per request to ensure even distribution
         // across solvers via consistent hash routing
         resources: vec![format!("bench_resource_{}", seq)],
@@ -343,7 +344,7 @@ pub fn generate_transfer(
 /// to the same solver, causing severe load imbalance in multi-solver tests.
 #[allow(dead_code)]
 pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64, seed_addresses: &[String]) -> BenchTransferRequest {
-    generate_transfer_with_n_accounts(amount, seq, None, seed_addresses)
+    generate_transfer_with_n_accounts(amount, seq, None, seed_addresses, None)
 }
 
 /// Generate a transfer using a specified number of test accounts
@@ -352,7 +353,7 @@ pub fn generate_transfer_with_test_accounts(amount: u64, seq: u64, seed_addresse
 /// - Otherwise, uses user_001 to user_N (must be initialized via --init-accounts first)
 ///
 /// `seed_addresses` are the authoritative hex addresses loaded from genesis.json.
-pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Option<u64>, seed_addresses: &[String]) -> BenchTransferRequest {
+pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Option<u64>, seed_addresses: &[String], subnet_id: Option<String>) -> BenchTransferRequest {
     // Build account list based on configuration
     // All names are converted to canonical hex addresses for production Validator compatibility.
     let accounts: Vec<String> = match num_accounts {
@@ -386,7 +387,7 @@ pub fn generate_transfer_with_n_accounts(amount: u64, seq: u64, num_accounts: Op
         transfer_type: "flux".to_string(),
         preferred_solver: None,
         shard_id: None,
-        subnet_id: None,
+        subnet_id,
         // Use unique resource key per request to ensure even distribution
         // across solvers via consistent hash routing
         resources: vec![format!("bench_resource_{}", seq)],
