@@ -110,6 +110,14 @@ pub struct ConsensusManager {
     pending_cfs: HashMap<String, ConsensusFrame>,
     /// Pending anchor builds awaiting finalization (cf_id -> PendingAnchorBuild)
     pending_builds: HashMap<String, PendingAnchorBuild>,
+    /// Events collected for each pending CF (cf_id -> events).
+    /// Stored on CF arrival so they can be applied at finalization time,
+    /// avoiding out-of-order pre-apply issues on Followers.
+    pending_cf_events: HashMap<String, Vec<setu_types::Event>>,
+    /// Votes received before their CF proposal arrived.
+    /// In P2P networks, votes can arrive before proposals due to network ordering.
+    /// These are replayed when the CF is received via `receive_cf`.
+    buffered_votes: HashMap<String, Vec<Vote>>,
     /// Finalized ConsensusFrames
     finalized_cfs: Vec<ConsensusFrame>,
     /// Set of anchor IDs that have been persisted to storage
@@ -130,6 +138,8 @@ impl ConsensusManager {
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             pending_builds: HashMap::new(),
+            pending_cf_events: HashMap::new(),
+            buffered_votes: HashMap::new(),
             finalized_cfs: Vec::new(),
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
@@ -149,6 +159,8 @@ impl ConsensusManager {
             legacy_folder: DagFolder::new(config),
             pending_cfs: HashMap::new(),
             pending_builds: HashMap::new(),
+            pending_cf_events: HashMap::new(),
+            buffered_votes: HashMap::new(),
             finalized_cfs: Vec::new(),
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
@@ -213,8 +225,20 @@ impl ConsensusManager {
     }
 
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
-        if !self.pending_cfs.contains_key(&cf.id) {
-            self.pending_cfs.insert(cf.id.clone(), cf);
+        let cf_id = cf.id.clone();
+        if !self.pending_cfs.contains_key(&cf_id) {
+            self.pending_cfs.insert(cf_id.clone(), cf);
+            
+            // Replay any votes that arrived before this CF proposal.
+            if let Some(buffered) = self.buffered_votes.remove(&cf_id) {
+                if let Some(cf) = self.pending_cfs.get_mut(&cf_id) {
+                    for vote in buffered {
+                        if !cf.votes.contains_key(&vote.validator_id) {
+                            cf.add_vote(vote);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -273,6 +297,9 @@ impl ConsensusManager {
             }
             cf.add_vote(vote);
         } else {
+            // CF not yet received — buffer the vote for later replay.
+            // In P2P networks, votes can arrive before their CF proposal.
+            self.buffered_votes.entry(cf_id.clone()).or_default().push(vote);
             return false;
         }
         self.check_finalization(&cf_id)
@@ -315,6 +342,8 @@ impl ConsensusManager {
                     // Check if this is our CF (we have a pending_build for it)
                     if let Some(pending_build) = self.pending_builds.remove(cf_id) {
                         // Leader path: commit the pending build
+                        // Clean up stored events (Leader uses pending_build's events)
+                        self.pending_cf_events.remove(cf_id);
                         tracing::info!(cf_id = %cf_id, "Leader path: committing pending build");
                         match self.anchor_builder.commit_build(pending_build.clone()) {
                             Ok(state_summary) => {
@@ -348,22 +377,28 @@ impl ConsensusManager {
                             }
                         }
                     } else {
-                        // Follower path: state was already applied in apply_cf_state_changes
-                        tracing::info!(cf_id = %cf_id, "Follower path: committing pre-applied state");
-                        {
-                            let anchor_id = self.anchor_builder.anchor_depth() + 1;
-                            let mut guard = self.anchor_builder.shared.lock_write();
-                            match guard.commit(anchor_id) {
-                                Ok(()) => {
-                                    self.anchor_builder.shared.publish_snapshot(&guard);
-                                }
-                                Err(e) => {
-                                    tracing::error!(cf_id = %cf_id, error = %e,
-                                        "Follower commit failed — state NOT published");
-                                }
+                        // Follower path: apply state at finalization time (deferred apply).
+                        // Events were stored in pending_cf_events when the CF arrived.
+                        // Applying here (not on arrival) guarantees correct ordering:
+                        // CFs finalize in Leader commit order, so the write GSM base
+                        // state always matches what the Leader computed against.
+                        let events = self.pending_cf_events.remove(cf_id).unwrap_or_default();
+                        tracing::info!(cf_id = %cf_id, event_count = events.len(), "Follower path: applying deferred state");
+                        match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                            Ok(state_summary) => {
+                                tracing::info!(
+                                    cf_id = %cf_id,
+                                    total_events = state_summary.total_events,
+                                    total_changes = state_summary.total_changes,
+                                    "Follower path: state applied and committed"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(cf_id = %cf_id, error = %e,
+                                    "Follower deferred apply failed, syncing metadata only");
+                                self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
                             }
                         }
-                        self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
                     }
                     
                     self.finalized_cfs.push(cf);
@@ -377,8 +412,9 @@ impl ConsensusManager {
             Some(CFDecision::Reject) | Some(CFDecision::Timeout) => {
                 // Remove rejected/timeout CF from pending
                 if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
-                    // Simply discard the pending_build if it exists (no rollback needed!)
+                    // Simply discard the pending_build and stored events (no rollback needed!)
                     self.pending_builds.remove(cf_id);
+                    self.pending_cf_events.remove(cf_id);
                     cf.reject();
                     return true;
                 }
@@ -456,6 +492,8 @@ impl ConsensusManager {
             if let Some(mut cf) = self.pending_cfs.remove(&id) {
                 // Simply discard the pending_build (no rollback needed in deferred commit mode!)
                 self.pending_builds.remove(&id);
+                self.pending_cf_events.remove(&id);
+                self.buffered_votes.remove(&id);
                 cf.reject();
             }
         }
@@ -561,40 +599,22 @@ impl ConsensusManager {
     // Follower State Synchronization
     // =========================================================================
     
-    /// Apply state changes from a received ConsensusFrame (follower path)
-    /// 
-    /// When a follower receives a CF from the leader, it needs to apply
-    /// the same state changes to maintain consistency. This method:
-    /// 1. Gets the events referenced in the CF's anchor
-    /// 2. Verifies the resulting state root matches the anchor's merkle_roots
-    /// 3. Only if verified, applies changes to the real write GSM
-    /// 
-    /// Returns true if state was applied and verified successfully.
+    /// Collect and store events from a received ConsensusFrame for later
+    /// application at finalization time (Follower path).
     ///
-    /// ## F1 fix: verify-before-mutate pattern
+    /// Previously this method pre-applied events to the write GSM immediately
+    /// on CF arrival. This caused cascading failures when CFs arrived out of
+    /// order at Followers: the base state differed from the Leader's, root
+    /// verification failed, and the CF was rejected entirely.
     ///
-    /// Previously, events were applied directly to the write GSM and then the
-    /// root was verified. If verification failed (Byzantine leader, missing events,
-    /// or bug-induced state divergence), the write GSM was left in a dirty state
-    /// with no rollback, causing cascading errors for all subsequent anchors.
+    /// New approach (deferred apply):
+    /// 1. Collect events from the DAG
+    /// 2. Store them in `pending_cf_events` for use at finalization
+    /// 3. Do NOT mutate the write GSM
+    /// 4. State is applied at finalization time via `apply_follower_finalized_cf`,
+    ///    which guarantees correct ordering (CFs finalize in Leader order).
     ///
-    /// New approach: clone write GSM → apply to clone → verify root → if OK,
-    /// apply to real write GSM. On failure, the real write GSM is untouched.
-    ///
-    /// ## Why clone from write GSM (not read snapshot)?
-    ///
-    /// Multiple CFs can arrive before the first is finalized. Each CF's
-    /// `apply_cf_state_changes` pre-applies events to the write GSM, but
-    /// `publish_snapshot` only happens at finalization. So the write GSM may
-    /// contain pre-applied changes from prior CFs that the read snapshot lacks.
-    /// Verifying against the read snapshot would miss those changes.
-    ///
-    /// ## Cost
-    ///
-    /// One extra `apply_committed_events` call per anchor (clone vs real).
-    /// Acceptable because: im::HashMap clone is O(1) (structural sharing),
-    /// the apply is deterministic, and this runs once per anchor (~every 10 VLC
-    /// ticks) not per-transaction.
+    /// Always returns true so the CF is received and voted on regardless.
     pub fn apply_cf_state_changes(&mut self, dag: &Dag, cf: &setu_types::ConsensusFrame) -> bool {
         // Get events from the anchor's event_ids
         let events: Vec<setu_types::Event> = cf.anchor.event_ids
@@ -602,59 +622,10 @@ impl ConsensusManager {
             .filter_map(|id| dag.get_event(id).cloned())
             .collect();
         
-        if events.is_empty() {
-            // No events to apply, but anchor might be empty - check merkle roots
-            return cf.anchor.merkle_roots.is_none() || 
-                   cf.anchor.merkle_roots.as_ref()
-                       .map(|r| r.global_state_root == self.get_global_root())
-                       .unwrap_or(true);
-        }
-        
-        let merkle_roots_clone = cf.anchor.merkle_roots.clone();
-        
-        // Hold write Mutex for the entire operation to prevent interleaving
-        // with other writers (e.g., infra_executor). Readers are unaffected
-        // because the ArcSwap read path is lock-free.
-        let mut guard = self.anchor_builder.shared.lock_write();
-        
-        // Phase 1: Verify on a temporary clone of the write GSM.
-        // clone() copies subnet_states (im::HashMap O(1)) and clears indexes,
-        // which is fine — verification only needs SMT state, not indexes.
-        let verified = {
-            let mut temp = (*guard).clone();
-            temp.apply_committed_events(&events);
-            
-            if let Some(ref merkle_roots) = merkle_roots_clone {
-                let (local_root, _) = temp.compute_global_root_bytes();
-                if local_root != merkle_roots.global_state_root {
-                    tracing::error!(
-                        local_root = %hex::encode(local_root),
-                        anchor_root = %hex::encode(merkle_roots.global_state_root),
-                        event_count = events.len(),
-                        "State root mismatch — write GSM NOT mutated (F1 safety)"
-                    );
-                    false
-                } else {
-                    true
-                }
-            } else {
-                true
-            }
-        }; // temp dropped
-        
-        if !verified {
-            // guard dropped here — real write GSM completely untouched
-            return false;
-        }
-        
-        // Phase 2: Verified — apply to real write GSM.
-        // Deterministic: same events + same base state → identical result.
-        // R9 guarantee preserved: no window between verify and mutate because
-        // we hold the Mutex continuously from Phase 1 through Phase 2.
-        let _ = guard.apply_committed_events(&events);
+        // Store events for deferred application at finalization time
+        self.pending_cf_events.insert(cf.id.clone(), events);
         
         true
-        // guard dropped, Mutex released
     }
     
     /// Verify a ConsensusFrame's merkle roots without applying state

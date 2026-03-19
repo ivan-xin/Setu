@@ -804,14 +804,10 @@ impl ConsensusEngine {
             ));
         }
         
-        // Step 5-6: Apply state changes from the CF's events to maintain consistent state
-        // This also verifies the resulting state matches the anchor's state root
-        let state_verified = manager.apply_cf_state_changes(&dag, &cf);
-        if !state_verified {
-            return Err(setu_types::SetuError::InvalidData(
-                "State root mismatch after applying CF state changes".to_string()
-            ));
-        }
+        // Step 5-6: Collect events from CF for deferred state application at finalization.
+        // State is NOT applied here — it will be applied when the CF is finalized,
+        // guaranteeing correct ordering even if CFs arrive out of network order.
+        manager.apply_cf_state_changes(&dag, &cf);
         
         let cf_id = cf.id.clone();
         

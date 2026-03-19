@@ -387,16 +387,17 @@ impl AnchorBuilder {
         // Route events by subnet
         let routed = EventRouter::route_events(&events);
         
-        // Collect state changes without applying
+        // Collect state changes (for metadata in PendingAnchorBuild)
         let pending_state_changes = self.collect_state_changes(&events);
         
         // Compute events root (Binary Merkle Tree)
         let events_root_hash = compute_events_root(&events);
         let events_root = *events_root_hash.as_bytes();
         
-        // Compute pending state root using temporary clone
+        // Compute state root using same deterministic logic as Follower:
+        // VLC-sorted, conflict-detected, cloned from write GSM
         let (global_state_root, subnet_roots) = 
-            self.compute_pending_state_root(&pending_state_changes);
+            self.compute_state_root_from_events(&events);
         
         // Compute new anchor chain root (what it will be after commit)
         let anchor_chain_root = self.last_anchor_chain_root;
@@ -497,26 +498,32 @@ impl AnchorBuilder {
             });
         }
         
-        // 2. Verify state root (compute expected vs actual)
-        if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
-            let pending_changes = self.collect_state_changes(events);
-            let (expected_root, _) = self.compute_pending_state_root(&pending_changes);
-            
-            if expected_root != merkle_roots.global_state_root {
-                return Err(AnchorBuildError::RootMismatch {
-                    expected: expected_root,
-                    actual: merkle_roots.global_state_root,
-                });
-            }
-        }
-        
-        // 3. Apply state changes and commit in a single write lock
+        // Hold write lock for the ENTIRE verify+commit to prevent race conditions.
+        // Without this, concurrent CF proposals can clone the same base state,
+        // and the second one's verification becomes stale after the first commits.
         let anchor_id = self.anchor_depth + 1;
         let state_summary = {
             let mut guard = self.shared.lock_write();
+            
+            // 2. Verify state root (compute expected vs actual)
+            if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
+                // Clone from write GSM under the lock
+                let mut temp_manager = (*guard).clone();
+                temp_manager.apply_committed_events(events);
+                let (expected_root, _) = temp_manager.compute_global_root_bytes();
+                
+                if expected_root != merkle_roots.global_state_root {
+                    // Write GSM NOT mutated — F1 safety preserved
+                    return Err(AnchorBuildError::RootMismatch {
+                        expected: expected_root,
+                        actual: merkle_roots.global_state_root,
+                    });
+                }
+            }
+            
+            // 3. Apply state changes and commit (same lock scope)
             let summary = guard.apply_committed_events(events);
             guard.commit(anchor_id)?;
-            // Publish snapshot while still holding Mutex
             self.shared.publish_snapshot(&guard);
             summary
         };
@@ -546,25 +553,31 @@ impl AnchorBuilder {
         changes
     }
     
-    /// Compute state root after applying pending changes (using temporary clone)
-    fn compute_pending_state_root(
+    /// Compute state root by applying events using the same deterministic logic
+    /// as Follower verification (`apply_committed_events`).
+    ///
+    /// This ensures Leader and Follower always compute identical state roots:
+    /// - Same base state source (write GSM)
+    /// - Same event ordering (VLC sort inside `apply_committed_events`)
+    /// - Same conflict detection (old_value mismatch → skip event)
+    /// - Same genesis duplicate handling
+    ///
+    /// The write lock is held only for the duration of the clone, not during
+    /// the actual computation.
+    fn compute_state_root_from_events(
         &self,
-        pending_changes: &HashMap<SubnetId, Vec<StateChangeEntry>>,
+        events: &[Event],
     ) -> ([u8; 32], HashMap<SubnetId, [u8; 32]>) {
-        // Clone from read snapshot (lock-free, no Mutex needed)
+        // Clone from write GSM (same base state as Follower verification)
         let mut temp_manager = {
-            let snapshot = self.shared.load_snapshot_arc();
-            (*snapshot).clone()  // Use existing clone() (clears indexes), temp calc only needs subnet_states
+            let guard = self.shared.lock_write();
+            (*guard).clone()
         };
+        // Mutex released — computation is on a detached clone
         
-        // Apply pending changes to the clone
-        for (subnet_id, entries) in pending_changes {
-            for entry in entries {
-                for change in &entry.changes {
-                    temp_manager.apply_state_change(*subnet_id, change);
-                }
-            }
-        }
+        // Apply using identical logic to Follower:
+        // VLC-sorted, conflict-detected, genesis-aware
+        temp_manager.apply_committed_events(events);
         
         // Compute and return the root
         temp_manager.compute_global_root_bytes()
