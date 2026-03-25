@@ -574,10 +574,12 @@ impl UserRegistration {
             // TODO: Verify address derivation from nostr_pubkey
             !nostr_pubkey.is_empty() && nostr_pubkey.len() == 32
         } else {
-            // MetaMask registration: verify ECDSA signature
+            // MetaMask / Setu native: verify address format
+            // 66 chars = 0x + 64 hex (Setu native 32-byte / Nostr)
+            // 42 chars = 0x + 40 hex (Ethereum 20-byte)
             // TODO: Implement actual ECDSA signature verification
-            // For now, just check address format
-            self.address.starts_with("0x") && self.address.len() == 42
+            self.address.starts_with("0x")
+                && (self.address.len() == 66 || self.address.len() == 42)
         }
     }
 }
