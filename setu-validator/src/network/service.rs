@@ -23,7 +23,7 @@ use super::types::*;
 use super::transfer_handler::TransferHandler;
 use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
-use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator};
+use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator, InfraExecutor};
 use crate::coin_reservation::CoinReservationManager;
 use axum::{
     routing::{get, post},
@@ -290,6 +290,19 @@ impl ValidatorNetworkService {
         &self.router_manager
     }
 
+    /// Get the state provider (delegates to TaskPreparer)
+    pub fn state_provider(&self) -> &Arc<dyn setu_storage::StateProvider> {
+        self.task_preparer.state_provider()
+    }
+
+    /// Create an InfraExecutor using the shared MerkleStateProvider
+    pub fn infra_executor(&self) -> InfraExecutor {
+        InfraExecutor::new(
+            self.validator_id.clone(),
+            Arc::clone(self.batch_task_preparer.merkle_state_provider()),
+        )
+    }
+
     pub fn consensus_validator(&self) -> Option<&Arc<ConsensusValidator>> {
         self.consensus_validator.as_ref()
     }
@@ -431,6 +444,13 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/credit", post(setu_api::http_get_credit::<ValidatorNetworkService>))
             .route("/api/v1/user/credentials", post(setu_api::http_get_credentials::<ValidatorNetworkService>))
             .route("/api/v1/user/transfer", post(setu_api::http_user_transfer::<ValidatorNetworkService>))
+            // Phase 3: Profile & Subnet Membership
+            .route("/api/v1/user/profile", post(setu_api::http_update_profile::<ValidatorNetworkService>))
+            .route("/api/v1/user/profile/:address", get(setu_api::http_get_profile::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnet/join", post(setu_api::http_join_subnet::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnet/leave", post(setu_api::http_leave_subnet::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnet/check/:address/:subnet_id", get(setu_api::http_check_membership::<ValidatorNetworkService>))
+            .route("/api/v1/user/subnets/:address", get(setu_api::http_get_user_subnets::<ValidatorNetworkService>))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;

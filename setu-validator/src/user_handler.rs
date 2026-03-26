@@ -13,6 +13,12 @@ use setu_rpc::{
     GetPowerRequest, GetPowerResponse, GetCreditRequest, GetCreditResponse,
     GetCredentialsRequest, GetCredentialsResponse, TransferRequest, TransferResponse,
     CoinBalance, SubmitTransferRequest,
+    // Phase 3
+    UpdateProfileRequest, UpdateProfileResponse,
+    GetProfileResponse, ProfileInfo,
+    JoinSubnetRequest, JoinSubnetResponse,
+    LeaveSubnetRequest, LeaveSubnetResponse,
+    CheckMembershipResponse, GetUserSubnetsResponse,
 };
 use setu_types::registration::UserRegistration;
 use setu_types::{ObjectId, hash_utils::setu_hash_with_domain};
@@ -44,6 +50,68 @@ impl ValidatorUserHandler {
             initial_power: 0,
             initial_credit: 0,
         }
+    }
+
+    /// Verify signature for a write operation (3-branch: MetaMask / Setu native / Nostr).
+    /// Returns Ok(()) if valid, or error message string if invalid.
+    fn verify_signature(
+        address: &str,
+        signature: &[u8],
+        message: &str,
+        nostr_pubkey: Option<&[u8]>,
+        public_key: Option<&str>,
+    ) -> Result<(), String> {
+        if std::env::var("SETU_SKIP_SIG_VERIFY").unwrap_or_default() == "1" {
+            return Ok(());
+        }
+        let result = if let Some(npk) = nostr_pubkey {
+            setu_keys::verify::verify_nostr_schnorr(address, npk, signature, message.as_bytes())
+        } else if let Some(pk_b64) = public_key {
+            let pk_raw = setu_keys::PublicKey::decode_base64(pk_b64)
+                .and_then(|pk| {
+                    let mut v = vec![pk.scheme().flag()];
+                    v.extend(pk.as_bytes());
+                    Ok(v)
+                });
+            match pk_raw {
+                Ok(pk_bytes) => setu_keys::verify::verify_setu_native_raw(
+                    address, &pk_bytes, signature, message.as_bytes(),
+                ),
+                Err(e) => Err(e),
+            }
+        } else {
+            setu_keys::verify::verify_metamask_personal_sign(address, signature, message)
+        };
+        result.map_err(|e| format!("Signature verification failed: {}", e))
+    }
+
+    /// Build VLC snapshot for a new event
+    fn build_vlc_snapshot(&self) -> VLCSnapshot {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let vlc_time = self.network_service.get_vlc_time();
+        let mut vlc = setu_vlc::VectorClock::new();
+        vlc.increment(self.network_service.validator_id());
+        VLCSnapshot {
+            vector_clock: vlc,
+            logical_time: vlc_time,
+            physical_time: now,
+        }
+    }
+
+    /// Validate timestamp is within 5-minute anti-replay window
+    fn check_timestamp(timestamp: u64) -> Result<(), String> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req_secs = timestamp / 1000;
+        if now_secs.abs_diff(req_secs) > 300 {
+            return Err("Timestamp too old or too far in the future (5 min window)".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -369,6 +437,249 @@ impl UserRpcHandler for ValidatorUserHandler {
             message: response.message,
             event_id: response.transfer_id,
             estimated_confirmation: Some(2), // ~2 seconds
+        }
+    }
+
+    // ========== Phase 3: Profile & Subnet Membership ==========
+
+    async fn update_profile(&self, request: UpdateProfileRequest) -> UpdateProfileResponse {
+        info!(address = %request.address, "Processing profile update");
+
+        // Validate address format
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return UpdateProfileResponse {
+                success: false,
+                message: "Invalid address format".to_string(),
+                event_id: None,
+            };
+        }
+
+        // Timestamp anti-replay
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return UpdateProfileResponse { success: false, message: e, event_id: None };
+        }
+
+        // Signature verification
+        if let Err(e) = Self::verify_signature(
+            &request.address, &request.signature, &request.message,
+            request.nostr_pubkey.as_deref(), request.public_key.as_deref(),
+        ) {
+            warn!(address = %request.address, error = %e, "Profile update sig failed");
+            return UpdateProfileResponse { success: false, message: e, event_id: None };
+        }
+
+        let vlc_snapshot = self.build_vlc_snapshot();
+        let attrs = request.attributes.unwrap_or_default();
+
+        let event = match self.network_service.infra_executor().execute_profile_update(
+            &request.address,
+            request.display_name.as_deref(),
+            request.avatar_url.as_deref(),
+            request.bio.as_deref(),
+            &attrs,
+            vlc_snapshot,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "Profile update failed");
+                return UpdateProfileResponse {
+                    success: false, message: format!("Profile update failed: {}", e), event_id: None,
+                };
+            }
+        };
+
+        let event_id = event.id.clone();
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(address = %request.address, event_id = %event_id, "Profile updated");
+        UpdateProfileResponse { success: true, message: "Profile updated".to_string(), event_id: Some(event_id) }
+    }
+
+    async fn get_profile(&self, address: &str) -> GetProfileResponse {
+        let profile_key = format!("profile:{}", address);
+        let profile_object_id = ObjectId::new(
+            setu_hash_with_domain(b"SETU_PROFILE:", profile_key.as_bytes()),
+        );
+
+        match self.network_service.state_provider().get_object(&profile_object_id) {
+            Some(data) => {
+                let profile: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
+                GetProfileResponse {
+                    found: true,
+                    address: address.to_string(),
+                    profile: Some(ProfileInfo {
+                        display_name: profile["display_name"].as_str().map(|s| s.to_string()),
+                        avatar_url: profile["avatar_url"].as_str().map(|s| s.to_string()),
+                        bio: profile["bio"].as_str().map(|s| s.to_string()),
+                        created_at: profile["created_at"].as_u64().unwrap_or(0),
+                    }),
+                }
+            }
+            None => GetProfileResponse {
+                found: false,
+                address: address.to_string(),
+                profile: None,
+            },
+        }
+    }
+
+    async fn join_subnet(&self, request: JoinSubnetRequest) -> JoinSubnetResponse {
+        info!(address = %request.address, subnet_id = %request.subnet_id, "Processing subnet join");
+
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return JoinSubnetResponse {
+                success: false, message: "Invalid address format".to_string(), event_id: None,
+            };
+        }
+
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return JoinSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        if let Err(e) = Self::verify_signature(
+            &request.address, &request.signature, &request.message,
+            request.nostr_pubkey.as_deref(), request.public_key.as_deref(),
+        ) {
+            warn!(address = %request.address, error = %e, "Subnet join sig failed");
+            return JoinSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        // Duplicate join detection
+        let membership_key = format!("user:{}:subnet:{}", request.address, request.subnet_id);
+        let membership_oid = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+        if self.network_service.state_provider().get_object(&membership_oid).is_some() {
+            return JoinSubnetResponse {
+                success: false,
+                message: format!("User {} already a member of subnet '{}'", request.address, request.subnet_id),
+                event_id: None,
+            };
+        }
+
+        let vlc_snapshot = self.build_vlc_snapshot();
+        let event = match self.network_service.infra_executor().execute_subnet_join(
+            &request.address, &request.subnet_id, vlc_snapshot,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "Subnet join failed");
+                return JoinSubnetResponse {
+                    success: false, message: format!("Subnet join failed: {}", e), event_id: None,
+                };
+            }
+        };
+
+        let event_id = event.id.clone();
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Joined subnet");
+        JoinSubnetResponse { success: true, message: "Joined subnet".to_string(), event_id: Some(event_id) }
+    }
+
+    async fn leave_subnet(&self, request: LeaveSubnetRequest) -> LeaveSubnetResponse {
+        info!(address = %request.address, subnet_id = %request.subnet_id, "Processing subnet leave");
+
+        if !request.address.starts_with("0x")
+            || (request.address.len() != 66 && request.address.len() != 42)
+        {
+            return LeaveSubnetResponse {
+                success: false, message: "Invalid address format".to_string(), event_id: None,
+            };
+        }
+
+        if let Err(e) = Self::check_timestamp(request.timestamp) {
+            return LeaveSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        if let Err(e) = Self::verify_signature(
+            &request.address, &request.signature, &request.message,
+            request.nostr_pubkey.as_deref(), request.public_key.as_deref(),
+        ) {
+            warn!(address = %request.address, error = %e, "Subnet leave sig failed");
+            return LeaveSubnetResponse { success: false, message: e, event_id: None };
+        }
+
+        // Existence check: must be a member to leave
+        let membership_key = format!("user:{}:subnet:{}", request.address, request.subnet_id);
+        let membership_oid = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+        if self.network_service.state_provider().get_object(&membership_oid).is_none() {
+            return LeaveSubnetResponse {
+                success: false,
+                message: format!("User {} is not a member of subnet '{}'", request.address, request.subnet_id),
+                event_id: None,
+            };
+        }
+
+        let vlc_snapshot = self.build_vlc_snapshot();
+        let event = match self.network_service.infra_executor().execute_subnet_leave(
+            &request.address, &request.subnet_id, vlc_snapshot,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                error!(address = %request.address, error = %e, "Subnet leave failed");
+                return LeaveSubnetResponse {
+                    success: false, message: format!("Subnet leave failed: {}", e), event_id: None,
+                };
+            }
+        };
+
+        let event_id = event.id.clone();
+        self.network_service.add_event_to_dag(event).await;
+
+        info!(address = %request.address, subnet_id = %request.subnet_id, event_id = %event_id, "Left subnet");
+        LeaveSubnetResponse { success: true, message: "Left subnet".to_string(), event_id: Some(event_id) }
+    }
+
+    async fn check_membership(&self, address: &str, subnet_id: &str) -> CheckMembershipResponse {
+        let membership_key = format!("user:{}:subnet:{}", address, subnet_id);
+        let membership_oid = ObjectId::new(
+            setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+        );
+
+        match self.network_service.state_provider().get_object(&membership_oid) {
+            Some(data) => {
+                let v: serde_json::Value = serde_json::from_slice(&data).unwrap_or_default();
+                CheckMembershipResponse {
+                    is_member: true,
+                    address: address.to_string(),
+                    subnet_id: subnet_id.to_string(),
+                    joined_at: v["joined_at"].as_u64(),
+                }
+            }
+            None => CheckMembershipResponse {
+                is_member: false,
+                address: address.to_string(),
+                subnet_id: subnet_id.to_string(),
+                joined_at: None,
+            },
+        }
+    }
+
+    async fn get_user_subnets(&self, address: &str) -> GetUserSubnetsResponse {
+        // Point-query across all registered subnets (O(subnet_count))
+        let all_subnets = self.network_service.get_all_subnets();
+        let mut joined = Vec::new();
+
+        for subnet_info in &all_subnets {
+            let membership_key = format!("user:{}:subnet:{}", address, subnet_info.subnet_id);
+            let membership_oid = ObjectId::new(
+                setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes()),
+            );
+            if self.network_service.state_provider().get_object(&membership_oid).is_some() {
+                joined.push(subnet_info.subnet_id.clone());
+            }
+        }
+
+        GetUserSubnetsResponse {
+            address: address.to_string(),
+            subnets: joined,
         }
     }
 }
