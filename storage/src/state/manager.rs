@@ -25,7 +25,7 @@ use setu_merkle::{
 };
 use setu_types::{SubnetId, AnchorMerkleRoots};
 use setu_types::event::{Event, StateChange, ExecutionResult};
-use setu_types::coin::CoinState;
+use setu_types::envelope::{detect_and_parse, StorageFormat};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -225,12 +225,12 @@ pub struct GlobalStateManager {
     /// enabling efficient coin queries by address. The index maps owner
     /// addresses to the set of subnet IDs where they have coins.
     coin_type_index: HashMap<String, HashSet<String>>,
-    /// Owner coin index: owner_address -> set of (object_id, subnet_id) pairs
+    /// Owner object index: owner_address -> set of (object_id, type_tag) pairs
     /// 
     /// This index tracks which object IDs belong to each owner, enabling
-    /// efficient coin lookups even for coins created by runtime split operations
-    /// (whose object_ids are not deterministic).
-    owner_coin_index: HashMap<String, HashSet<([u8; 32], String)>>,
+    /// efficient lookups for both Coins and Move objects.
+    /// The type_tag is coin_type for legacy CoinState, or Move type_tag for ObjectEnvelope.
+    owner_object_index: HashMap<String, HashSet<([u8; 32], String)>>,
     /// Modification tracker: object_id -> last modifying event_id
     /// 
     /// Updated during apply_committed_events to track which event last modified
@@ -275,7 +275,7 @@ impl Clone for GlobalStateManager {
             current_anchor: self.current_anchor,
             // Don't clone indices - clones are for temporary state root calculations only
             coin_type_index: HashMap::new(),
-            owner_coin_index: HashMap::new(),
+            owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
         }
     }
@@ -284,7 +284,7 @@ impl Clone for GlobalStateManager {
 impl GlobalStateManager {
     /// Create a full read snapshot (preserving all index data).
     ///
-    /// Unlike `clone()`, this method preserves coin_type_index, owner_coin_index,
+    /// Unlike `clone()`, this method preserves coin_type_index, owner_object_index,
     /// and modification_tracker, so the read snapshot can properly serve queries.
     ///
     /// ## Differences from clone()
@@ -294,7 +294,7 @@ impl GlobalStateManager {
     /// | subnet_states | ✅ preserved | ✅ preserved |
     /// | store | ❌ set to None | ❌ set to None |
     /// | coin_type_index | ❌ cleared | ✅ preserved |
-    /// | owner_coin_index | ❌ cleared | ✅ preserved |
+    /// | owner_object_index | ❌ cleared | ✅ preserved |
     /// | modification_tracker | ❌ cleared | ✅ preserved |
     ///
     /// ## Performance
@@ -306,7 +306,7 @@ impl GlobalStateManager {
             store: None,  // Read snapshot doesn't need storage backend
             current_anchor: self.current_anchor,
             coin_type_index: self.coin_type_index.clone(),
-            owner_coin_index: self.owner_coin_index.clone(),
+            owner_object_index: self.owner_object_index.clone(),
             modification_tracker: self.modification_tracker.clone(),
         }
     }
@@ -322,7 +322,7 @@ impl GlobalStateManager {
             store: None,
             current_anchor: 0,
             coin_type_index: HashMap::new(),
-            owner_coin_index: HashMap::new(),
+            owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
         }
     }
@@ -734,7 +734,7 @@ impl GlobalStateManager {
     pub fn register_coin_object(&mut self, address: &str, coin_type: &str, object_id: [u8; 32]) {
         let canonical = Self::resolve_address(address);
         self.register_coin_type(&canonical, coin_type);
-        self.owner_coin_index
+        self.owner_object_index
             .entry(canonical)
             .or_default()
             .insert((object_id, coin_type.to_string()));
@@ -742,52 +742,62 @@ impl GlobalStateManager {
     
     /// Get all object IDs owned by an address
     /// 
-    /// Returns (object_id, coin_type) pairs for all coins owned by the address.
+    /// Returns (object_id, type_tag) pairs for all objects owned by the address.
+    /// For legacy CoinState, type_tag is the coin_type (subnet_id).
+    /// For ObjectEnvelope, type_tag is the Move type tag string.
     pub fn get_coin_objects_for_address(&self, address: &str) -> Vec<([u8; 32], String)> {
         let canonical = Self::resolve_address(address);
-        self.owner_coin_index
+        self.owner_object_index
             .get(&canonical)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Rebuild the coin_type_index by scanning all objects in all SMTs.
+    /// Rebuild all indexes by scanning all objects in all SMTs.
     /// 
+    /// Supports both legacy CoinState and ObjectEnvelope formats via `detect_and_parse()`.
     /// This should be called at startup after recovering SMT state from storage.
-    /// It ensures the index is consistent with the actual state.
-    /// 
-    /// # Performance
-    /// - O(n) where n is total number of objects
-    /// - ~1 second per 1M objects (in-memory scan)
     /// 
     /// # Returns
-    /// Number of coins indexed.
+    /// Number of objects indexed.
     pub fn rebuild_coin_type_index(&mut self) -> usize {
         self.coin_type_index.clear();
-        self.owner_coin_index.clear();
+        self.owner_object_index.clear();
         
-        // First collect all coin data to avoid borrow conflicts
-        let coin_data: Vec<(String, String, [u8; 32])> = self.iter_all_objects()
+        // Collect all parseable object data to avoid borrow conflicts
+        // Each entry: (owner, type_tag, object_id, is_coin, coin_type_for_index)
+        let object_data: Vec<(String, String, [u8; 32], Option<String>)> = self.iter_all_objects()
             .filter_map(|(_subnet_id, object_id, value)| {
-                CoinState::from_bytes(value)
-                    .map(|cs| (cs.owner.clone(), cs.coin_type.clone(), object_id))
+                match detect_and_parse(value) {
+                    StorageFormat::Envelope(env) => {
+                        let owner = env.metadata.owner.to_string();
+                        let coin_type = extract_coin_type_from_tag(&env.type_tag);
+                        Some((owner, env.type_tag.clone(), object_id, coin_type))
+                    }
+                    StorageFormat::LegacyCoinState(cs) => {
+                        Some((cs.owner.clone(), cs.coin_type.clone(), object_id, Some(cs.coin_type.clone())))
+                    }
+                    StorageFormat::Unknown => None,
+                }
             })
             .collect();
         
         // Then update the indices
-        for (owner, coin_type, object_id) in coin_data {
-            self.coin_type_index
+        for (owner, type_tag, object_id, coin_type) in object_data {
+            self.owner_object_index
                 .entry(owner.clone())
                 .or_default()
-                .insert(coin_type.clone());
+                .insert((object_id, type_tag));
             
-            self.owner_coin_index
-                .entry(owner)
-                .or_default()
-                .insert((object_id, coin_type));
+            if let Some(ct) = coin_type {
+                self.coin_type_index
+                    .entry(owner)
+                    .or_default()
+                    .insert(ct);
+            }
         }
         
-        self.coin_type_index.values().map(|v| v.len()).sum()
+        self.owner_object_index.values().map(|v| v.len()).sum()
     }
 
     /// Get index statistics for debugging/monitoring.
@@ -848,34 +858,13 @@ impl GlobalStateManager {
                 };
                 // smt borrow released here
                 
-                // Update coin_type_index and owner_coin_index if this is a CoinState
-                if let Some(new_cs) = CoinState::from_bytes(value) {
-                    // If there's an old value, check if owner changed → clean up old index
-                    if let Some(ref old_bytes) = change.old_value {
-                        if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
-                            if old_cs.owner != new_cs.owner {
-                                // Owner changed (e.g., full transfer) → remove from old owner's index
-                                if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
-                                    set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
-                                    if set.is_empty() {
-                                        self.owner_coin_index.remove(&old_cs.owner);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Add/update new owner's index entries
-                    self.coin_type_index
-                        .entry(new_cs.owner.clone())
-                        .or_default()
-                        .insert(new_cs.coin_type.clone());
-                    
-                    self.owner_coin_index
-                        .entry(new_cs.owner.clone())
-                        .or_default()
-                        .insert((*object_id.as_bytes(), new_cs.coin_type.clone()));
+                // Clean up old owner's index if owner changed
+                if let Some(ref old_bytes) = change.old_value {
+                    self.remove_from_indexes_for_value(&object_id, old_bytes);
                 }
+                
+                // Update indexes based on new value format
+                self.update_indexes_for_value(&object_id, value, &change.key);
                 
                 ApplyResult::Updated {
                     object_id: *object_id.as_bytes(),
@@ -892,17 +881,7 @@ impl GlobalStateManager {
                 });
                 
                 if let Some(ref old_bytes) = effective_old {
-                    if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
-                        // Remove from owner_coin_index
-                        if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
-                            set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
-                            if set.is_empty() {
-                                self.owner_coin_index.remove(&old_cs.owner);
-                            }
-                        }
-                        // Note: coin_type_index not cleaned here because the owner may
-                        // still have other coins of the same type. Cleaned during rebuild.
-                    }
+                    self.remove_from_indexes_for_value(&object_id, old_bytes);
                 }
                 
                 let existed = {
@@ -917,6 +896,73 @@ impl GlobalStateManager {
         }
     }
     
+    /// Generalized index update — supports both ObjectEnvelope and legacy CoinState.
+    fn update_indexes_for_value(&mut self, object_id: &HashValue, value: &[u8], key: &str) {
+        // Module keys don't participate in object indexing
+        if key.starts_with("mod:") || key.starts_with("user:") || key.starts_with("solver:")
+            || key.starts_with("validator:") || key.starts_with("event:") {
+            return;
+        }
+        
+        match detect_and_parse(value) {
+            StorageFormat::Envelope(env) => {
+                let owner_hex = env.metadata.owner.to_string();
+                
+                self.owner_object_index
+                    .entry(owner_hex.clone())
+                    .or_default()
+                    .insert((*object_id.as_bytes(), env.type_tag.clone()));
+                
+                // If this is a Coin type, also update coin_type_index for backward compat
+                if let Some(coin_type) = extract_coin_type_from_tag(&env.type_tag) {
+                    self.coin_type_index
+                        .entry(owner_hex)
+                        .or_default()
+                        .insert(coin_type);
+                }
+            }
+            StorageFormat::LegacyCoinState(cs) => {
+                self.coin_type_index
+                    .entry(cs.owner.clone())
+                    .or_default()
+                    .insert(cs.coin_type.clone());
+                
+                self.owner_object_index
+                    .entry(cs.owner.clone())
+                    .or_default()
+                    .insert((*object_id.as_bytes(), cs.coin_type.clone()));
+            }
+            StorageFormat::Unknown => {
+                // Unrecognized format — skip indexing (doesn't affect SMT correctness)
+            }
+        }
+    }
+    
+    /// Remove an object from indexes based on its old value bytes.
+    fn remove_from_indexes_for_value(&mut self, object_id: &HashValue, old_bytes: &[u8]) {
+        match detect_and_parse(old_bytes) {
+            StorageFormat::Envelope(env) => {
+                let owner_hex = env.metadata.owner.to_string();
+                if let Some(set) = self.owner_object_index.get_mut(&owner_hex) {
+                    set.remove(&(*object_id.as_bytes(), env.type_tag.clone()));
+                    if set.is_empty() {
+                        self.owner_object_index.remove(&owner_hex);
+                    }
+                }
+                // Note: coin_type_index not cleaned per-delete — cleaned during rebuild
+            }
+            StorageFormat::LegacyCoinState(cs) => {
+                if let Some(set) = self.owner_object_index.get_mut(&cs.owner) {
+                    set.remove(&(*object_id.as_bytes(), cs.coin_type.clone()));
+                    if set.is_empty() {
+                        self.owner_object_index.remove(&cs.owner);
+                    }
+                }
+            }
+            StorageFormat::Unknown => {}
+        }
+    }
+
     /// Apply all state changes from an ExecutionResult to a subnet
     ///
     /// Returns the new subnet root after applying all changes.
@@ -1130,6 +1176,11 @@ impl GlobalStateManager {
                 key = %key,
                 "Invalid oid: format — hex decode failed or wrong length"
             );
+        } else if key.starts_with("mod:") {
+            // Module bytecode key: "mod:{hex_addr}::{module_name}"
+            // Hash with BLAKE3 — consistent with MerkleStateProvider::get_raw_data()
+            let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+            return HashValue::from_slice(&hash).expect("32 bytes");
         } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") || key.starts_with("event:") {
             // Known non-object metadata key prefixes.
             // These don't have a native 32-byte ObjectId, so we hash the key.
@@ -1154,6 +1205,21 @@ impl GlobalStateManager {
         let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
         HashValue::from_slice(&hash).expect("32 bytes")
     }
+}
+
+/// Extract coin type from a Move type_tag string.
+///
+/// `"0x1::coin::Coin<0x1::setu::ROOT>"` → `Some("ROOT")`
+/// `"0x1::mymodule::MyStruct"` → `None`
+fn extract_coin_type_from_tag(tag: &str) -> Option<String> {
+    let start = tag.find("::coin::Coin<")? + "::coin::Coin<".len();
+    let end = tag.rfind('>')?;
+    if start >= end {
+        return None;
+    }
+    let inner = &tag[start..end];
+    // Take the last segment after "::"
+    inner.rsplit("::").next().map(|s| s.to_string())
 }
 
 /// Result of applying a single StateChange
@@ -1255,6 +1321,7 @@ impl Default for GlobalStateManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use setu_types::coin::CoinState;
     
     #[test]
     fn test_subnet_state_smt() {
@@ -1384,6 +1451,32 @@ mod tests {
         // Invalid oid format should panic (debug_assert)
         let key = "oid:not-valid-hex";
         let _parsed = GlobalStateManager::parse_state_change_key(key);
+    }
+
+    #[test]
+    fn test_parse_state_change_key_mod_prefix() {
+        // "mod:" prefix should hash with setu_hash — same as "event:" path
+        let key = "mod:0x1234::my_module";
+        let parsed = GlobalStateManager::parse_state_change_key(key);
+        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
+        assert_eq!(parsed.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn test_apply_state_change_mod_key() {
+        use setu_types::event::StateChange;
+
+        let mut manager = GlobalStateManager::new();
+        let bytecode = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let sc = StateChange::insert("mod:0xdead::counter".to_string(), bytecode.clone());
+
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+
+        // Verify the data was inserted into the ROOT SMT
+        let expected_hash = setu_types::hash_utils::setu_hash(b"mod:0xdead::counter");
+        let hash_value = HashValue::from_slice(&expected_hash).unwrap();
+        let smt = manager.root_subnet();
+        assert_eq!(smt.get(&hash_value), Some(&bytecode));
     }
     
     #[test]
@@ -1547,5 +1640,249 @@ mod tests {
         let smt = manager.root_subnet();
         let oid = HashValue::from_slice(&coin_bytes).unwrap();
         assert_eq!(smt.get(&oid), Some(&value));
+    }
+
+    // =========================================================================
+    // §14 Index Generalization Tests
+    // =========================================================================
+
+    /// Helper: create an ObjectEnvelope with Coin type_tag
+    fn make_coin_envelope(owner: setu_types::Address, balance: u64, coin_type: &str) -> Vec<u8> {
+        use setu_types::envelope::ObjectEnvelope;
+        use setu_types::coin::{CoinData, CoinType, Balance};
+        use setu_types::object::{ObjectId, Ownership};
+        
+        let coin_data = CoinData {
+            coin_type: CoinType::new(coin_type),
+            balance: Balance::new(balance),
+        };
+        let bcs_data = bcs::to_bytes(&coin_data).unwrap();
+        let env = ObjectEnvelope::from_move_result(
+            ObjectId::new([0u8; 32]), // id doesn't matter for serialization
+            owner,
+            1,
+            Ownership::AddressOwner(owner),
+            format!("0x1::coin::Coin<0x1::setu::{}>", coin_type),
+            bcs_data,
+        );
+        env.to_bytes()
+    }
+
+    /// Helper: create an ObjectEnvelope with a custom (non-coin) type_tag
+    fn make_custom_envelope(owner: setu_types::Address, type_tag: &str) -> Vec<u8> {
+        use setu_types::envelope::ObjectEnvelope;
+        use setu_types::object::{ObjectId, Ownership};
+        
+        let bcs_data = bcs::to_bytes(&42u64).unwrap(); // arbitrary data
+        let env = ObjectEnvelope::from_move_result(
+            ObjectId::new([0u8; 32]),
+            owner,
+            1,
+            Ownership::AddressOwner(owner),
+            type_tag.to_string(),
+            bcs_data,
+        );
+        env.to_bytes()
+    }
+
+    #[test]
+    fn test_apply_state_change_envelope_updates_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let obj_id = [0xAA; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let value = make_coin_envelope(alice, 1000, "ROOT");
+        
+        let sc = StateChange::insert(key, value);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // owner_object_index should have alice's entry
+        let objects = manager.get_coin_objects_for_address(&alice.to_string());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, obj_id);
+        assert!(objects[0].1.contains("Coin<"));
+        
+        // coin_type_index should also have alice→ROOT
+        let types = manager.get_coin_types_for_address(&alice.to_string());
+        assert!(types.contains("ROOT"));
+    }
+    
+    #[test]
+    fn test_apply_state_change_envelope_non_coin_updates_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let obj_id = [0xBB; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let value = make_custom_envelope(alice, "0xcafe::game::Sword");
+        
+        let sc = StateChange::insert(key, value);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // owner_object_index should have alice's entry with the custom type_tag
+        let objects = manager.get_coin_objects_for_address(&alice.to_string());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, obj_id);
+        assert_eq!(objects[0].1, "0xcafe::game::Sword");
+        
+        // coin_type_index should NOT have an entry (not a Coin type)
+        let types = manager.get_coin_types_for_address(&alice.to_string());
+        assert!(types.is_empty());
+    }
+    
+    #[test]
+    fn test_apply_state_change_legacy_coinstate_still_works() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice_hex = setu_types::Address::from_str_id("alice").to_string();
+        let obj_id = [0xCC; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let cs = CoinState::new(alice_hex.clone(), 500);
+        let value = cs.to_bytes();
+        
+        let sc = StateChange::insert(key, value);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // owner_object_index should have entry
+        let objects = manager.get_coin_objects_for_address(&alice_hex);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, obj_id);
+        
+        // coin_type_index should have ROOT
+        let types = manager.get_coin_types_for_address(&alice_hex);
+        assert!(types.contains("ROOT"));
+    }
+    
+    #[test]
+    fn test_apply_state_change_delete_cleans_envelope_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let obj_id = [0xDD; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        let value = make_coin_envelope(alice, 1000, "ROOT");
+        
+        // Insert first
+        let sc_insert = StateChange::insert(key.clone(), value.clone());
+        manager.apply_state_change(SubnetId::ROOT, &sc_insert);
+        assert_eq!(manager.get_coin_objects_for_address(&alice.to_string()).len(), 1);
+        
+        // Delete with old_value provided
+        let sc_delete = StateChange {
+            key,
+            old_value: Some(value),
+            new_value: None,
+        };
+        manager.apply_state_change(SubnetId::ROOT, &sc_delete);
+        
+        // owner_object_index should be empty for alice
+        assert!(manager.get_coin_objects_for_address(&alice.to_string()).is_empty());
+    }
+    
+    #[test]
+    fn test_apply_state_change_owner_transfer_envelope() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let bob = setu_types::Address::from_str_id("bob");
+        let obj_id = [0xEE; 32];
+        let key = format!("oid:{}", hex::encode(obj_id));
+        
+        let old_value = make_coin_envelope(alice, 1000, "ROOT");
+        let new_value = make_coin_envelope(bob, 1000, "ROOT");
+        
+        // Insert as alice
+        let sc_insert = StateChange::insert(key.clone(), old_value.clone());
+        manager.apply_state_change(SubnetId::ROOT, &sc_insert);
+        assert_eq!(manager.get_coin_objects_for_address(&alice.to_string()).len(), 1);
+        
+        // Transfer to bob (update with old_value)
+        let sc_transfer = StateChange::update(key, old_value, new_value);
+        manager.apply_state_change(SubnetId::ROOT, &sc_transfer);
+        
+        // Alice should have no objects
+        assert!(manager.get_coin_objects_for_address(&alice.to_string()).is_empty());
+        // Bob should have 1 object
+        let bob_objects = manager.get_coin_objects_for_address(&bob.to_string());
+        assert_eq!(bob_objects.len(), 1);
+        assert_eq!(bob_objects[0].0, obj_id);
+    }
+    
+    #[test]
+    fn test_rebuild_indexes_mixed_formats() {
+        let mut manager = GlobalStateManager::new();
+        
+        let alice = setu_types::Address::from_str_id("alice");
+        let bob = setu_types::Address::from_str_id("bob");
+        
+        // Insert a legacy CoinState directly into SMT
+        let cs = CoinState::new(alice.to_string(), 500);
+        manager.upsert_object(SubnetId::ROOT, [0x01; 32], cs.to_bytes());
+        
+        // Insert an ObjectEnvelope directly into SMT
+        let env_bytes = make_coin_envelope(bob, 2000, "ROOT");
+        manager.upsert_object(SubnetId::ROOT, [0x02; 32], env_bytes);
+        
+        // Insert a custom Move object envelope
+        let custom_bytes = make_custom_envelope(alice, "0xcafe::nft::Token");
+        manager.upsert_object(SubnetId::ROOT, [0x03; 32], custom_bytes);
+        
+        // Rebuild from scratch
+        let count = manager.rebuild_coin_type_index();
+        assert_eq!(count, 3, "Should index all 3 objects");
+        
+        // alice: 1 legacy coin + 1 custom object
+        let alice_objects = manager.get_coin_objects_for_address(&alice.to_string());
+        assert_eq!(alice_objects.len(), 2);
+        
+        // bob: 1 envelope coin
+        let bob_objects = manager.get_coin_objects_for_address(&bob.to_string());
+        assert_eq!(bob_objects.len(), 1);
+        
+        // coin_type_index: alice→ROOT (from CoinState), bob→ROOT (from Envelope)
+        assert!(manager.get_coin_types_for_address(&alice.to_string()).contains("ROOT"));
+        assert!(manager.get_coin_types_for_address(&bob.to_string()).contains("ROOT"));
+    }
+    
+    #[test]
+    fn test_extract_coin_type_from_tag() {
+        assert_eq!(
+            super::extract_coin_type_from_tag("0x1::coin::Coin<0x1::setu::ROOT>"),
+            Some("ROOT".to_string())
+        );
+        assert_eq!(
+            super::extract_coin_type_from_tag("0x1::coin::Coin<0xcafe::mytoken::GOLD>"),
+            Some("GOLD".to_string())
+        );
+        // Not a Coin type → None
+        assert_eq!(
+            super::extract_coin_type_from_tag("0xcafe::game::Sword"),
+            None
+        );
+        // Edge case: empty inner
+        assert_eq!(
+            super::extract_coin_type_from_tag("0x1::coin::Coin<>"),
+            None
+        );
+    }
+    
+    #[test]
+    fn test_mod_key_skips_index() {
+        use setu_types::event::StateChange;
+        let mut manager = GlobalStateManager::new();
+        
+        let bytecode = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let sc = StateChange::insert("mod:0xdead::counter".to_string(), bytecode);
+        manager.apply_state_change(SubnetId::ROOT, &sc);
+        
+        // No index entries should be created for mod: keys
+        assert!(manager.owner_object_index.is_empty());
+        assert!(manager.coin_type_index.is_empty());
     }
 }
