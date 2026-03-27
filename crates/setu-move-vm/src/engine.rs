@@ -27,6 +27,11 @@ use crate::object_runtime::{
 };
 use crate::resolver::SetuModuleResolver;
 
+// Embed build-time generated stdlib bytecodes constant.
+// When .mv files exist in setu-framework/compiled/, STDLIB_MODULES is populated.
+// Otherwise it's an empty array (build.rs graceful degradation).
+include!(concat!(env!("OUT_DIR"), "/stdlib_modules.rs"));
+
 // ═══════════════════════════════════════════════════════════════
 // Config & Output types
 // ═══════════════════════════════════════════════════════════════
@@ -127,6 +132,59 @@ impl SetuMoveEngine {
             stdlib_modules,
             gas_config: GasConfig::default(),
         })
+    }
+
+    /// Create engine with embedded stdlib modules (from build.rs).
+    ///
+    /// Parses each (name, bytecode) pair from [`STDLIB_MODULES`],
+    /// deserializes the bytecode to extract the real `ModuleId`,
+    /// verifies it with move-bytecode-verifier, then passes the
+    /// resulting HashMap to [`new_with_stdlib`].
+    ///
+    /// Returns an engine with an empty stdlib if no .mv files were
+    /// found at build time (graceful degradation).
+    pub fn new_with_embedded_stdlib() -> Result<Self, RuntimeError> {
+        let mut stdlib = HashMap::new();
+
+        for &(name, bytes) in STDLIB_MODULES {
+            let compiled_module =
+                move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
+                    .map_err(|e| {
+                        RuntimeError::VMInitError(format!(
+                            "Failed to deserialize stdlib module '{}': {}",
+                            name, e
+                        ))
+                    })?;
+
+            move_bytecode_verifier::verify_module_unmetered(&compiled_module).map_err(
+                |e| {
+                    RuntimeError::VMInitError(format!(
+                        "Stdlib module '{}' failed verification: {}",
+                        name, e
+                    ))
+                },
+            )?;
+
+            let module_id = compiled_module.self_id();
+            stdlib.insert(module_id, bytes.to_vec());
+        }
+
+        if stdlib.is_empty() {
+            tracing::warn!(
+                "No stdlib modules found. \
+                 Run: cd setu-framework && sui move build && \
+                 cp build/SetuFramework/bytecode_modules/*.mv compiled/"
+            );
+        } else {
+            tracing::info!("Loaded {} stdlib modules", stdlib.len());
+        }
+
+        Self::new_with_stdlib(stdlib)
+    }
+
+    /// Returns the number of embedded stdlib modules.
+    pub fn stdlib_module_count(&self) -> usize {
+        self.stdlib_modules.len()
     }
 
     /// Execute a Move function call.
@@ -391,5 +449,118 @@ mod tests {
     fn test_state_change_type_eq() {
         assert_eq!(MoveStateChangeType::Create, MoveStateChangeType::Create);
         assert_ne!(MoveStateChangeType::Create, MoveStateChangeType::Delete);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Phase 2: Stdlib embedding tests
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_embedded_stdlib_empty_ok() {
+        // new_with_embedded_stdlib should succeed even when STDLIB_MODULES is empty
+        let engine = SetuMoveEngine::new_with_embedded_stdlib();
+        assert!(engine.is_ok(), "Engine should init with empty or populated stdlib");
+    }
+
+    #[test]
+    fn test_embedded_stdlib_loads_all() {
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: stdlib .mv files not found — run sui move build");
+            return;
+        }
+        let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
+        assert_eq!(
+            engine.stdlib_module_count(),
+            6,
+            "Expected 6 stdlib modules (object, transfer, tx_context, balance, coin, setu)"
+        );
+    }
+
+    #[test]
+    fn test_embedded_stdlib_module_ids_at_0x1() {
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: stdlib .mv files not found");
+            return;
+        }
+        use move_core_types::account_address::AccountAddress;
+
+        for &(name, bytes) in STDLIB_MODULES {
+            let cm =
+                move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
+                    .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", name, e));
+            assert_eq!(
+                *cm.self_id().address(),
+                AccountAddress::ONE,
+                "Module '{}' should be at address 0x1",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_stdlib_module_names() {
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: stdlib .mv files not found");
+            return;
+        }
+        let expected = ["object", "transfer", "tx_context", "balance", "coin", "setu"];
+        let names: Vec<&str> = STDLIB_MODULES.iter().map(|(n, _)| *n).collect();
+        for exp in &expected {
+            assert!(
+                names.contains(exp),
+                "Expected module '{}' in STDLIB_MODULES, found: {:?}",
+                exp,
+                names
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_stdlib_resolver_finds_modules() {
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: stdlib .mv files not found");
+            return;
+        }
+        use setu_runtime::state::InMemoryObjectStore;
+        use move_core_types::resolver::ModuleResolver;
+        use crate::resolver::SetuModuleResolver;
+
+        let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
+        let store = InMemoryObjectStore::new();
+        let resolver = SetuModuleResolver::new(&store, &engine.stdlib_modules);
+
+        for &(name, _) in STDLIB_MODULES {
+            let cm =
+                move_binary_format::CompiledModule::deserialize_with_defaults(
+                    STDLIB_MODULES
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .unwrap()
+                        .1,
+                )
+                .unwrap();
+            let mid = cm.self_id();
+            let result = resolver.get_module(&mid);
+            assert!(
+                result.is_ok() && result.unwrap().is_some(),
+                "Resolver should find stdlib module '{}'",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_stdlib_bytecode_verifies() {
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: stdlib .mv files not found");
+            return;
+        }
+        for &(name, bytes) in STDLIB_MODULES {
+            let cm =
+                move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
+                    .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", name, e));
+            move_bytecode_verifier::verify_module_unmetered(&cm)
+                .unwrap_or_else(|e| panic!("Module '{}' failed verification: {}", name, e));
+        }
     }
 }
