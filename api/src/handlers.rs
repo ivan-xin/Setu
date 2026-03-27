@@ -75,6 +75,12 @@ pub trait ValidatorService: Send + Sync {
     
     /// Get object (state query)
     fn get_object(&self, key: &str) -> GetObjectResponse;
+
+    /// Submit a Move function call
+    fn submit_move_call(&self, request: MoveCallRequest) -> impl std::future::Future<Output = MoveCallResponse> + Send;
+
+    /// Submit a Move module publish
+    fn submit_move_publish(&self, request: MovePublishRequest) -> impl std::future::Future<Output = MovePublishResponse> + Send;
 }
 
 // ============================================
@@ -294,6 +300,26 @@ pub async fn http_get_object<S: ValidatorService>(
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> Json<GetObjectResponse> {
     Json(service.get_object(&key))
+}
+
+// ============================================
+// Move VM Handlers (Phase 4)
+// ============================================
+
+/// Submit a Move function call
+pub async fn http_submit_move_call<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MoveCallRequest>,
+) -> Json<MoveCallResponse> {
+    Json(service.submit_move_call(request).await)
+}
+
+/// Submit Move module publish
+pub async fn http_submit_move_publish<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MovePublishRequest>,
+) -> Json<MovePublishResponse> {
+    Json(service.submit_move_publish(request).await)
 }
 
 // ============================================

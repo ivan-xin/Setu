@@ -128,6 +128,16 @@ pub trait StateProvider: Send + Sync {
         let proof = self.get_merkle_proof(object_id)?;
         Some((data, proof))
     }
+
+    /// Get raw storage data by string key.
+    ///
+    /// Used for loading module bytecode via `"mod:{hex_addr}::{module_name}"` keys.
+    /// The key is hashed with BLAKE3 to produce the 32-byte SMT lookup key.
+    ///
+    /// Default returns `None`; `MerkleStateProvider` overrides with SMT lookup.
+    fn get_raw(&self, _key: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 // ============================================================================
@@ -196,6 +206,17 @@ impl MerkleStateProvider {
     /// modification events in a single lock acquisition.
     pub(crate) fn modification_tracker(&self) -> &Arc<RwLock<HashMap<[u8; 32], String>>> {
         &self.modification_tracker
+    }
+
+    /// Get raw storage data by string key (module bytecode lookup).
+    ///
+    /// Hashes the key with BLAKE3 to produce the SMT lookup HashValue,
+    /// then reads from the ROOT subnet SMT.
+    pub fn get_raw_data(&self, key: &str) -> Option<Vec<u8>> {
+        let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+        let hash_value = setu_merkle::HashValue::from_slice(&hash).ok()?;
+        let snapshot = self.shared.load_snapshot();
+        snapshot.get_subnet(&SubnetId::ROOT)?.get(&hash_value).cloned()
     }
 
     /// Register a subnet for an address (called when creating/updating coins)
@@ -428,6 +449,10 @@ impl StateProvider for MerkleStateProvider {
         // Fallback to local tracker (for backward compatibility)
         let tracker = self.modification_tracker.read().unwrap();
         tracker.get(object_id.as_bytes()).cloned()
+    }
+
+    fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
+        self.get_raw_data(key)
     }
 }
 
@@ -815,5 +840,46 @@ mod tests {
         let (address_count, entry_count) = provider.index_stats();
         assert_eq!(address_count, 0);
         assert_eq!(entry_count, 0);
+    }
+
+    #[test]
+    fn test_get_raw_default_returns_none() {
+        // Default StateProvider::get_raw() should return None
+        struct DummyProvider;
+        impl StateProvider for DummyProvider {
+            fn get_coins_for_address(&self, _: &str) -> Vec<CoinInfo> { vec![] }
+            fn get_object(&self, _id: &ObjectId) -> Option<Vec<u8>> { None }
+            fn get_state_root(&self) -> [u8; 32] { [0u8; 32] }
+            fn get_merkle_proof(&self, _: &ObjectId) -> Option<SimpleMerkleProof> { None }
+            fn get_last_modifying_event(&self, _: &ObjectId) -> Option<String> { None }
+        }
+        assert!(DummyProvider.get_raw("mod:0x1::coin").is_none());
+    }
+
+    #[test]
+    fn test_merkle_get_raw_module_key() {
+        use setu_types::event::StateChange;
+
+        let shared = make_shared_with_init(|gsm| {
+            // Insert module bytecode into ROOT SMT via apply_state_change
+            let sc = StateChange::insert(
+                "mod:0xdead::counter".to_string(),
+                vec![0xCA, 0xFE],
+            );
+            gsm.apply_state_change(SubnetId::ROOT, &sc);
+        });
+        // Must publish so MerkleStateProvider can see the data
+        {
+            let gsm = shared.lock_write();
+            shared.publish_snapshot(&gsm);
+        }
+        let provider = MerkleStateProvider::new(shared);
+
+        // get_raw should find the module data
+        let data = provider.get_raw("mod:0xdead::counter");
+        assert_eq!(data, Some(vec![0xCA, 0xFE]));
+
+        // Missing key should return None
+        assert!(provider.get_raw("mod:0xdead::missing").is_none());
     }
 }

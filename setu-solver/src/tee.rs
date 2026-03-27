@@ -148,7 +148,8 @@ impl TeeExecutor {
             task.gas_budget,
         )
         .with_events(vec![task.event])
-        .with_read_set(task.read_set);
+        .with_read_set(task.read_set)
+        .with_module_read_set(task.module_read_set);
         
         // Execute STF in TEE
         let output = self.enclave.execute_stf(input).await

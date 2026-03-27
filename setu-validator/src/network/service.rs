@@ -23,6 +23,7 @@ use super::types::*;
 use super::transfer_handler::TransferHandler;
 use super::tee_executor::TeeExecutor;
 use super::event_handler::EventHandler;
+use super::move_handler;
 use crate::{RouterManager, TaskPreparer, BatchTaskPreparer, ConsensusValidator, InfraExecutor};
 use crate::coin_reservation::CoinReservationManager;
 use axum::{
@@ -451,6 +452,9 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/subnet/leave", post(setu_api::http_leave_subnet::<ValidatorNetworkService>))
             .route("/api/v1/user/subnet/check/:address/:subnet_id", get(setu_api::http_check_membership::<ValidatorNetworkService>))
             .route("/api/v1/user/subnets/:address", get(setu_api::http_get_user_subnets::<ValidatorNetworkService>))
+            // Phase 4: Move VM endpoints
+            .route("/api/v1/move/call", post(setu_api::http_submit_move_call::<ValidatorNetworkService>))
+            .route("/api/v1/move/publish", post(setu_api::http_submit_move_publish::<ValidatorNetworkService>))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -581,6 +585,29 @@ impl ValidatorNetworkService {
 
     pub fn get_object(&self, key: &str) -> GetObjectResponse {
         EventHandler::get_object(key)
+    }
+
+    // ============================================
+    // Move VM (Phase 4)
+    // ============================================
+
+    pub async fn submit_move_call(&self, request: setu_api::MoveCallRequest) -> setu_api::MoveCallResponse {
+        move_handler::MoveCallHandler::submit_move_call(request).await
+    }
+
+    pub async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let executor = self.infra_executor();
+        let (response, event) = move_handler::MovePublishHandler::submit_move_publish(
+            &executor, vlc_time, request,
+        ).await;
+
+        // If successful, submit event to DAG (same as SubnetRegister flow)
+        if let Some(event) = event {
+            self.add_event_to_dag(event).await;
+        }
+
+        response
     }
 
     // ============================================
@@ -890,6 +917,14 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     fn get_object(&self, key: &str) -> setu_api::GetObjectResponse {
         self.get_object(key)
+    }
+
+    async fn submit_move_call(&self, request: setu_api::MoveCallRequest) -> setu_api::MoveCallResponse {
+        self.submit_move_call(request).await
+    }
+
+    async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
+        self.submit_move_publish(request).await
     }
 }
 

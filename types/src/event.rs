@@ -544,6 +544,20 @@ impl Event {
         event
     }
 
+    /// Create a contract publish event (Move module deployment)
+    pub fn contract_publish(
+        sender: String,
+        modules: Vec<Vec<u8>>,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::ContractPublish, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MovePublish(MovePublishPayload { modules });
+        event.creator = sender;
+        event
+    }
+
     fn compute_id(
         parent_ids: &[EventId],
         vlc_snapshot: &VLCSnapshot,

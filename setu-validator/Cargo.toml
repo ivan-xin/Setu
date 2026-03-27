@@ -23,6 +23,10 @@ setu-storage = { path = "../storage" }
 setu-api = { path = "../api" }
 setu-network-anemo = { path = "../crates/setu-network-anemo" }
 setu-keys = { path = "../crates/setu-keys" }
+setu-move-vm = { path = "../crates/setu-move-vm" }
+move-binary-format     = { workspace = true }
+move-bytecode-verifier = { workspace = true }
+move-core-types        = { workspace = true }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

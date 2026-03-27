@@ -218,6 +218,11 @@ impl StfInput {
         self.anchor_id = Some(anchor_id);
         self
     }
+
+    pub fn with_module_read_set(mut self, module_read_set: Vec<ReadSetEntry>) -> Self {
+        self.module_read_set = module_read_set;
+        self
+    }
     
     /// Compute input hash for attestation binding
     /// This hash covers all inputs to ensure attestation is bound to specific execution
@@ -515,5 +520,27 @@ mod tests {
             .with_proof(vec![1, 2, 3]);
         
         assert!(entry.proof.is_some());
+    }
+
+    #[test]
+    fn test_stf_input_with_module_read_set() {
+        let task_id = [42u8; 32];
+        let input = StfInput::new(
+            task_id,
+            SubnetId::ROOT,
+            [0u8; 32],
+            ResolvedInputs::new(),
+            GasBudget::default(),
+        );
+        // Default: empty module_read_set
+        assert!(input.module_read_set.is_empty());
+
+        // Builder sets the field
+        let modules = vec![
+            ReadSetEntry::new("mod:0xdead::counter".to_string(), vec![0xCA, 0xFE]),
+        ];
+        let input2 = input.with_module_read_set(modules.clone());
+        assert_eq!(input2.module_read_set.len(), 1);
+        assert_eq!(input2.module_read_set[0].key, "mod:0xdead::counter");
     }
 }
