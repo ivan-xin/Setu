@@ -172,6 +172,8 @@ use crate::object::ObjectId;
 
 // ========== Move-specific Payload Types ==========
 
+fn default_true() -> bool { true }
+
 /// Move function call payload (paired with EventType::ContractCall)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveCallPayload {
@@ -199,6 +201,10 @@ pub struct MoveCallPayload {
     /// Consumed object indices into input_object_ids (by-value T params)
     #[serde(default)]
     pub consumed_indices: Option<Vec<usize>>,
+    /// Whether the target function takes a `&mut TxContext` last parameter.
+    /// When true, engine.execute() auto-appends BCS(TxContext) to args.
+    #[serde(default = "default_true")]
+    pub needs_tx_context: bool,
 }
 
 /// Move module publish payload (paired with EventType::ContractPublish)

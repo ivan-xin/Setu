@@ -15,6 +15,11 @@
 pub mod address_compat;
 pub mod engine;
 pub mod gas;
+pub mod hybrid;
 pub mod natives;
 pub mod object_runtime;
 pub mod resolver;
+
+// Re-export move-core-types so downstream crates (e.g. setu-enclave)
+// can access Move types without a direct dependency.
+pub use move_core_types;

@@ -55,6 +55,10 @@ pub struct MoveExecutionContext {
     pub sender: Address,
     pub gas_budget: u64,
     pub current_version: u64,
+    /// Epoch number (Phase 3: fixed 0).
+    pub epoch: u64,
+    /// Whether the target function takes `&mut TxContext` as last parameter.
+    pub needs_tx_context: bool,
 }
 
 /// Module publish/change record.
@@ -223,9 +227,15 @@ impl SetuMoveEngine {
         // 6. Gas meter
         let mut gas_meter = InstructionCountGasMeter::new(ctx.gas_budget);
 
+        // 6.5. Append TxContext BCS if the target function requires it
+        let mut final_args = args;
+        if ctx.needs_tx_context {
+            final_args.push(Self::build_tx_context_bcs(ctx));
+        }
+
         // 7. Execute (6 args: module, func, ty_args, args, gas_meter, tracer)
         let exec_result = session.execute_function_bypass_visibility(
-            module_id, function, ty_args, args, &mut gas_meter, None,
+            module_id, function, ty_args, final_args, &mut gas_meter, None,
         );
 
         match exec_result {
@@ -416,6 +426,34 @@ impl SetuMoveEngine {
         }
 
         Ok(changes)
+    }
+
+    /// Build BCS-serialized TxContext for Move function calls.
+    ///
+    /// Layout matches `0x2::tx_context::TxContext` (Sui stdlib):
+    /// ```text
+    /// struct TxContext has drop {
+    ///     sender: address,
+    ///     tx_hash: vector<u8>,
+    ///     epoch: u64,
+    ///     ids_created: u64,
+    /// }
+    /// ```
+    pub fn build_tx_context_bcs(ctx: &MoveExecutionContext) -> Vec<u8> {
+        use crate::address_compat::setu_addr_to_move;
+        let mut buf = Vec::new();
+        // sender: address (32 bytes, fixed-size in BCS)
+        let move_addr = setu_addr_to_move(&ctx.sender);
+        buf.extend_from_slice(move_addr.as_ref());
+        // tx_hash: vector<u8> (BCS: ULEB128 length + bytes)
+        let tx_hash_bcs = bcs::to_bytes(&ctx.tx_hash.to_vec())
+            .expect("BCS serialize tx_hash");
+        buf.extend_from_slice(&tx_hash_bcs);
+        // epoch: u64
+        buf.extend_from_slice(&ctx.epoch.to_le_bytes());
+        // ids_created: u64 (starts at 0)
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf
     }
 
     pub fn gas_config(&self) -> &GasConfig {

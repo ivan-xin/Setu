@@ -41,18 +41,32 @@ use setu_types::task::{
     ReadSetEntry,
 };
 use async_trait::async_trait;
-use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, StateStore};
+use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, InMemoryObjectStore, StateStore, ObjectStore, RawStore};
 use setu_types::{EventId, create_coin, Address, Object, CoinData, ObjectId, Balance, CoinType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "move-vm")]
+use setu_move_vm::move_core_types::{
+    account_address::AccountAddress,
+    identifier::{IdentStr, Identifier},
+    language_storage::{ModuleId, TypeTag},
+};
+#[cfg(feature = "move-vm")]
+use setu_move_vm::engine::{MoveExecutionContext, SetuMoveEngine};
+#[cfg(feature = "move-vm")]
+use setu_move_vm::object_runtime::InputObject;
+#[cfg(feature = "move-vm")]
+use std::str::FromStr;
+
 /// CoinState from storage layer - matches storage/src/state_provider.rs
 /// 
 /// TEE receives raw CoinState (BCS) from read_set so it can:
 /// 1. Verify Merkle proof (hash must match what's stored in tree)
 /// 2. Convert to Object<CoinData> for runtime execution
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CoinState {
     pub owner: String,
@@ -62,6 +76,7 @@ struct CoinState {
     pub coin_type: String,
 }
 
+#[allow(dead_code)]
 fn default_coin_type() -> String {
     "ROOT".to_string()  // ROOT subnet's native token (consistent with storage)
 }
@@ -92,6 +107,9 @@ pub struct MockEnclave {
     legacy_state: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     /// Execution counter for statistics
     execution_count: Arc<RwLock<u64>>,
+    /// Move VM engine (optional, enabled via `move-vm` feature)
+    #[cfg(feature = "move-vm")]
+    move_engine: Option<Arc<SetuMoveEngine>>,
 }
 
 impl MockEnclave {
@@ -105,6 +123,10 @@ impl MockEnclave {
             runtime: Arc::new(RwLock::new(runtime)),
             legacy_state: Arc::new(RwLock::new(HashMap::new())),
             execution_count: Arc::new(RwLock::new(0)),
+            #[cfg(feature = "move-vm")]
+            move_engine: SetuMoveEngine::new_with_embedded_stdlib()
+                .ok()
+                .map(Arc::new),
         }
     }
     
@@ -152,6 +174,8 @@ impl MockEnclave {
     /// ## Conversion
     /// 
     /// After verification, TEE converts CoinState → Object<CoinData> for runtime
+    /// Build temporary state from read_set (legacy, kept for backward compatibility)
+    #[allow(dead_code)]
     fn build_state_from_read_set(&self, read_set: &[ReadSetEntry]) -> StfResult<InMemoryStateStore> {
         let mut store = InMemoryStateStore::new();
         let mut loaded_count = 0;
@@ -226,6 +250,108 @@ impl MockEnclave {
         Ok(store)
     }
     
+    /// Build temporary InMemoryObjectStore from read_set + module_read_set (solver-tee3, Phase 3+).
+    ///
+    /// Supports three key prefixes:
+    /// - "oid:" → ObjectEnvelope (BCS) or legacy CoinState
+    /// - "coin:" → legacy CoinState (BCS) → ObjectEnvelope
+    /// - "mod:" → raw module bytecode (set_raw)
+    fn build_object_store_from_read_set(
+        &self,
+        read_set: &[ReadSetEntry],
+        module_read_set: &[ReadSetEntry],
+    ) -> StfResult<InMemoryObjectStore> {
+        use setu_types::envelope::{ObjectEnvelope, ENVELOPE_MAGIC};
+
+        let mut store = InMemoryObjectStore::new();
+        let mut loaded_count = 0;
+
+        for entry in read_set {
+            if let Some(hex_id) = entry.key.strip_prefix("oid:") {
+                let object_id = ObjectId::from_hex(hex_id)
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                        "Invalid object ID: {}", e
+                    )))?;
+
+                // Try ObjectEnvelope first (magic bytes check)
+                if entry.value.len() >= 2 {
+                    let magic = u16::from_le_bytes([entry.value[0], entry.value[1]]);
+                    if magic == ENVELOPE_MAGIC {
+                        // BCS ObjectEnvelope
+                        let env: ObjectEnvelope = bcs::from_bytes(&entry.value)
+                            .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                                "Failed to deserialize ObjectEnvelope {}: {}", hex_id, e
+                            )))?;
+                        store.set_envelope(object_id, env)
+                            .map_err(|e| StfError::InternalError(format!(
+                                "Failed to store envelope: {}", e
+                            )))?;
+                        loaded_count += 1;
+                        continue;
+                    }
+                }
+
+                // Fallback: legacy CoinState BCS
+                let coin_state: setu_types::coin::CoinState = bcs::from_bytes(&entry.value)
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                        "Failed to deserialize CoinState {}: {}", hex_id, e
+                    )))?;
+                let env = ObjectEnvelope::from_legacy_coin_state(
+                    object_id, &coin_state,
+                ).map_err(|e| StfError::InternalError(format!(
+                    "Failed to convert CoinState {}: {}", hex_id, e
+                )))?;
+                store.set_envelope(object_id, env)
+                    .map_err(|e| StfError::InternalError(format!(
+                        "Failed to store envelope: {}", e
+                    )))?;
+                loaded_count += 1;
+            } else if let Some(hex_id) = entry.key.strip_prefix("coin:") {
+                // Legacy "coin:" prefix → CoinState → ObjectEnvelope
+                let object_id = ObjectId::from_hex(hex_id)
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                        "Invalid object ID: {}", e
+                    )))?;
+                let coin_state: setu_types::coin::CoinState = bcs::from_bytes(&entry.value)
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                        "Failed to deserialize CoinState {}: {}", hex_id, e
+                    )))?;
+                let env = ObjectEnvelope::from_legacy_coin_state(
+                    object_id, &coin_state,
+                ).map_err(|e| StfError::InternalError(format!(
+                    "Failed to convert CoinState {}: {}", hex_id, e
+                )))?;
+                store.set_envelope(object_id, env)
+                    .map_err(|e| StfError::InternalError(format!(
+                        "Failed to store envelope: {}", e
+                    )))?;
+                loaded_count += 1;
+            } else {
+                return Err(StfError::InvalidResolvedInputs(format!(
+                    "Unknown read_set key format: {}", entry.key
+                )));
+            }
+        }
+
+        // Load module bytecode from module_read_set
+        for entry in module_read_set {
+            if entry.key.starts_with("mod:") {
+                store.set_raw(&entry.key, entry.value.clone())
+                    .map_err(|e| StfError::InternalError(format!(
+                        "Failed to store module: {}", e
+                    )))?;
+            }
+        }
+
+        info!(
+            loaded_count = loaded_count,
+            module_count = module_read_set.len(),
+            "Built object store from read_set (Phase 3)"
+        );
+
+        Ok(store)
+    }
+
     /// Simulate applying events to state using self.runtime (LEGACY mode)
     /// 
     /// WARNING: This uses the shared self.runtime which can cause race conditions
@@ -284,7 +410,7 @@ impl MockEnclave {
     async fn simulate_execution_isolated(
         &self,
         input: &StfInput,
-        mut local_runtime: RuntimeExecutor<InMemoryStateStore>,
+        mut local_runtime: RuntimeExecutor<InMemoryObjectStore>,
     ) -> StfResult<(StateDiff, Vec<EventId>, Vec<FailedEvent>)> {
         let start = std::time::Instant::now();
         let mut diff = StateDiff::new();
@@ -298,8 +424,8 @@ impl MockEnclave {
                 return Err(StfError::ExecutionTimeout);
             }
             
-            // Execute event using the LOCAL runtime (not self.runtime!)
-            let result = self.execute_single_event_with_runtime(
+            // Execute event using the LOCAL runtime via new object-store method
+            let result = self.execute_single_event_with_object_store(
                 event, 
                 &input.resolved_inputs, 
                 &mut diff,
@@ -502,6 +628,266 @@ impl MockEnclave {
         Ok(())
     }
     
+    /// Execute a single event using InMemoryObjectStore-backed runtime (isolated path).
+    ///
+    /// Handles all event types that the legacy method handles, plus MoveCall.
+    /// MoveCall branch is only available when the `move-vm` feature is enabled.
+    async fn execute_single_event_with_object_store(
+        &self,
+        event: &setu_types::Event,
+        resolved_inputs: &ResolvedInputs,
+        diff: &mut StateDiff,
+        local_runtime: &mut RuntimeExecutor<InMemoryObjectStore>,
+    ) -> Result<(), String> {
+        debug!(event_id = %event.id, event_type = ?event.event_type, "Executing event via object store runtime");
+        
+        // Transfer
+        if let Some(transfer) = &event.transfer {
+            return self.execute_transfer_with_local_runtime(
+                event, transfer, resolved_inputs, diff, local_runtime
+            ).await;
+        }
+
+        match &event.payload {
+            // Infrastructure events — should never reach TEE
+            setu_types::event::EventPayload::SubnetRegister(_) => {
+                warn!(event_id = %event.id, "SubnetRegister event incorrectly routed to TEE");
+                return Err("SubnetRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::UserRegister(_) => {
+                warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE");
+                return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::ContractPublish { .. } => {
+                warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE");
+                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::MovePublish(_) => {
+                warn!(event_id = %event.id, "MovePublish event incorrectly routed to TEE");
+                return Err("MovePublish is a ROOT event, should not reach TEE".to_string());
+            }
+
+            // CoinMerge
+            setu_types::event::EventPayload::CoinMerge { .. } => {
+                let ctx = ExecutionContext::new(
+                    self.config.solver_id.clone(),
+                    event.timestamp,
+                    false,
+                    Self::derive_tx_hash(&event.id),
+                );
+                if let setu_types::OperationType::MergeCoins { target_index, source_indices } = &resolved_inputs.operation {
+                    let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
+                    let source_coin_ids: Vec<ObjectId> = source_indices.iter()
+                        .map(|&i| resolved_inputs.input_objects[i].object_id)
+                        .collect();
+                    let owner = local_runtime.state()
+                        .get_object(&target_coin_id)
+                        .map_err(|e| format!("Failed to read target coin: {}", e))?
+                        .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
+                        .metadata.owner
+                        .ok_or_else(|| "Target coin has no owner".to_string())?;
+                    let output = local_runtime.execute_merge_coins(
+                        &owner, target_coin_id, &source_coin_ids, &ctx,
+                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    if !output.success {
+                        return Err(output.message.unwrap_or_else(|| "Merge failed".to_string()));
+                    }
+                    diff.add_state_changes(&output.state_changes);
+                } else {
+                    return Err("CoinMerge payload but operation is not MergeCoins".to_string());
+                }
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+
+            // CoinSplit
+            setu_types::event::EventPayload::CoinSplit { .. } => {
+                let ctx = ExecutionContext::new(
+                    self.config.solver_id.clone(),
+                    event.timestamp,
+                    false,
+                    Self::derive_tx_hash(&event.id),
+                );
+                if let setu_types::OperationType::SplitCoin { source_index, amounts } = &resolved_inputs.operation {
+                    let source_coin_id = resolved_inputs.input_objects[*source_index].object_id;
+                    let owner = local_runtime.state()
+                        .get_object(&source_coin_id)
+                        .map_err(|e| format!("Failed to read source coin: {}", e))?
+                        .ok_or_else(|| format!("Source coin {} not found", source_coin_id))?
+                        .metadata.owner
+                        .ok_or_else(|| "Source coin has no owner".to_string())?;
+                    let output = local_runtime.execute_split_coin(
+                        &owner, source_coin_id, amounts, &ctx,
+                    ).map_err(|e| format!("Runtime split error: {}", e))?;
+                    if !output.success {
+                        return Err(output.message.unwrap_or_else(|| "Split failed".to_string()));
+                    }
+                    diff.add_state_changes(&output.state_changes);
+                } else {
+                    return Err("CoinSplit payload but operation is not SplitCoin".to_string());
+                }
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+
+            // CoinMergeThenTransfer
+            setu_types::event::EventPayload::CoinMergeThenTransfer { .. } => {
+                let ctx = ExecutionContext::new(
+                    self.config.solver_id.clone(),
+                    event.timestamp,
+                    false,
+                    Self::derive_tx_hash(&event.id),
+                );
+                if let setu_types::OperationType::MergeThenTransfer {
+                    target_index, source_indices, recipient, amount
+                } = &resolved_inputs.operation {
+                    let target_coin_id = resolved_inputs.input_objects[*target_index].object_id;
+                    let source_coin_ids: Vec<ObjectId> = source_indices.iter()
+                        .map(|&i| resolved_inputs.input_objects[i].object_id)
+                        .collect();
+                    let owner = local_runtime.state()
+                        .get_object(&target_coin_id)
+                        .map_err(|e| format!("Failed to read target coin: {}", e))?
+                        .ok_or_else(|| format!("Target coin {} not found", target_coin_id))?
+                        .metadata.owner
+                        .ok_or_else(|| "Target coin has no owner".to_string())?;
+
+                    let mut merge_output = local_runtime.execute_merge_coins(
+                        &owner, target_coin_id, &source_coin_ids, &ctx,
+                    ).map_err(|e| format!("Runtime merge error: {}", e))?;
+                    if !merge_output.success {
+                        return Err(merge_output.message.unwrap_or_else(|| "Merge failed".to_string()));
+                    }
+
+                    let transfer_output = local_runtime.execute_transfer_with_coin(
+                        target_coin_id,
+                        &owner.to_string(),
+                        &recipient.to_string(),
+                        Some(*amount),
+                        &ctx,
+                    ).map_err(|e| format!("Runtime transfer error: {}", e))?;
+                    if !transfer_output.success {
+                        return Err(transfer_output.message.unwrap_or_else(|| "Transfer failed".to_string()));
+                    }
+
+                    merge_output.state_changes.extend(transfer_output.state_changes);
+                    merge_output.created_objects.extend(transfer_output.created_objects);
+                    merge_output.deleted_objects.extend(transfer_output.deleted_objects);
+                    diff.add_state_changes(&merge_output.state_changes);
+                } else {
+                    return Err("CoinMergeThenTransfer payload but operation is not MergeThenTransfer".to_string());
+                }
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+
+            // MoveCall — only when move-vm feature is enabled
+            #[cfg(feature = "move-vm")]
+            setu_types::event::EventPayload::MoveCall(payload) => {
+                let engine = self.move_engine.as_ref()
+                    .ok_or("Move VM not enabled".to_string())?;
+
+                // 1. Construct InputObjects (R4-ISSUE-1: map+error propagation, not filter_map)
+                let input_objects: Vec<InputObject> = resolved_inputs.input_objects.iter()
+                    .map(|ro| {
+                        let env = local_runtime.state().get_envelope(&ro.object_id)
+                            .map_err(|e| format!("Failed to get envelope for {}: {}", ro.object_id, e))?
+                            .ok_or_else(|| format!("Object {} not found in store", ro.object_id))?;
+                        InputObject::from_envelope(&ro.object_id, &env)
+                            .map_err(|e| format!("Failed to convert object {}: {}", ro.object_id, e))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+
+                // 2. Parse ModuleId + function name
+                let addr = AccountAddress::from_hex_literal(&payload.package)
+                    .map_err(|e| format!("Invalid package address: {}", e))?;
+                let module_id = ModuleId::new(addr, Identifier::new(payload.module.as_str())
+                    .map_err(|e| format!("Invalid module name: {}", e))?);
+                let func_name = IdentStr::new(payload.function.as_str())
+                    .map_err(|e| format!("Invalid function name: {}", e))?;
+
+                // 3. Parse type_args
+                let type_args: Vec<TypeTag> = payload.type_args.iter()
+                    .map(|s| TypeTag::from_str(s))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("Invalid type arg: {}", e))?;
+
+                // 4. MoveExecutionContext
+                let move_ctx = MoveExecutionContext {
+                    tx_hash: Self::derive_tx_hash(&event.id),
+                    sender: Address::from_hex(&payload.sender)
+                        .map_err(|e| format!("Invalid sender: {}", e))?,
+                    gas_budget: 10_000_000,
+                    current_version: 0,
+                    epoch: 0,
+                    needs_tx_context: payload.needs_tx_context,
+                };
+
+                // 5. Assemble args (R3-ISSUE-7)
+                let combined_args = setu_move_vm::hybrid::build_move_call_args(
+                    &input_objects,
+                    &payload.args,
+                    payload.consumed_indices.as_deref().unwrap_or(&[]),
+                    payload.mutable_indices.as_deref().unwrap_or(&[]),
+                );
+
+                // 6. Execute
+                let output = engine.execute(
+                    local_runtime.state(),
+                    input_objects,
+                    &module_id,
+                    func_name,
+                    type_args,
+                    combined_args,
+                    &move_ctx,
+                ).map_err(|e| format!("Move VM error: {}", e))?;
+
+                if !output.success {
+                    return Err(output.error.unwrap_or("MoveCall failed".into()));
+                }
+
+                // 7. Write state changes to StateDiff
+                for sc in &output.state_changes {
+                    let key = setu_types::object_key(&sc.object_id);
+                    match &sc.new_state {
+                        Some(new_state) => {
+                            diff.add_write(WriteSetEntry::new(key, new_state.clone()));
+                        }
+                        None => {
+                            diff.add_delete(key);
+                        }
+                    }
+                }
+
+                // 8. Module changes to diff
+                for mc in &output.module_changes {
+                    match mc {
+                        setu_move_vm::engine::ModuleChange::Publish(id, bytes) => {
+                            diff.add_write(WriteSetEntry::new(
+                                format!("mod:{}::{}", id.address(), id.name()),
+                                bytes.clone(),
+                            ));
+                        }
+                    }
+                }
+
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+
+            _ => {}
+        }
+
+        // For non-transfer events, record in legacy state
+        let mut legacy_state = self.legacy_state.write().await;
+        self.record_event_processed(&mut legacy_state, event, diff);
+        Ok(())
+    }
+
     /// Execute a transfer event using the provided runtime
     /// 
     /// Uses resolved_inputs.primary_coin() to get the coin_id that Validator
@@ -510,13 +896,13 @@ impl MockEnclave {
     ///
     /// Used by both legacy (shared runtime via write lock) and solver-tee3
     /// (isolated runtime) execution paths.
-    async fn execute_transfer_with_local_runtime(
+    async fn execute_transfer_with_local_runtime<S: StateStore>(
         &self,
         event: &setu_types::Event,
         transfer: &setu_types::Transfer,
         resolved_inputs: &ResolvedInputs,
         diff: &mut StateDiff,
-        local_runtime: &mut RuntimeExecutor<InMemoryStateStore>,
+        local_runtime: &mut RuntimeExecutor<S>,
     ) -> Result<(), String> {
         let ctx = ExecutionContext::new(
             self.config.solver_id.clone(),
@@ -665,12 +1051,16 @@ impl EnclaveRuntime for MockEnclave {
         let use_read_set_state = !input.read_set.is_empty();
         
         let (diff, events_processed, events_failed) = if use_read_set_state {
-            // Build temporary state from read_set into a LOCAL store
-            let local_store = self.build_state_from_read_set(&input.read_set)?;
+            // Build temporary state from read_set into a LOCAL ObjectStore
+            let local_store = self.build_object_store_from_read_set(
+                &input.read_set,
+                &input.module_read_set,
+            )?;
             let local_runtime = RuntimeExecutor::new(local_store);
             
             info!(
                 read_set_entries = input.read_set.len(),
+                module_entries = input.module_read_set.len(),
                 "Using isolated read_set state for execution (solver-tee3 mode)"
             );
             
@@ -813,6 +1203,10 @@ impl MockEnclaveBuilder {
             runtime: Arc::new(RwLock::new(runtime)),
             legacy_state: Arc::new(RwLock::new(self.initial_state)),
             execution_count: Arc::new(RwLock::new(0)),
+            #[cfg(feature = "move-vm")]
+            move_engine: SetuMoveEngine::new_with_embedded_stdlib()
+                .ok()
+                .map(Arc::new),
         };
         
         enclave

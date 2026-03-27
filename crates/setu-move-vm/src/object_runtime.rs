@@ -28,6 +28,33 @@ pub struct InputObject {
     pub type_tag: StructTag,
 }
 
+impl InputObject {
+    /// Construct an InputObject from an ObjectEnvelope.
+    ///
+    /// Parses the envelope's type_tag string into a StructTag.
+    /// Returns error if parsing fails (malformed data, not a silent skip).
+    pub fn from_envelope(
+        id: &ObjectId,
+        env: &setu_types::ObjectEnvelope,
+    ) -> Result<Self, setu_runtime::error::RuntimeError> {
+        use std::str::FromStr;
+        let type_tag = StructTag::from_str(&env.type_tag).map_err(|e| {
+            setu_runtime::error::RuntimeError::InvalidTransaction(format!(
+                "Failed to parse type_tag '{}': {}",
+                env.type_tag, e
+            ))
+        })?;
+        Ok(Self {
+            id: *id,
+            owner: env.metadata.owner,
+            version: env.metadata.version,
+            envelope_bytes: env.to_bytes(),
+            move_data: env.data.clone(),
+            type_tag,
+        })
+    }
+}
+
 /// Transfer effect recorded by `native_transfer_internal`.
 pub struct ObjectTransferEffect {
     pub new_owner: AccountAddress,
