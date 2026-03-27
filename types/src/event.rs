@@ -168,6 +168,45 @@ impl EventType {
 }
 
 use crate::genesis::GenesisConfig;
+use crate::object::ObjectId;
+
+// ========== Move-specific Payload Types ==========
+
+/// Move function call payload (paired with EventType::ContractCall)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveCallPayload {
+    /// Transaction sender address (hex).
+    /// Validator MUST verify: sender == Event signer public key derived address.
+    pub sender: String,
+    /// Target module address (hex), e.g. "0x1"
+    pub package: String,
+    /// Module name, e.g. "coin"
+    pub module: String,
+    /// Function name, e.g. "transfer"
+    pub function: String,
+    /// Type arguments (Move TypeTag string representation)
+    pub type_args: Vec<String>,
+    /// Pure arguments — BCS serialized, no object references.
+    /// Mapped to `pure_args` in OperationType::MoveCall.
+    pub args: Vec<Vec<u8>>,
+    /// Input object IDs (referenced or consumed)
+    pub input_object_ids: Vec<ObjectId>,
+    /// Shared object IDs (Phase 0-4: must be empty — ADR-1)
+    pub shared_object_ids: Vec<ObjectId>,
+    /// Mutable reference indices into input_object_ids (&mut T params)
+    #[serde(default)]
+    pub mutable_indices: Option<Vec<usize>>,
+    /// Consumed object indices into input_object_ids (by-value T params)
+    #[serde(default)]
+    pub consumed_indices: Option<Vec<usize>>,
+}
+
+/// Move module publish payload (paired with EventType::ContractPublish)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovePublishPayload {
+    /// Compiled module bytecode (one package may contain multiple modules)
+    pub modules: Vec<Vec<u8>>,
+}
 
 // ========== Event Payload ==========
 
@@ -233,6 +272,10 @@ pub enum EventPayload {
         /// Amount to transfer after merge
         amount: u64,
     },
+    /// Move function call (paired with EventType::ContractCall)
+    MoveCall(MoveCallPayload),
+    /// Move module publish (paired with EventType::ContractPublish)
+    MovePublish(MovePublishPayload),
 }
 
 impl Default for EventPayload {
@@ -676,6 +719,16 @@ impl Event {
                 resources.extend(source_coin_ids.iter().map(|id| format!("coin:{}", id)));
                 resources.push(format!("user:{}", recipient));
                 resources
+            }
+            EventPayload::MoveCall(payload) => {
+                let mut resources: Vec<String> = payload.input_object_ids.iter()
+                    .map(|id| format!("oid:{}", hex::encode(id.as_bytes())))
+                    .collect();
+                resources.push(format!("contract:{}::{}::{}", payload.package, payload.module, payload.function));
+                resources
+            }
+            EventPayload::MovePublish(_) => {
+                vec![]
             }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {

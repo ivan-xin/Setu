@@ -43,6 +43,12 @@ pub struct SolverTask {
     
     /// Gas budget for execution
     pub gas_budget: GasBudget,
+
+    /// Move module bytecode needed for MoveCall execution.
+    /// Keys: "mod:{hex_addr}::{name}", values: raw bytecode.
+    /// Empty for non-MoveCall operations.
+    #[serde(default)]
+    pub module_read_set: Vec<ReadSetEntry>,
 }
 
 impl SolverTask {
@@ -62,6 +68,7 @@ impl SolverTask {
             pre_state_root,
             subnet_id,
             gas_budget: GasBudget::default(),
+            module_read_set: Vec::new(),
         }
     }
     
@@ -170,6 +177,31 @@ impl ResolvedInputs {
             input_objects: objects,
         }
     }
+
+    /// Create for Move function call
+    pub fn move_call(
+        package: String,
+        module_name: String,
+        function_name: String,
+        type_args: Vec<String>,
+        pure_args: Vec<Vec<u8>>,
+        input_objects: Vec<ResolvedObject>,
+        mutable_indices: Vec<usize>,
+        consumed_indices: Vec<usize>,
+    ) -> Self {
+        Self {
+            operation: OperationType::MoveCall {
+                package,
+                module_name,
+                function_name,
+                type_args,
+                pure_args,
+                mutable_indices,
+                consumed_indices,
+            },
+            input_objects,
+        }
+    }
     
     /// Get primary coin object (for Transfer)
     pub fn primary_coin(&self) -> Option<&ResolvedObject> {
@@ -187,6 +219,8 @@ impl ResolvedInputs {
             OperationType::MergeThenTransfer { target_index, .. } => {
                 self.input_objects.get(*target_index)
             }
+            OperationType::MoveCall { .. } => None,
+            OperationType::MovePublish { .. } => None,
         }
     }
 }
@@ -237,6 +271,30 @@ pub enum OperationType {
         recipient: crate::object::Address,
         /// Amount to transfer after merge
         amount: u64,
+    },
+
+    /// Move function call
+    MoveCall {
+        /// Module address (hex)
+        package: String,
+        /// Module name
+        module_name: String,
+        /// Function name
+        function_name: String,
+        /// Type arguments (Move TypeTag string representation)
+        type_args: Vec<String>,
+        /// Pure arguments (BCS serialized) — no object references
+        pure_args: Vec<Vec<u8>>,
+        /// Indices into input_objects that are mutable references (&mut T)
+        mutable_indices: Vec<usize>,
+        /// Indices into input_objects that are consumed (by value T)
+        consumed_indices: Vec<usize>,
+    },
+
+    /// Move module publish (Phase 0-4: goes through ROOT/RootSubnetExecutor, not TEE)
+    MovePublish {
+        /// Module bytecode list
+        modules: Vec<Vec<u8>>,
     },
 }
 

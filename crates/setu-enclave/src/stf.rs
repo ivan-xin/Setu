@@ -123,6 +123,21 @@ pub enum StfError {
     
     #[error("Internal enclave error: {0}")]
     InternalError(String),
+
+    #[error("Move VM execution error: {0}")]
+    VMExecutionError(String),
+
+    #[error("Move VM verification error: {0}")]
+    VMVerificationError(String),
+
+    #[error("Move module not found: {module_id}")]
+    ModuleNotFound { module_id: String },
+
+    #[error("Object type mismatch: expected {expected}, got {actual}")]
+    ObjectTypeMismatch { expected: String, actual: String },
+
+    #[error("Move VM not enabled")]
+    VMNotEnabled,
 }
 
 pub type StfResult<T> = Result<T, StfError>;
@@ -159,6 +174,12 @@ pub struct StfInput {
     
     /// Optional: anchor ID for context
     pub anchor_id: Option<u64>,
+
+    /// Move module bytecode (MoveCall execution needs these).
+    /// Keys: "mod:{hex_addr}::{name}", values: raw bytecode.
+    /// Empty for non-MoveCall transactions.
+    #[serde(default)]
+    pub module_read_set: Vec<ReadSetEntry>,
 }
 
 impl StfInput {
@@ -179,6 +200,7 @@ impl StfInput {
             resolved_inputs,
             gas_budget,
             anchor_id: None,
+            module_read_set: Vec::new(),
         }
     }
     

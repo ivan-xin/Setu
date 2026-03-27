@@ -25,3 +25,9 @@ tests/
 *.py
 .VSCodeCounter/
 docs/
+deploy/
+*.key
+ai/
+.github/
+.antigravity.yaml
+rustfmt.toml

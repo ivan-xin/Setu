@@ -10,6 +10,7 @@ pub mod object;
 pub mod subnet;          // Subnet (sub-application) types
 pub mod merkle;          // Merkle tree types for state commitment
 pub mod task;            // Task types for Validator → Solver communication
+pub mod envelope;        // ObjectEnvelope — unified storage for Move objects and legacy coins
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -37,6 +38,7 @@ pub use registration::{
 pub use event::{
     Event, EventId, EventStatus, EventType, EventPayload,
     ExecutionResult, StateChange,
+    MoveCallPayload, MovePublishPayload,
 };
 
 // State key format helpers
@@ -87,6 +89,9 @@ pub use account_view::AccountView;
 
 // Genesis config
 pub use genesis::{GenesisConfig, GenesisAccount, GenesisError};
+
+// Envelope types
+pub use envelope::{ObjectEnvelope, EnvelopeMetadata, StorageFormat, detect_and_parse, ENVELOPE_MAGIC};
 
 // Task types for Validator → Solver communication
 pub use task::{
