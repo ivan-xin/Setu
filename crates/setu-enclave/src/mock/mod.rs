@@ -437,6 +437,7 @@ impl MockEnclave {
                     processed.push(event.id.clone());
                 }
                 Err(reason) => {
+                    warn!(event_id = %event.id, error = %reason, "Event execution failed in isolated mode");
                     failed.push(FailedEvent {
                         event_id: event.id.clone(),
                         reason,
@@ -827,7 +828,7 @@ impl MockEnclave {
                 };
 
                 // 5. Assemble args (R3-ISSUE-7)
-                let combined_args = setu_move_vm::hybrid::build_move_call_args(
+                let (combined_args, mutable_arg_map) = setu_move_vm::hybrid::build_move_call_args(
                     &input_objects,
                     &payload.args,
                     payload.consumed_indices.as_deref().unwrap_or(&[]),
@@ -843,6 +844,7 @@ impl MockEnclave {
                     type_args,
                     combined_args,
                     &move_ctx,
+                    &mutable_arg_map,
                 ).map_err(|e| format!("Move VM error: {}", e))?;
 
                 if !output.success {
@@ -1048,7 +1050,7 @@ impl EnclaveRuntime for MockEnclave {
         // 
         // Previous bug: We replaced self.runtime with a new temp_store, causing
         // race conditions where concurrent tasks would see each other's (or empty) state.
-        let use_read_set_state = !input.read_set.is_empty();
+        let use_read_set_state = !input.read_set.is_empty() || !input.module_read_set.is_empty();
         
         let (diff, events_processed, events_failed) = if use_read_set_state {
             // Build temporary state from read_set into a LOCAL ObjectStore

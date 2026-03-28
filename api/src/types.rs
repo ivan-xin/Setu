@@ -102,6 +102,9 @@ pub struct MoveCallResponse {
     pub success: bool,
     /// Number of state changes produced
     pub state_changes: usize,
+    /// Created object IDs (hex-encoded, "oid:{hex}" keys from state changes)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_objects: Vec<String>,
     /// Error message (if failed)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

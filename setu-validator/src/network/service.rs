@@ -142,11 +142,13 @@ impl ValidatorNetworkService {
         );
 
         // Create HTTP client for sync Solver calls
+        // .no_proxy() prevents macOS system proxy from intercepting localhost calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(2))
             .pool_max_idle_per_host(200)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -221,11 +223,13 @@ impl ValidatorNetworkService {
         );
 
         // Create HTTP client for sync Solver calls
+        // .no_proxy() prevents macOS system proxy from intercepting localhost calls
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(2))
             .pool_max_idle_per_host(200)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -592,7 +596,18 @@ impl ValidatorNetworkService {
     // ============================================
 
     pub async fn submit_move_call(&self, request: setu_api::MoveCallRequest) -> setu_api::MoveCallResponse {
-        move_handler::MoveCallHandler::submit_move_call(request).await
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let state_provider = Arc::clone(self.batch_task_preparer.merkle_state_provider());
+        let response = move_handler::MoveCallHandler::submit_move_call(
+            &self.validator_id,
+            &self.task_preparer,
+            &self.router_manager,
+            &self.tee_executor,
+            &state_provider,
+            vlc_time,
+            request,
+        ).await;
+        response
     }
 
     pub async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {

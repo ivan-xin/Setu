@@ -9,6 +9,7 @@ Example Move contracts for the Setu network. Each demonstrates different aspects
 | [counter](counter/) | Owned objects, mutation via entry functions, transfer |
 | [custom_token](custom_token/) | Custom fungible token (Coin\<GOLD\>), TreasuryCap, mint/burn |
 | [nft](nft/) | Unique NFT objects, freeze (immutable), burn (delete) |
+| [lightning](lightning/) | Payment channel (Sui contract adaptation), Balance lifecycle, parallel-vector patterns |
 
 ## Prerequisites
 

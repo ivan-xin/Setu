@@ -232,7 +232,7 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 };
 
                 // Assemble args
-                let combined_args = build_move_call_args(
+                let (combined_args, mutable_arg_map) = build_move_call_args(
                     &input_objects, pure_args, consumed_indices, mutable_indices,
                 );
 
@@ -245,6 +245,7 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                     ty_args,
                     combined_args,
                     &move_ctx,
+                    &mutable_arg_map,
                 )?;
 
                 if !move_output.success {
@@ -297,34 +298,42 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
 
 /// Assemble Move function call arguments in the correct order.
 ///
-/// Order: [consumed_obj_bcs..., mutable_obj_bcs..., pure_args...]
+/// Returns `(args, mutable_arg_map)` where `mutable_arg_map` maps
+/// each `&mut` argument's position in `args` to its input ObjectId.
 /// TxContext is handled by engine.execute() internally.
 pub fn build_move_call_args(
     input_objects: &[InputObject],
     pure_args: &[Vec<u8>],
     consumed_indices: &[usize],
     mutable_indices: &[usize],
-) -> Vec<Vec<u8>> {
+) -> (Vec<Vec<u8>>, Vec<(usize, setu_types::ObjectId)>) {
     let mut args = Vec::new();
+    let mut mutable_arg_map = Vec::new();
+    let mutable_set: std::collections::HashSet<usize> = mutable_indices.iter().copied().collect();
 
-    // 1. By-value object params (consumed)
-    for &idx in consumed_indices {
+    // Input objects are placed first, in their original index order.
+    // Both consumed (by-value) and mutable (&mut) objects contribute their
+    // BCS data to the args vector. The parameter order in the Move function
+    // must match the order of input_object_ids.
+    let object_indices: std::collections::BTreeSet<usize> = consumed_indices.iter()
+        .chain(mutable_indices.iter())
+        .copied()
+        .collect();
+
+    for &idx in &object_indices {
         if idx < input_objects.len() {
+            let arg_pos = args.len();
             args.push(input_objects[idx].move_data.clone());
+            if mutable_set.contains(&idx) {
+                mutable_arg_map.push((arg_pos, input_objects[idx].id));
+            }
         }
     }
 
-    // 2. &mut object params (mutable references)
-    for &idx in mutable_indices {
-        if idx < input_objects.len() {
-            args.push(input_objects[idx].move_data.clone());
-        }
-    }
-
-    // 3. Pure arguments (BCS)
+    // Pure arguments follow all object args
     args.extend_from_slice(pure_args);
 
-    args
+    (args, mutable_arg_map)
 }
 
 #[cfg(test)]
@@ -390,11 +399,15 @@ mod tests {
         let consumed = &[0usize]; // obj_a consumed
         let mutable = &[1usize]; // obj_b mutable
 
-        let args = build_move_call_args(&[obj_a, obj_b], &pure, consumed, mutable);
+        let (args, mutable_arg_map) = build_move_call_args(&[obj_a, obj_b], &pure, consumed, mutable);
         assert_eq!(args.len(), 3);
         assert_eq!(args[0], vec![0xA0]); // consumed first
         assert_eq!(args[1], vec![0xB0]); // mutable second
         assert_eq!(args[2], vec![0xCC]); // pure last
+        // mutable_arg_map: obj_b (index 1) is mutable, at arg position 1
+        assert_eq!(mutable_arg_map.len(), 1);
+        assert_eq!(mutable_arg_map[0].0, 1); // arg position
+        assert_eq!(mutable_arg_map[0].1, setu_types::ObjectId::new([0xBB; 32])); // object ID
     }
 
     #[test]

@@ -401,6 +401,16 @@ impl RouterManager {
     pub fn get_all_solvers(&self) -> Vec<SolverConnection> {
         self.solver_registry.read().values().cloned().collect()
     }
+
+    /// Route a generic task (non-transfer) to any available solver
+    pub fn route_any(&self) -> Result<String, RouterError> {
+        let solvers = self.solver_registry.read();
+        solvers
+            .values()
+            .find(|s| s.is_available())
+            .map(|s| s.id.clone())
+            .ok_or(RouterError::NoSolverAvailable)
+    }
 }
 
 impl Default for RouterManager {

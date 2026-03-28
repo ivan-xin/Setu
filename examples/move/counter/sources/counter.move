@@ -11,13 +11,27 @@
 //   POST /api/v1/move/publish { "sender": "alice", "modules": ["<hex bytecode>"] }
 //
 // Usage:
+//   # Create a counter (needs TxContext for UID generation)
 //   POST /api/v1/move/call {
-//     "sender": "alice",
-//     "package": "<package_addr>",
-//     "module": "counter",
-//     "function": "create",
-//     "type_args": [],
-//     "args": []
+//     "sender": "alice", "package": "0xcafe", "module": "counter",
+//     "function": "create", "needs_tx_context": true
+//   }
+//
+//   # Increment (pass counter as &mut, no TxContext needed)
+//   POST /api/v1/move/call {
+//     "sender": "alice", "package": "0xcafe", "module": "counter",
+//     "function": "increment",
+//     "input_object_ids": ["<counter_id>"], "mutable_indices": [0],
+//     "needs_tx_context": false
+//   }
+//
+//   # Increment by amount (pure arg = BCS little-endian u64)
+//   POST /api/v1/move/call {
+//     "sender": "alice", "package": "0xcafe", "module": "counter",
+//     "function": "increment_by",
+//     "input_object_ids": ["<counter_id>"], "mutable_indices": [0],
+//     "args": ["0a00000000000000"],
+//     "needs_tx_context": false
 //   }
 module examples::counter {
     use setu::object::{Self, UID};

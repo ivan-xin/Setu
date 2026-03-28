@@ -544,6 +544,18 @@ impl Event {
         event
     }
 
+    /// Create a Move function call event (ContractCall)
+    pub fn move_call(
+        payload: MoveCallPayload,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::ContractCall, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MoveCall(payload);
+        event
+    }
+
     /// Create a contract publish event (Move module deployment)
     pub fn contract_publish(
         sender: String,

@@ -192,6 +192,10 @@ impl SetuMoveEngine {
     }
 
     /// Execute a Move function call.
+    ///
+    /// `mutable_arg_map` maps each `&mut` argument's position in `args`
+    /// to its input ObjectId, so that post-execution mutations captured
+    /// in `mutable_reference_outputs` can be recorded as state changes.
     #[allow(clippy::too_many_arguments)]
     pub fn execute<S: RawStore>(
         &self,
@@ -202,6 +206,7 @@ impl SetuMoveEngine {
         type_args: Vec<TypeTag>,
         args: Vec<Vec<u8>>,
         ctx: &MoveExecutionContext,
+        mutable_arg_map: &[(usize, ObjectId)],
     ) -> Result<MoveExecutionOutput, RuntimeError> {
         // 1. Resolver
         let resolver = SetuModuleResolver::new(store, &self.stdlib_modules);
@@ -246,8 +251,32 @@ impl SetuMoveEngine {
                     .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
 
                 // 9. Extract object runtime
-                let obj_runtime: SetuObjectRuntime = native_ext.remove::<SetuObjectRuntime>()
+                let mut obj_runtime: SetuObjectRuntime = native_ext.remove::<SetuObjectRuntime>()
                     .map_err(|e| RuntimeError::VMExecutionError(e.to_string()))?;
+
+                // 9.5. Process mutable_reference_outputs — capture &mut arg mutations
+                // The Move VM serializes mutated &mut arguments back in
+                // SerializedReturnValues.mutable_reference_outputs.
+                // Each entry: (LocalIndex = arg position, bcs_bytes, layout).
+                for (local_idx, bcs_bytes, _layout) in &return_values.mutable_reference_outputs {
+                    let arg_idx = *local_idx as usize;
+                    if let Some(&(_, object_id)) = mutable_arg_map.iter()
+                        .find(|(pos, _)| *pos == arg_idx)
+                    {
+                        // Look up the original input object to get its StructTag
+                        if let Some(input_obj) = obj_runtime.get_input_object(&object_id) {
+                            let type_tag = input_obj.type_tag.clone();
+                            obj_runtime.mutate_object(object_id, type_tag, bcs_bytes.clone());
+                        } else {
+                            tracing::warn!(
+                                arg_idx,
+                                object_id = %object_id,
+                                "Input object not found for mutated &mut arg, skipping"
+                            );
+                        }
+                    }
+                }
+
                 let obj_results = obj_runtime.into_results();
 
                 // 10. Extract module changes from ChangeSet
