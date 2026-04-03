@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn test_transfer_event() {
         let transfer = Transfer::new("tx-1", "alice", "bob", 100)
-            .with_type(TransferType::FluxTransfer);
+            .with_type(TransferType::SetuTransfer);
         
         let event = Event::transfer(
             transfer,

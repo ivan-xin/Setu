@@ -441,7 +441,7 @@ impl ValidatorNetworkService {
             .route("/api/v1/user/account", post(setu_api::http_get_account::<ValidatorNetworkService>))
             .route("/api/v1/user/balance", post(setu_api::http_get_user_balance::<ValidatorNetworkService>))
             .route("/api/v1/user/power", post(setu_api::http_get_power::<ValidatorNetworkService>))
-            .route("/api/v1/user/credit", post(setu_api::http_get_credit::<ValidatorNetworkService>))
+            .route("/api/v1/user/flux", post(setu_api::http_get_flux::<ValidatorNetworkService>))
             .route("/api/v1/user/credentials", post(setu_api::http_get_credentials::<ValidatorNetworkService>))
             .route("/api/v1/user/transfer", post(setu_api::http_user_transfer::<ValidatorNetworkService>))
             // Phase 3: Profile & Subnet Membership

@@ -17,6 +17,7 @@ pub mod profile;        // Profile & Credential (identity)
 pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
 pub mod genesis;        // Genesis configuration
+pub mod resource;       // Resource types: FluxState, PowerState, governance
 
 // Re-export VLC types from setu-vlc (single source of truth)
 pub use setu_vlc::{VectorClock, VLCSnapshot};
@@ -87,6 +88,13 @@ pub use account_view::AccountView;
 
 // Genesis config
 pub use genesis::{GenesisConfig, GenesisAccount, GenesisError};
+
+// Resource model (Power / Flux)
+pub use resource::{
+    FluxState, PowerState, ResourceGovernanceMode, AtomicGovernanceMode,
+    flux_state_object_id, power_state_object_id,
+    INITIAL_POWER, INITIAL_FLUX,
+};
 
 // Task types for Validator → Solver communication
 pub use task::{
