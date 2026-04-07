@@ -18,6 +18,7 @@ pub mod relation;       // RelationGraph object (social)
 pub mod account_view;   // Account aggregated view
 pub mod genesis;        // Genesis configuration
 pub mod resource;       // Resource types: FluxState, PowerState, governance
+pub mod governance;     // Governance proposal types
 
 // Re-export VLC types from setu-vlc (single source of truth)
 pub use setu_vlc::{VectorClock, VLCSnapshot};
@@ -88,6 +89,12 @@ pub use account_view::AccountView;
 
 // Genesis config
 pub use genesis::{GenesisConfig, GenesisAccount, GenesisError};
+
+// Governance types
+pub use governance::{
+    GovernancePayload, GovernanceAction, ProposalContent, ProposalType, ProposalEffect,
+    GovernanceDecision, GovernanceProposal, ProposalStatus,
+};
 
 // Resource model (Power / Flux)
 pub use resource::{

@@ -364,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
                             key,
                             old_value: None,
                             new_value: Some(coin_state.to_bytes()),
+                            target_subnet: None,
                         });
                         info!(
                             name = ?account.name,
@@ -409,6 +410,7 @@ async fn main() -> anyhow::Result<()> {
                                 key,
                                 old_value: None,
                                 new_value: Some(coin_state.to_bytes()),
+                                target_subnet: None,
                             });
                         }
                         info!(

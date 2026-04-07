@@ -131,6 +131,7 @@ impl StateChange {
             key: setu_types::object_key(&self.object_id),
             old_value: self.old_state.clone(),
             new_value: self.new_state.clone(),
+            target_subnet: None,
         }
     }
 }

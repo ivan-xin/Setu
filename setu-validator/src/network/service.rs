@@ -763,6 +763,20 @@ impl ValidatorNetworkService {
                 self.solver_info.remove(&unreg.node_id);
                 ReplayAction::Applied(ReplayKind::SolverUnregister)
             }
+            EventPayload::Governance(payload) => {
+                // During replay, governance events are tracked for statistics.
+                // The actual proposal state is persisted in GOVERNANCE subnet SMT
+                // and will be recovered via apply_committed_events, not here.
+                use setu_types::governance::GovernanceAction;
+                match &payload.action {
+                    GovernanceAction::Propose(_) => {
+                        ReplayAction::Applied(ReplayKind::GovernancePropose)
+                    }
+                    GovernanceAction::Execute { .. } => {
+                        ReplayAction::Applied(ReplayKind::GovernanceExecute)
+                    }
+                }
+            }
             _ => ReplayAction::Skipped,
         }
     }

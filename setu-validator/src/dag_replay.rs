@@ -7,6 +7,7 @@
 use crate::ValidatorNetworkService;
 use setu_storage::EventStoreBackend;
 use setu_types::{Event, EventPayload};
+use setu_types::governance::GovernanceAction;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -27,6 +28,8 @@ pub enum ReplayKind {
     ValidatorUnregister,
     SolverRegister,
     SolverUnregister,
+    GovernancePropose,
+    GovernanceExecute,
 }
 
 /// Statistics collected during a replay run.
@@ -40,6 +43,8 @@ pub struct ReplayStats {
     pub validators_unregistered: usize,
     pub solvers_registered: usize,
     pub solvers_unregistered: usize,
+    pub governance_proposals: usize,
+    pub governance_executions: usize,
     pub errors: usize,
     pub duration_ms: u64,
 }
@@ -119,6 +124,8 @@ impl DagReplayManager {
                             ReplayKind::ValidatorUnregister => stats.validators_unregistered += 1,
                             ReplayKind::SolverRegister => stats.solvers_registered += 1,
                             ReplayKind::SolverUnregister => stats.solvers_unregistered += 1,
+                            ReplayKind::GovernancePropose => stats.governance_proposals += 1,
+                            ReplayKind::GovernanceExecute => stats.governance_executions += 1,
                         }
                     }
                     ReplayAction::Skipped => {
