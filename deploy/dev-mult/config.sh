@@ -93,24 +93,32 @@ remote_sync() {
     if [ "${4:-}" = "--no-delete" ]; then
         rsync_opts=""
     fi
+
+    local exclude_opts=(
+        --exclude 'target/'
+        --exclude '.git/'
+        --exclude '.github/'
+        --exclude 'logs/'
+        --exclude 'deploy/'
+        --exclude 'docs/'
+        --exclude 'ai/'
+        --exclude 'keys/'
+        --exclude 'tests/'
+        --exclude 'docker/'
+        --exclude 'scripts/'
+        --exclude 'setu-framework/compiled/'
+        --exclude '*.md'
+        --exclude '*.log'
+    )
+
     if command -v sshpass &>/dev/null; then
         SSHPASS="$SSH_PWD" rsync -az $rsync_opts \
-            --exclude 'target/' \
-            --exclude '.git/' \
-            --exclude 'logs/' \
-            --exclude 'deploy/' \
-            --exclude 'docs/' \
-            --exclude '*.log' \
+            "${exclude_opts[@]}" \
             -e "sshpass -e ssh $SSH_OPTS" \
             "$src" "${SSH_USER}@${host}:${dest}"
     else
         rsync -az $rsync_opts \
-            --exclude 'target/' \
-            --exclude '.git/' \
-            --exclude 'logs/' \
-            --exclude 'deploy/' \
-            --exclude 'docs/' \
-            --exclude '*.log' \
+            "${exclude_opts[@]}" \
             -e "ssh $SSH_OPTS" \
             "$src" "${SSH_USER}@${host}:${dest}"
     fi
