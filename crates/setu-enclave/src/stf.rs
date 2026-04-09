@@ -123,6 +123,21 @@ pub enum StfError {
     
     #[error("Internal enclave error: {0}")]
     InternalError(String),
+
+    #[error("Move VM execution error: {0}")]
+    VMExecutionError(String),
+
+    #[error("Move VM verification error: {0}")]
+    VMVerificationError(String),
+
+    #[error("Move module not found: {module_id}")]
+    ModuleNotFound { module_id: String },
+
+    #[error("Object type mismatch: expected {expected}, got {actual}")]
+    ObjectTypeMismatch { expected: String, actual: String },
+
+    #[error("Move VM not enabled")]
+    VMNotEnabled,
 }
 
 pub type StfResult<T> = Result<T, StfError>;
@@ -159,6 +174,12 @@ pub struct StfInput {
     
     /// Optional: anchor ID for context
     pub anchor_id: Option<u64>,
+
+    /// Move module bytecode (MoveCall execution needs these).
+    /// Keys: "mod:{hex_addr}::{name}", values: raw bytecode.
+    /// Empty for non-MoveCall transactions.
+    #[serde(default)]
+    pub module_read_set: Vec<ReadSetEntry>,
 }
 
 impl StfInput {
@@ -179,6 +200,7 @@ impl StfInput {
             resolved_inputs,
             gas_budget,
             anchor_id: None,
+            module_read_set: Vec::new(),
         }
     }
     
@@ -194,6 +216,11 @@ impl StfInput {
     
     pub fn with_anchor(mut self, anchor_id: u64) -> Self {
         self.anchor_id = Some(anchor_id);
+        self
+    }
+
+    pub fn with_module_read_set(mut self, module_read_set: Vec<ReadSetEntry>) -> Self {
+        self.module_read_set = module_read_set;
         self
     }
     
@@ -496,5 +523,27 @@ mod tests {
             .with_proof(vec![1, 2, 3]);
         
         assert!(entry.proof.is_some());
+    }
+
+    #[test]
+    fn test_stf_input_with_module_read_set() {
+        let task_id = [42u8; 32];
+        let input = StfInput::new(
+            task_id,
+            SubnetId::ROOT,
+            [0u8; 32],
+            ResolvedInputs::new(),
+            GasBudget::default(),
+        );
+        // Default: empty module_read_set
+        assert!(input.module_read_set.is_empty());
+
+        // Builder sets the field
+        let modules = vec![
+            ReadSetEntry::new("mod:0xdead::counter".to_string(), vec![0xCA, 0xFE]),
+        ];
+        let input2 = input.with_module_read_set(modules.clone());
+        assert_eq!(input2.module_read_set.len(), 1);
+        assert_eq!(input2.module_read_set[0].key, "mod:0xdead::counter");
     }
 }

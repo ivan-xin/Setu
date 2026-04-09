@@ -893,6 +893,163 @@ impl TaskPreparer {
         
         parent_ids
     }
+
+    // ========== Phase 4: MoveCall task preparation ==========
+
+    /// Prepare a SolverTask for a MoveCall request
+    ///
+    /// Collects input objects, resolves module dependencies, and builds
+    /// a SolverTask with ResolvedInputs::MoveCall + module_read_set.
+    pub fn prepare_move_call_task(
+        &self,
+        event: &setu_types::Event,
+        call: &setu_types::event::MoveCallPayload,
+        subnet_id: SubnetId,
+    ) -> Result<SolverTask, TaskPrepareError> {
+        // ADR-1: reject shared objects
+        if !call.shared_object_ids.is_empty() {
+            return Err(TaskPrepareError::SharedObjectNotSupported);
+        }
+
+        // 1. Collect input objects
+        let mut read_set = Vec::new();
+        let mut resolved_objects = Vec::new();
+
+        for object_id in &call.input_object_ids {
+            let data = self.state_provider.get_object(object_id)
+                .ok_or_else(|| TaskPrepareError::ObjectNotFound(
+                    hex::encode(object_id.as_bytes()),
+                ))?;
+
+            let key = format!("oid:{}", hex::encode(object_id.as_bytes()));
+            read_set.push(ReadSetEntry::new(key, data.clone()));
+
+            // Extract version from ObjectEnvelope if present, otherwise 0
+            let version = match setu_types::envelope::detect_and_parse(&data) {
+                setu_types::envelope::StorageFormat::Envelope(env) => env.metadata.version,
+                _ => 0,
+            };
+
+            resolved_objects.push(ResolvedObject {
+                object_id: *object_id,
+                object_type: "MoveObject".to_string(),
+                expected_version: version,
+            });
+        }
+
+        // 2. Validate indices
+        let mutable_indices = call.mutable_indices.clone().unwrap_or_default();
+        let consumed_indices = call.consumed_indices.clone().unwrap_or_default();
+        let obj_count = call.input_object_ids.len();
+        for &idx in mutable_indices.iter().chain(consumed_indices.iter()) {
+            if idx >= obj_count {
+                return Err(TaskPrepareError::InvalidInput(format!(
+                    "Index {} out of range (object count: {})", idx, obj_count
+                )));
+            }
+        }
+
+        // 3. Resolve module dependencies
+        let module_read_set = self.resolve_module_dependencies(&call.package, &call.module)?;
+
+        // 4. Build ResolvedInputs::MoveCall
+        let resolved_inputs = ResolvedInputs::move_call(
+            call.package.clone(),
+            call.module.clone(),
+            call.function.clone(),
+            call.type_args.clone(),
+            call.args.clone(),
+            resolved_objects,
+            mutable_indices,
+            consumed_indices,
+        );
+
+        // 5. Derive dependencies (for future DAG ordering)
+        let _parent_ids = self.derive_dependencies(
+            &call.input_object_ids.iter().collect::<Vec<_>>(),
+        );
+
+        // 6. Build SolverTask
+        let task_id = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TASK:");
+            hasher.update(event.id.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        let pre_state_root = self.state_provider.get_state_root();
+
+        Ok(SolverTask {
+            task_id,
+            subnet_id,
+            pre_state_root,
+            event: event.clone(),
+            read_set,
+            resolved_inputs,
+            gas_budget: setu_types::task::GasBudget::default(),
+            module_read_set,
+        })
+    }
+
+    /// Resolve transitive module dependencies for a MoveCall
+    ///
+    /// Walks the dependency graph via move-binary-format deserialization,
+    /// loading each module from storage. Skips stdlib (0x1) since it's
+    /// embedded in the binary.
+    fn resolve_module_dependencies(
+        &self,
+        package_addr: &str,
+        module_name: &str,
+    ) -> Result<Vec<ReadSetEntry>, TaskPrepareError> {
+        use move_binary_format::CompiledModule;
+
+        const MAX_MODULE_DEPENDENCIES: usize = 256;
+        const STDLIB_ADDRS: &[&str] = &[
+            "0x1",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        ];
+
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![(package_addr.to_string(), module_name.to_string())];
+
+        while let Some((addr, name)) = stack.pop() {
+            let key = format!("mod:{}::{}", addr, name);
+            if visited.contains(&key) {
+                continue;
+            }
+            if visited.len() >= MAX_MODULE_DEPENDENCIES {
+                return Err(TaskPrepareError::TooManyDependencies {
+                    max: MAX_MODULE_DEPENDENCIES,
+                    found: visited.len() + 1,
+                });
+            }
+            visited.insert(key.clone());
+
+            // Skip stdlib — embedded in binary
+            if STDLIB_ADDRS.iter().any(|&a| addr == a) {
+                continue;
+            }
+
+            // Load from storage
+            let bytecode = self.state_provider.get_raw(&key)
+                .ok_or_else(|| TaskPrepareError::ModuleNotFound(key.clone()))?;
+
+            result.push(ReadSetEntry::new(key, bytecode.clone()));
+
+            // Parse dependencies
+            let compiled = CompiledModule::deserialize_with_defaults(&bytecode)
+                .map_err(|e| TaskPrepareError::InvalidModule(format!("{}: {}", name, e)))?;
+            for dep in compiled.immediate_dependencies() {
+                stack.push((
+                    dep.address().to_hex_literal(),
+                    dep.name().to_string(),
+                ));
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -1086,5 +1243,148 @@ mod tests {
             }
             _ => panic!("Expected NeedMerge"),
         }
+    }
+
+    // ========== MoveCall preparation tests ==========
+
+    /// Helper: create a valid Move module bytecode with the given address and name
+    fn make_module_bytes(
+        addr: move_binary_format::file_format::AddressIdentifierIndex,
+        addr_val: move_core_types::account_address::AccountAddress,
+        name: &str,
+    ) -> Vec<u8> {
+        use move_binary_format::file_format::*;
+        let mut module = empty_module();
+        module.address_identifiers[0] = addr_val;
+        module.identifiers[0] = move_core_types::identifier::Identifier::new(name).unwrap();
+        let mut buf = Vec::new();
+        module.serialize_with_version(move_binary_format::file_format_common::VERSION_MAX, &mut buf)
+            .expect("serialize module");
+        buf
+    }
+
+    /// Helper: create a TaskPreparer backed by a fresh state with a module stored
+    fn make_preparer_with_module(module_key: &str, module_bytes: &[u8]) -> TaskPreparer {
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider};
+        use setu_types::event::StateChange;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let mut gsm = shared.lock_write();
+            let sc = StateChange::insert(module_key.to_string(), module_bytes.to_vec());
+            gsm.apply_state_change(SubnetId::ROOT, &sc);
+            shared.publish_snapshot(&gsm);
+        }
+        let provider: Arc<dyn StateProvider> = Arc::new(MerkleStateProvider::new(shared));
+        TaskPreparer::new("validator-test".to_string(), provider)
+    }
+
+    fn test_move_call_payload(package: &str, module: &str, function: &str) -> setu_types::event::MoveCallPayload {
+        setu_types::event::MoveCallPayload {
+            sender: "alice".to_string(),
+            package: package.to_string(),
+            module: module.to_string(),
+            function: function.to_string(),
+            type_args: vec![],
+            args: vec![],
+            input_object_ids: vec![],
+            shared_object_ids: vec![],
+            mutable_indices: None,
+            consumed_indices: None,
+            needs_tx_context: false,
+        }
+    }
+
+    fn test_event() -> setu_types::Event {
+        setu_types::Event::new(
+            setu_types::event::EventType::ContractCall,
+            vec![],
+            setu_types::event::VLCSnapshot {
+                vector_clock: setu_vlc::VectorClock::new(),
+                logical_time: 1,
+                physical_time: 1000,
+            },
+            "alice".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_prepare_move_call_task_basic() {
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+        let preparer = make_preparer_with_module(&module_key, &bytecode);
+        let event = test_event();
+        let call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(result.is_ok(), "Error: {:?}", result.unwrap_err());
+        let task = result.unwrap();
+
+        // Verify module_read_set populated
+        assert!(!task.module_read_set.is_empty());
+        assert!(task.module_read_set[0].key.contains("counter"));
+
+        // Verify ResolvedInputs is MoveCall
+        match &task.resolved_inputs.operation {
+            OperationType::MoveCall { package, module_name, function_name, .. } => {
+                assert!(package.contains("dead"));
+                assert_eq!(module_name, "counter");
+                assert_eq!(function_name, "increment");
+            }
+            _ => panic!("Expected MoveCall operation"),
+        }
+    }
+
+    #[test]
+    fn test_prepare_move_call_shared_objects_rejected() {
+        let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+        let event = test_event();
+        let mut call = test_move_call_payload("0x1", "coin", "transfer");
+        call.shared_object_ids = vec![ObjectId::new([0xAA; 32])];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::SharedObjectNotSupported)));
+    }
+
+    #[test]
+    fn test_resolve_module_dependencies_missing_module() {
+        // Preparer with no modules stored
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider};
+        use std::sync::Arc;
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let gsm = shared.lock_write();
+            shared.publish_snapshot(&gsm);
+        }
+        let provider: Arc<dyn StateProvider> = Arc::new(MerkleStateProvider::new(shared));
+        let preparer = TaskPreparer::new("validator-test".to_string(), provider);
+
+        let result = preparer.resolve_module_dependencies("0xdead", "counter");
+        assert!(matches!(result, Err(TaskPrepareError::ModuleNotFound(_))));
+    }
+
+    #[test]
+    fn test_resolve_module_dependencies_stdlib_skipped() {
+        // Ask to resolve a stdlib module — should return empty (stdlib is embedded)
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider};
+        use std::sync::Arc;
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let gsm = shared.lock_write();
+            shared.publish_snapshot(&gsm);
+        }
+        let provider: Arc<dyn StateProvider> = Arc::new(MerkleStateProvider::new(shared));
+        let preparer = TaskPreparer::new("validator-test".to_string(), provider);
+
+        // "0x1" is stdlib — should be skipped entirely
+        let result = preparer.resolve_module_dependencies("0x1", "vector");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }

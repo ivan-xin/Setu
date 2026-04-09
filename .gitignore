@@ -25,3 +25,13 @@ tests/
 *.py
 .VSCodeCounter/
 docs/
+deploy/
+*.key
+ai/
+
+# Move framework build output (Sui CLI)
+setu-framework/build/
+.github/
+.antigravity.yaml
+rustfmt.toml
+setu-framework/compiled/.gitkeep

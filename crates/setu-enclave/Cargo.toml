@@ -10,11 +10,14 @@ default = ["mock"]
 mock = []
 # AWS Nitro Enclave for production
 nitro = ["aws-nitro-enclaves-nsm-api"]
+# Move VM integration (adds SetuMoveEngine support)
+move-vm = ["dep:setu-move-vm"]
 
 [dependencies]
 setu-types = { path = "../../types" }
 setu-runtime = { path = "../setu-runtime" }
 setu-merkle = { path = "../setu-merkle" }
+setu-move-vm = { path = "../setu-move-vm", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -99,6 +99,18 @@ pub enum TaskPrepareError {
     
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Module not found: {0}")]
+    ModuleNotFound(String),
+
+    #[error("Invalid module bytecode: {0}")]
+    InvalidModule(String),
+
+    #[error("Too many module dependencies (max {max}): found {found}")]
+    TooManyDependencies { max: usize, found: usize },
+
+    #[error("Shared objects not supported (ADR-1)")]
+    SharedObjectNotSupported,
 }
 
 /// Convert SimpleMerkleProof to MerkleProof (for TEE)

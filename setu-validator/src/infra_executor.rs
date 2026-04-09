@@ -215,6 +215,95 @@ impl InfraExecutor {
         Ok(event)
     }
 
+    // ========== Phase 4: Move VM Contract Publish ==========
+
+    /// Execute a ContractPublish event (Move module deployment)
+    ///
+    /// Verifies Move bytecode and stores modules in ROOT subnet SMT.
+    /// Follows the same pattern as execute_subnet_register():
+    /// execute → eager apply state → set execution_result → return Event
+    pub fn execute_contract_publish(
+        &self,
+        sender: &str,
+        modules_bytes: &[Vec<u8>],
+        vlc_snapshot: VLCSnapshot,
+    ) -> Result<Event, String> {
+        use move_binary_format::CompiledModule;
+        use move_bytecode_verifier::verify_module_unmetered;
+
+        if modules_bytes.is_empty() {
+            return Err("Empty module list".into());
+        }
+
+        let mut state_changes: Vec<EventStateChange> = Vec::new();
+
+        for module_bytes in modules_bytes {
+            // 1. Deserialize
+            let compiled = CompiledModule::deserialize_with_defaults(module_bytes)
+                .map_err(|e| format!("Module deserialization failed: {}", e))?;
+
+            // 2. Bytecode verification
+            verify_module_unmetered(&compiled)
+                .map_err(|e| format!("Bytecode verification failed: {}", e))?;
+
+            // 3. Build "mod:{addr}::{name}" key
+            let module_addr = compiled.self_id().address().to_hex_literal();
+            let module_name = compiled.self_id().name().to_string();
+            let module_key = format!("mod:{}::{}", module_addr, module_name);
+
+            // 4. ADR-4: reject duplicate publish — check on-chain state
+            if self.state_provider.get_raw_data(&module_key).is_some() {
+                return Err(format!("Module already published (ADR-4): {}", module_key));
+            }
+
+            // 5. In-batch duplicate check
+            if state_changes.iter().any(|sc| sc.key == module_key) {
+                return Err(format!("Duplicate module in batch: {}", module_key));
+            }
+
+            // 6. Build StateChange (key = "mod:{addr}::{name}", value = raw bytecode)
+            state_changes.push(EventStateChange::insert(
+                module_key,
+                module_bytes.clone(),
+            ));
+        }
+
+        // 7. Eagerly apply state changes to MerkleStateProvider
+        {
+            let shared = self.state_provider.shared_state_manager();
+            let mut manager = shared.lock_write();
+            for sc in &state_changes {
+                manager.apply_state_change(SubnetId::ROOT, sc);
+            }
+            shared.publish_snapshot(&manager);
+        }
+
+        // 8. Build Event
+        let mut event = Event::contract_publish(
+            sender.to_string(),
+            modules_bytes.to_vec(),
+            vec![], // No parent events
+            vlc_snapshot,
+            self.validator_id.clone(),
+        );
+
+        // 9. Set execution_result
+        event.set_execution_result(ExecutionResult {
+            success: true,
+            message: Some(format!("{} module(s) published", state_changes.len())),
+            state_changes,
+        });
+
+        info!(
+            sender = %sender,
+            module_count = modules_bytes.len(),
+            event_id = %event.id,
+            "Contract published by Validator"
+        );
+
+        Ok(event)
+    }
+
     /// Apply state changes to the MerkleStateProvider
     ///
     /// Routes through `apply_state_change()` which handles both SMT updates
@@ -532,5 +621,99 @@ mod tests {
         // Delete: new_value = None
         assert!(er.state_changes[0].new_value.is_none());
         assert!(er.state_changes[1].new_value.is_none());
+    }
+
+    /// Helper: create a valid Move module with a given address and name
+    fn make_module_bytes(addr: move_core_types::account_address::AccountAddress, name: &str) -> Vec<u8> {
+        use move_binary_format::file_format::*;
+        let mut module = empty_module();
+        module.address_identifiers[0] = addr;
+        module.identifiers[0] = move_core_types::identifier::Identifier::new(name).unwrap();
+        let mut buf = Vec::new();
+        module.serialize_with_version(move_binary_format::file_format_common::VERSION_MAX, &mut buf)
+            .expect("serialize empty module");
+        buf
+    }
+
+    #[test]
+    fn test_execute_contract_publish_basic() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead")
+            .expect("valid addr");
+        let module_bytes = make_module_bytes(addr, "counter");
+
+        let result = executor.execute_contract_publish("alice", &[module_bytes], test_vlc());
+        assert!(result.is_ok());
+        let event = result.unwrap();
+        assert_eq!(event.event_type, setu_types::event::EventType::ContractPublish);
+        let er = event.execution_result.as_ref().unwrap();
+        assert!(er.success);
+        assert_eq!(er.state_changes.len(), 1);
+        assert!(er.state_changes[0].key.starts_with("mod:"));
+    }
+
+    #[test]
+    fn test_execute_contract_publish_empty_modules() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let result = executor.execute_contract_publish("alice", &[], test_vlc());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty module list"));
+    }
+
+    #[test]
+    fn test_execute_contract_publish_invalid_bytecode() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let result = executor.execute_contract_publish("alice", &[vec![0xFF, 0x00]], test_vlc());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("deserialization failed"));
+    }
+
+    #[test]
+    fn test_execute_contract_publish_adr4_duplicate() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(Arc::clone(&shared)));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead")
+            .expect("valid addr");
+        let module_bytes = make_module_bytes(addr, "counter");
+
+        // First publish succeeds
+        let result1 = executor.execute_contract_publish("alice", &[module_bytes.clone()], test_vlc());
+        assert!(result1.is_ok());
+
+        // Second publish of same module fails (ADR-4)
+        let result2 = executor.execute_contract_publish("alice", &[module_bytes], test_vlc());
+        assert!(result2.is_err());
+        assert!(result2.unwrap_err().contains("ADR-4"));
+    }
+
+    #[test]
+    fn test_execute_contract_publish_batch_duplicate() {
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        let provider = Arc::new(MerkleStateProvider::new(shared));
+        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead")
+            .expect("valid addr");
+        let module_bytes = make_module_bytes(addr, "counter");
+
+        // Same module twice in one batch
+        let result = executor.execute_contract_publish(
+            "alice",
+            &[module_bytes.clone(), module_bytes],
+            test_vlc(),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate module in batch"));
     }
 }

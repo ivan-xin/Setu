@@ -33,4 +33,13 @@ pub enum RuntimeError {
     
     #[error("Unknown error: {0}")]
     Unknown(String),
+
+    #[error("Move VM is not enabled")]
+    VMNotEnabled,
+
+    #[error("Move VM initialization error: {0}")]
+    VMInitError(String),
+
+    #[error("Move VM execution error: {0}")]
+    VMExecutionError(String),
 }
