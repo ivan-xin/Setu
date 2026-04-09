@@ -339,6 +339,15 @@ impl MockEnclave {
                 }
 
                 // Fallback: legacy CoinState BCS
+                // Non-CoinState entries (FluxState, PowerState, ResourceParams) are JSON-serialized
+                // and will fail BCS deserialization. Detect them by trying JSON first: if the
+                // bytes start with '{', it's a JSON object — skip it. These entries are handled
+                // separately by extract_power_flux() and extract_resource_params().
+                // This preserves error detection for genuinely corrupted BCS CoinState data.
+                if entry.value.first() == Some(&b'{') {
+                    debug!(key = %entry.key, "Skipping JSON read_set entry (Power/Flux/ResourceParams)");
+                    continue;
+                }
                 let coin_state: setu_types::coin::CoinState = bcs::from_bytes(&entry.value)
                     .map_err(|e| StfError::InvalidResolvedInputs(format!(
                         "Failed to deserialize CoinState {}: {}", hex_id, e
