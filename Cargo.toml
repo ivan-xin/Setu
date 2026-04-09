@@ -22,6 +22,9 @@ members = [
     "setu-cli",               # CLI tool
     "setu-benchmark",         # TPS benchmark tool
 ]
+exclude = [
+    "tools/move-compile",     # Independent project with Sui move-compiler deps
+]
 resolver = "2"
 
 [workspace.package]
