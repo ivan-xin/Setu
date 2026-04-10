@@ -900,12 +900,34 @@ impl MockEnclave {
                 let engine = self.move_engine.as_ref()
                     .ok_or("Move VM not enabled".to_string())?;
 
-                // 1. Construct InputObjects (R4-ISSUE-1: map+error propagation, not filter_map)
+                // 0. Parse sender address (for ownership checks)
+                let sender_addr = Address::from_hex(&payload.sender)
+                    .map_err(|e| format!("Invalid sender: {}", e))?;
+
+                // 1. Construct InputObjects with ownership check (TEE defense-in-depth)
                 let input_objects: Vec<InputObject> = resolved_inputs.input_objects.iter()
                     .map(|ro| {
                         let env = local_runtime.state().get_envelope(&ro.object_id)
                             .map_err(|e| format!("Failed to get envelope for {}: {}", ro.object_id, e))?
                             .ok_or_else(|| format!("Object {} not found in store", ro.object_id))?;
+
+                        // Ownership check
+                        match env.metadata.ownership {
+                            setu_types::Ownership::AddressOwner(owner) => {
+                                if owner != sender_addr {
+                                    return Err(format!(
+                                        "Object {} not owned by sender {}",
+                                        ro.object_id, payload.sender
+                                    ));
+                                }
+                            }
+                            setu_types::Ownership::Immutable => { /* anyone can read */ }
+                            setu_types::Ownership::ObjectOwner(_) => { /* Move runtime handles */ }
+                            setu_types::Ownership::Shared { .. } => {
+                                return Err(format!("Shared object {} not supported (ADR-1)", ro.object_id));
+                            }
+                        }
+
                         InputObject::from_envelope(&ro.object_id, &env)
                             .map_err(|e| format!("Failed to convert object {}: {}", ro.object_id, e))
                     })
@@ -928,8 +950,7 @@ impl MockEnclave {
                 // 4. MoveExecutionContext
                 let move_ctx = MoveExecutionContext {
                     tx_hash: Self::derive_tx_hash(&event.id),
-                    sender: Address::from_hex(&payload.sender)
-                        .map_err(|e| format!("Invalid sender: {}", e))?,
+                    sender: sender_addr,
                     gas_budget: 10_000_000,
                     current_version: 0,
                     epoch: 0,

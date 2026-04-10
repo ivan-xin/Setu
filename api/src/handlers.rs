@@ -81,6 +81,15 @@ pub trait ValidatorService: Send + Sync {
 
     /// Submit a Move module publish
     fn submit_move_publish(&self, request: MovePublishRequest) -> impl std::future::Future<Output = MovePublishResponse> + Send;
+
+    /// Query a Move object by object ID (hex)
+    fn get_move_object(&self, object_id: &str) -> GetMoveObjectResponse;
+
+    /// Query module ABI (function list)
+    fn get_module_abi(&self, address: &str, name: &str) -> GetModuleAbiResponse;
+
+    /// List all modules at an address
+    fn list_modules(&self, address: &str) -> ListModulesResponse;
 }
 
 // ============================================
@@ -320,6 +329,30 @@ pub async fn http_submit_move_publish<S: ValidatorService>(
     Json(request): Json<MovePublishRequest>,
 ) -> Json<MovePublishResponse> {
     Json(service.submit_move_publish(request).await)
+}
+
+/// Query a Move object by object ID (hex)
+pub async fn http_get_move_object<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(object_id): axum::extract::Path<String>,
+) -> Json<GetMoveObjectResponse> {
+    Json(service.get_move_object(&object_id))
+}
+
+/// Query a module's ABI (function list)
+pub async fn http_get_module_abi<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path((address, name)): axum::extract::Path<(String, String)>,
+) -> Json<GetModuleAbiResponse> {
+    Json(service.get_module_abi(&address, &name))
+}
+
+/// List all modules published at an address
+pub async fn http_list_modules<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Json<ListModulesResponse> {
+    Json(service.list_modules(&address))
 }
 
 // ============================================

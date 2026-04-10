@@ -500,6 +500,10 @@ impl ValidatorNetworkService {
             // Phase 4: Move VM endpoints
             .route("/api/v1/move/call", post(setu_api::http_submit_move_call::<ValidatorNetworkService>))
             .route("/api/v1/move/publish", post(setu_api::http_submit_move_publish::<ValidatorNetworkService>))
+            // Phase 5b: Move object/module query endpoints
+            .route("/api/v1/move/objects/:object_id", get(setu_api::http_get_move_object::<ValidatorNetworkService>))
+            .route("/api/v1/move/modules/:address/:name", get(setu_api::http_get_module_abi::<ValidatorNetworkService>))
+            .route("/api/v1/move/modules/:address", get(setu_api::http_list_modules::<ValidatorNetworkService>))
             .with_state(service);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
@@ -664,6 +668,174 @@ impl ValidatorNetworkService {
         }
 
         response
+    }
+
+    /// Query a Move object by its hex object ID
+    pub fn get_move_object(&self, object_id_hex: &str) -> setu_api::GetMoveObjectResponse {
+        let stripped = object_id_hex.strip_prefix("0x").unwrap_or(object_id_hex);
+        let key = format!("oid:{}", stripped);
+
+        // Parse hex → ObjectId, then use get_object() which looks up by raw bytes.
+        // NOTE: get_raw() would BLAKE3-hash the key string, but "oid:" objects are
+        // stored under raw ObjectId bytes in the SMT (see parse_state_change_key).
+        let object_id = match setu_types::object::ObjectId::from_hex(stripped) {
+            Ok(id) => id,
+            Err(_) => {
+                return setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: String::new(), ownership: String::new(),
+                    type_tag: String::new(), version: 0,
+                    data_hex: String::new(), exists: false,
+                    error: Some(format!("Invalid object ID hex: {}", stripped)),
+                };
+            }
+        };
+        let data = match self.task_preparer.state_provider().get_object(&object_id) {
+            Some(d) => d,
+            None => {
+                return setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: String::new(), ownership: String::new(),
+                    type_tag: String::new(), version: 0,
+                    data_hex: String::new(), exists: false, error: None,
+                };
+            }
+        };
+
+        match setu_types::envelope::detect_and_parse(&data) {
+            setu_types::envelope::StorageFormat::Envelope(env) => {
+                setu_api::GetMoveObjectResponse {
+                    key,
+                    object_id: hex::encode(env.metadata.id.as_bytes()),
+                    owner: env.metadata.owner.to_string(),
+                    ownership: format!("{:?}", env.metadata.ownership),
+                    type_tag: env.type_tag.clone(),
+                    version: env.metadata.version,
+                    data_hex: hex::encode(&env.data),
+                    exists: true,
+                    error: None,
+                }
+            }
+            setu_types::envelope::StorageFormat::LegacyCoinState(cs) => {
+                setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: cs.owner.clone(),
+                    ownership: "AddressOwner".to_string(),
+                    type_tag: format!("LegacyCoinState({})", cs.coin_type),
+                    version: cs.version,
+                    data_hex: hex::encode(&data),
+                    exists: true, error: None,
+                }
+            }
+            setu_types::envelope::StorageFormat::Unknown => {
+                setu_api::GetMoveObjectResponse {
+                    key, object_id: stripped.to_string(),
+                    owner: String::new(), ownership: String::new(),
+                    type_tag: String::new(), version: 0,
+                    data_hex: hex::encode(&data),
+                    exists: true,
+                    error: Some("Unknown storage format".into()),
+                }
+            }
+        }
+    }
+
+    /// Query module ABI (function list) by address and name
+    pub fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {
+        let not_found = setu_api::GetModuleAbiResponse {
+            address: address.to_string(),
+            name: name.to_string(),
+            functions: vec![],
+            exists: false,
+            error: None,
+        };
+
+        // Try storage first, then embedded stdlib
+        let stripped = address.strip_prefix("0x").unwrap_or(address);
+        let module_key = format!("mod:{}::{}", address, name);
+        let bytecode = self.task_preparer.state_provider().get_raw(&module_key)
+            .or_else(|| {
+                if stripped == "1" || stripped == "0000000000000000000000000000000000000000000000000000000000000001" {
+                    setu_move_vm::engine::STDLIB_MODULES.iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, bytes)| bytes.to_vec())
+                } else {
+                    None
+                }
+            });
+
+        let bytecode = match bytecode {
+            Some(b) => b,
+            None => return not_found,
+        };
+
+        // Deserialize the module to extract function signatures
+        use move_binary_format::CompiledModule;
+        let module = match CompiledModule::deserialize_with_defaults(&bytecode) {
+            Ok(m) => m,
+            Err(e) => {
+                return setu_api::GetModuleAbiResponse {
+                    address: address.to_string(),
+                    name: name.to_string(),
+                    functions: vec![],
+                    exists: true,
+                    error: Some(format!("Failed to deserialize module: {}", e)),
+                };
+            }
+        };
+
+        let functions: Vec<setu_api::FunctionAbi> = module.function_defs.iter()
+            .filter_map(|func_def| {
+                let func_handle = &module.function_handles[func_def.function.0 as usize];
+                let func_name = module.identifier_at(func_handle.name).to_string();
+                let sig = &module.signatures[func_handle.parameters.0 as usize];
+                let params: Vec<String> = sig.0.iter()
+                    .map(|tok| format!("{:?}", tok))
+                    .collect();
+                let is_entry = func_def.is_entry;
+                let type_param_count = func_handle.type_parameters.len();
+                Some(setu_api::FunctionAbi {
+                    name: func_name,
+                    type_param_count,
+                    parameters: params,
+                    is_entry,
+                })
+            })
+            .collect();
+
+        setu_api::GetModuleAbiResponse {
+            address: address.to_string(),
+            name: name.to_string(),
+            functions,
+            exists: true,
+            error: None,
+        }
+    }
+
+    /// List all modules published at an address
+    pub fn list_modules(&self, address: &str) -> setu_api::ListModulesResponse {
+        let stripped = address.strip_prefix("0x").unwrap_or(address);
+
+        // For stdlib (0x1), return embedded module names
+        if stripped == "1" || stripped == "0000000000000000000000000000000000000000000000000000000000000001" {
+            let modules: Vec<String> = setu_move_vm::engine::STDLIB_MODULES.iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            return setu_api::ListModulesResponse {
+                address: address.to_string(),
+                modules,
+                error: None,
+            };
+        }
+
+        // For user-published modules, scan storage with "mod:{addr}::" prefix
+        // This is a limitation: we can't efficiently enumerate all modules at an address
+        // from an SMT (which uses hashed keys). Return empty with a note.
+        setu_api::ListModulesResponse {
+            address: address.to_string(),
+            modules: vec![],
+            error: Some("Module enumeration for user addresses requires index (not yet implemented)".into()),
+        }
     }
 
     // ============================================
@@ -1018,6 +1190,18 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
         self.submit_move_publish(request).await
+    }
+
+    fn get_move_object(&self, object_id: &str) -> setu_api::GetMoveObjectResponse {
+        self.get_move_object(object_id)
+    }
+
+    fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {
+        self.get_module_abi(address, name)
+    }
+
+    fn list_modules(&self, address: &str) -> setu_api::ListModulesResponse {
+        self.list_modules(address)
     }
 }
 

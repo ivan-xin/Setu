@@ -911,6 +911,9 @@ impl TaskPreparer {
             return Err(TaskPrepareError::SharedObjectNotSupported);
         }
 
+        // 0. Parse sender address (once, outside loop)
+        let sender_addr = setu_types::Address::normalize(&call.sender);
+
         // 1. Collect input objects
         let mut read_set = Vec::new();
         let mut resolved_objects = Vec::new();
@@ -921,11 +924,47 @@ impl TaskPreparer {
                     hex::encode(object_id.as_bytes()),
                 ))?;
 
+            // Parse once: ownership check + version extraction
+            let parsed = setu_types::envelope::detect_and_parse(&data);
+
+            // Ownership check: sender must own AddressOwner objects
+            match &parsed {
+                setu_types::envelope::StorageFormat::Envelope(env) => {
+                    match env.metadata.ownership {
+                        setu_types::Ownership::AddressOwner(owner) => {
+                            if owner != sender_addr {
+                                return Err(TaskPrepareError::NotOwnedBySender {
+                                    object_id: hex::encode(object_id.as_bytes()),
+                                    sender: call.sender.clone(),
+                                });
+                            }
+                        }
+                        setu_types::Ownership::Immutable => { /* anyone can read */ }
+                        setu_types::Ownership::ObjectOwner(_) => { /* Move runtime handles */ }
+                        setu_types::Ownership::Shared { .. } => {
+                            return Err(TaskPrepareError::SharedObjectNotSupported);
+                        }
+                    }
+                }
+                setu_types::envelope::StorageFormat::LegacyCoinState(cs) => {
+                    let cs_owner = setu_types::Address::normalize(&cs.owner);
+                    if cs_owner != sender_addr {
+                        return Err(TaskPrepareError::NotOwnedBySender {
+                            object_id: hex::encode(object_id.as_bytes()),
+                            sender: call.sender.clone(),
+                        });
+                    }
+                }
+                setu_types::envelope::StorageFormat::Unknown => {
+                    // Unknown format — allow for now (module bytecode etc.)
+                }
+            }
+
             let key = format!("oid:{}", hex::encode(object_id.as_bytes()));
             read_set.push(ReadSetEntry::new(key, data.clone()));
 
-            // Extract version from ObjectEnvelope if present, otherwise 0
-            let version = match setu_types::envelope::detect_and_parse(&data) {
+            // Extract version from parsed format
+            let version = match &parsed {
                 setu_types::envelope::StorageFormat::Envelope(env) => env.metadata.version,
                 _ => 0,
             };
@@ -1386,5 +1425,171 @@ mod tests {
         let result = preparer.resolve_module_dependencies("0x1", "vector");
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    // ========== Sender-Owner consistency check tests (Phase 5b) ==========
+
+    /// Helper: create a preparer with an ObjectEnvelope stored for a given owner
+    fn make_preparer_with_owned_object(
+        object_id: ObjectId,
+        owner: setu_types::Address,
+        ownership: setu_types::Ownership,
+        module_key: Option<(&str, &[u8])>,
+    ) -> TaskPreparer {
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider};
+        use setu_types::event::StateChange;
+        use setu_types::envelope::ObjectEnvelope;
+        use setu_types::object::ObjectDigest;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let mut gsm = shared.lock_write();
+
+            // Store the ObjectEnvelope
+            let env = ObjectEnvelope::from_move_result(
+                object_id,
+                owner,
+                1,
+                ownership,
+                "0xcafe::test::TestObj".to_string(),
+                vec![0u8; 32], // dummy BCS data
+            );
+            let key = format!("oid:{}", hex::encode(object_id.as_bytes()));
+            let sc = StateChange::insert(key, env.to_bytes());
+            gsm.apply_state_change(SubnetId::ROOT, &sc);
+
+            // Optionally store a module
+            if let Some((mk, mb)) = module_key {
+                let sc = StateChange::insert(mk.to_string(), mb.to_vec());
+                gsm.apply_state_change(SubnetId::ROOT, &sc);
+            }
+
+            shared.publish_snapshot(&gsm);
+        }
+        let provider: Arc<dyn StateProvider> = Arc::new(MerkleStateProvider::new(shared));
+        TaskPreparer::new("validator-test".to_string(), provider)
+    }
+
+    #[test]
+    fn test_move_call_owned_object_by_owner_passes() {
+        let alice = setu_types::Address::normalize("alice");
+        let obj_id = ObjectId::new([0x11; 32]);
+
+        // Create module bytecode (required for prepare_move_call_task)
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::AddressOwner(alice),
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.input_object_ids = vec![obj_id];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(result.is_ok(), "Owner should be able to use own object: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_move_call_non_owner_rejected() {
+        let alice = setu_types::Address::normalize("alice");
+        let bob = setu_types::Address::normalize("bob");
+        let obj_id = ObjectId::new([0x22; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        // Object owned by alice
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::AddressOwner(alice),
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        // Bob tries to use alice's object
+        call.sender = bob.to_string().strip_prefix("0x").unwrap_or(&bob.to_string()).to_string();
+        call.input_object_ids = vec![obj_id];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::NotOwnedBySender { .. })),
+            "Non-owner should be rejected, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_move_call_immutable_object_any_sender_passes() {
+        let alice = setu_types::Address::normalize("alice");
+        let bob = setu_types::Address::normalize("bob");
+        let obj_id = ObjectId::new([0x33; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        // Immutable object
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::Immutable,
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        // Bob can use immutable object
+        call.sender = bob.to_string().strip_prefix("0x").unwrap_or(&bob.to_string()).to_string();
+        call.input_object_ids = vec![obj_id];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(result.is_ok(), "Any sender should be able to read immutable object: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_move_call_shared_object_in_envelope_rejected() {
+        let alice = setu_types::Address::normalize("alice");
+        let obj_id = ObjectId::new([0x44; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        // Shared object in envelope
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::Shared { initial_shared_version: 0 },
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.input_object_ids = vec![obj_id];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::SharedObjectNotSupported)),
+            "Shared objects in envelopes should be rejected (ADR-1), got: {:?}", result);
     }
 }

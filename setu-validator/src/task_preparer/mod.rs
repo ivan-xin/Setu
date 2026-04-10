@@ -111,6 +111,9 @@ pub enum TaskPrepareError {
 
     #[error("Shared objects not supported (ADR-1)")]
     SharedObjectNotSupported,
+
+    #[error("Object {object_id} not owned by sender {sender}")]
+    NotOwnedBySender { object_id: String, sender: String },
 }
 
 /// Convert SimpleMerkleProof to MerkleProof (for TEE)

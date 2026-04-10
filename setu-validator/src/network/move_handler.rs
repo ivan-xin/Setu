@@ -34,7 +34,7 @@ impl MoveCallHandler {
         request: MoveCallRequest,
     ) -> MoveCallResponse {
         // 1. Convert MoveCallRequest → MoveCallPayload
-        let payload = match Self::convert_request(&request) {
+        let mut payload = match Self::convert_request(&request) {
             Ok(p) => p,
             Err(e) => {
                 return MoveCallResponse {
@@ -46,6 +46,37 @@ impl MoveCallHandler {
                 };
             }
         };
+
+        // 1.5. Auto-detect needs_tx_context from module bytecode
+        //      Look up the target module from storage or embedded stdlib.
+        {
+            let module_key = format!("mod:{}::{}", payload.package, payload.module);
+            let module_bytes = state_provider.get_raw_data(&module_key)
+                .or_else(|| {
+                    // Check embedded stdlib if target is at address 0x1
+                    let stripped = payload.package.strip_prefix("0x").unwrap_or(&payload.package);
+                    if stripped == "1" || stripped == "0000000000000000000000000000000000000000000000000000000000000001" {
+                        setu_move_vm::engine::STDLIB_MODULES.iter()
+                            .find(|(name, _)| *name == payload.module.as_str())
+                            .map(|(_, bytes)| bytes.to_vec())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(bytes) = module_bytes {
+                if let Some(detected) = setu_move_vm::engine::detect_needs_tx_context(&bytes, &payload.function) {
+                    if detected != payload.needs_tx_context {
+                        info!(
+                            function = %payload.function,
+                            declared = payload.needs_tx_context,
+                            detected,
+                            "Auto-detected needs_tx_context override"
+                        );
+                        payload.needs_tx_context = detected;
+                    }
+                }
+            }
+        }
 
         // 2. Build VLCSnapshot
         let vlc_snapshot = VLCSnapshot {

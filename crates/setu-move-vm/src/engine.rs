@@ -490,6 +490,60 @@ impl SetuMoveEngine {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// needs_tx_context auto-detection
+// ═══════════════════════════════════════════════════════════════
+
+/// Detect whether a Move function's last parameter is `&mut TxContext`.
+///
+/// Deserializes the module bytecode, finds the named function, and inspects
+/// the last parameter's type signature. Returns `true` if the last param
+/// is `MutableReference(Struct(0x1::tx_context::TxContext))`.
+///
+/// Returns `None` if the module cannot be parsed or the function is not found.
+pub fn detect_needs_tx_context(module_bytes: &[u8], function_name: &str) -> Option<bool> {
+    use move_binary_format::CompiledModule;
+    use move_binary_format::file_format::SignatureToken;
+
+    let module = CompiledModule::deserialize_with_defaults(module_bytes).ok()?;
+
+    // Find the function definition
+    for func_def in &module.function_defs {
+        let func_handle = &module.function_handles[func_def.function.0 as usize];
+        let func_ident = module.identifier_at(func_handle.name);
+        if func_ident.as_str() != function_name {
+            continue;
+        }
+
+        let sig = &module.signatures[func_handle.parameters.0 as usize];
+        let params = &sig.0;
+        if let Some(last_param) = params.last() {
+            // Check: MutableReference(Datatype(idx)) where datatype is 0x1::tx_context::TxContext
+            if let SignatureToken::MutableReference(inner) = last_param {
+                if let SignatureToken::Datatype(datatype_handle_idx) = inner.as_ref() {
+                    let dt_handle = &module.datatype_handles[datatype_handle_idx.0 as usize];
+                    let struct_name = module.identifier_at(dt_handle.name);
+                    let module_handle = &module.module_handles[dt_handle.module.0 as usize];
+                    let module_name = module.identifier_at(module_handle.name);
+                    let module_addr = module.address_identifier_at(module_handle.address);
+
+                    // Check: address == 0x1, module == "tx_context", struct == "TxContext"
+                    if module_addr == &move_core_types::account_address::AccountAddress::ONE
+                        && module_name.as_str() == "tx_context"
+                        && struct_name.as_str() == "TxContext"
+                    {
+                        return Some(true);
+                    }
+                }
+            }
+            return Some(false);
+        }
+        // No parameters → no TxContext
+        return Some(false);
+    }
+    None // function not found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +684,64 @@ mod tests {
             move_bytecode_verifier::verify_module_unmetered(&cm)
                 .unwrap_or_else(|e| panic!("Module '{}' failed verification: {}", name, e));
         }
+    }
+
+    // ── detect_needs_tx_context tests ──
+
+    fn stdlib_bytes(name: &str) -> &'static [u8] {
+        STDLIB_MODULES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("stdlib module '{}' not found", name))
+            .1
+    }
+
+    #[test]
+    fn test_detect_needs_tx_context_true() {
+        // coin::from_balance(balance, ctx: &mut TxContext) → should detect true
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: no stdlib");
+            return;
+        }
+        let result = detect_needs_tx_context(stdlib_bytes("coin"), "from_balance");
+        assert_eq!(result, Some(true), "from_balance has &mut TxContext as last param");
+    }
+
+    #[test]
+    fn test_detect_needs_tx_context_false_immutable_ref() {
+        // tx_context::sender(ctx: &TxContext) — immutable ref, not mutable → false
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: no stdlib");
+            return;
+        }
+        let result = detect_needs_tx_context(stdlib_bytes("tx_context"), "sender");
+        assert_eq!(result, Some(false), "sender takes &TxContext (immutable), not &mut");
+    }
+
+    #[test]
+    fn test_detect_needs_tx_context_false_no_context() {
+        // transfer::transfer<T>(obj, recipient: address) — no TxContext param at all
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: no stdlib");
+            return;
+        }
+        let result = detect_needs_tx_context(stdlib_bytes("transfer"), "transfer");
+        assert_eq!(result, Some(false), "transfer has no TxContext param");
+    }
+
+    #[test]
+    fn test_detect_needs_tx_context_function_not_found() {
+        if STDLIB_MODULES.is_empty() {
+            eprintln!("SKIP: no stdlib");
+            return;
+        }
+        let result = detect_needs_tx_context(stdlib_bytes("coin"), "nonexistent_function");
+        assert_eq!(result, None, "non-existent function should return None");
+    }
+
+    #[test]
+    fn test_detect_needs_tx_context_invalid_bytecode() {
+        let result = detect_needs_tx_context(b"not valid bytecode", "anything");
+        assert_eq!(result, None, "invalid bytecode should return None (deserialization fails)");
     }
 }

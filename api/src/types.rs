@@ -136,3 +136,72 @@ pub struct MovePublishResponse {
 fn default_true() -> bool {
     true
 }
+
+// ============================================
+// Move Object/Module Query Types (Phase 5b)
+// ============================================
+
+/// Response for Move object query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetMoveObjectResponse {
+    /// Object key ("oid:{hex}")
+    pub key: String,
+    /// Object ID (hex)
+    pub object_id: String,
+    /// Owner address (hex)
+    pub owner: String,
+    /// Ownership type
+    pub ownership: String,
+    /// Move type tag (e.g. "0x1::coin::Coin<0x1::setu::SETU>")
+    pub type_tag: String,
+    /// Object version
+    pub version: u64,
+    /// BCS-serialized data (hex)
+    pub data_hex: String,
+    /// Whether the object exists
+    pub exists: bool,
+    /// Error message (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response for module ABI query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetModuleAbiResponse {
+    /// Module address
+    pub address: String,
+    /// Module name
+    pub name: String,
+    /// Public/entry functions
+    pub functions: Vec<FunctionAbi>,
+    /// Whether the module exists
+    pub exists: bool,
+    /// Error message (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Function ABI info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionAbi {
+    /// Function name
+    pub name: String,
+    /// Number of type parameters
+    pub type_param_count: usize,
+    /// Parameter types (string representation)
+    pub parameters: Vec<String>,
+    /// Whether this is an entry function
+    pub is_entry: bool,
+}
+
+/// Response for listing modules at an address
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListModulesResponse {
+    /// Module address
+    pub address: String,
+    /// Module names
+    pub modules: Vec<String>,
+    /// Error message (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
