@@ -34,6 +34,11 @@ fn main() {
         "balance",
         "coin",
         "setu",
+        "vector",
+        "option",
+        "string",
+        "vec_map",
+        "vec_set",
     ];
 
     let mut code = String::from(

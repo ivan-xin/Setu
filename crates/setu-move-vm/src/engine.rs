@@ -538,8 +538,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            6,
-            "Expected 6 stdlib modules (object, transfer, tx_context, balance, coin, setu)"
+            11,
+            "Expected 11 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set)"
         );
     }
 
@@ -570,7 +570,8 @@ mod tests {
             eprintln!("SKIP: stdlib .mv files not found");
             return;
         }
-        let expected = ["object", "transfer", "tx_context", "balance", "coin", "setu"];
+        let expected = ["object", "transfer", "tx_context", "balance", "coin", "setu",
+                       "vector", "option", "string", "vec_map", "vec_set"];
         let names: Vec<&str> = STDLIB_MODULES.iter().map(|(n, _)| *n).collect();
         for exp in &expected {
             assert!(
