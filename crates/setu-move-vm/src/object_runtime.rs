@@ -82,6 +82,7 @@ pub struct ObjectRuntimeResults {
     pub transfers: IndexMap<ObjectId, ObjectTransferEffect>,
     pub frozen: IndexMap<ObjectId, ObjectFreezeEffect>,
     pub mutated: IndexMap<ObjectId, ObjectMutationEffect>,
+    pub emitted_events: Vec<(StructTag, Vec<u8>)>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -102,6 +103,7 @@ pub struct SetuObjectRuntime {
     transfers: IndexMap<ObjectId, ObjectTransferEffect>,
     frozen: IndexMap<ObjectId, ObjectFreezeEffect>,
     mutated: IndexMap<ObjectId, ObjectMutationEffect>,
+    pub(crate) emitted_events: Vec<(StructTag, Vec<u8>)>,
     // Context
     tx_hash: [u8; 32],
     ids_created: u64,
@@ -127,6 +129,7 @@ impl SetuObjectRuntime {
             transfers: IndexMap::new(),
             frozen: IndexMap::new(),
             mutated: IndexMap::new(),
+            emitted_events: Vec::new(),
             tx_hash,
             ids_created: 0,
             sender,
@@ -191,6 +194,11 @@ impl SetuObjectRuntime {
         self.deleted_ids.insert(id);
     }
 
+    /// Record a structured event emission.
+    pub fn emit_event(&mut self, type_tag: StructTag, bcs_bytes: Vec<u8>) {
+        self.emitted_events.push((type_tag, bcs_bytes));
+    }
+
     /// Look up a pre-loaded input object.
     pub fn get_input_object(&self, id: &ObjectId) -> Option<&InputObject> {
         self.input_objects.get(id)
@@ -210,6 +218,7 @@ impl SetuObjectRuntime {
             transfers: self.transfers,
             frozen: self.frozen,
             mutated: self.mutated,
+            emitted_events: self.emitted_events,
         }
     }
 }
@@ -288,5 +297,48 @@ mod tests {
         let results = rt.into_results();
         assert_eq!(results.created_ids.len(), 1);
         assert_eq!(results.deleted_ids.len(), 1);
+    }
+
+    fn test_struct_tag(name: &str) -> StructTag {
+        StructTag {
+            address: AccountAddress::ONE,
+            module: move_core_types::identifier::Identifier::new("test").unwrap(),
+            name: move_core_types::identifier::Identifier::new(name).unwrap(),
+            type_params: vec![],
+        }
+    }
+
+    #[test]
+    fn test_emit_event_recorded() {
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let tag = test_struct_tag("MyEvent");
+        rt.emit_event(tag.clone(), vec![0x01, 0x02]);
+        assert_eq!(rt.emitted_events.len(), 1);
+        assert_eq!(rt.emitted_events[0].0, tag);
+        assert_eq!(rt.emitted_events[0].1, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_emit_multiple_events_ordered() {
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let tag_a = test_struct_tag("EventA");
+        let tag_b = test_struct_tag("EventB");
+        rt.emit_event(tag_a.clone(), vec![0xAA]);
+        rt.emit_event(tag_b.clone(), vec![0xBB]);
+        rt.emit_event(tag_a.clone(), vec![0xCC]);
+
+        assert_eq!(rt.emitted_events.len(), 3);
+        assert_eq!(rt.emitted_events[0].0, tag_a);
+        assert_eq!(rt.emitted_events[1].0, tag_b);
+        assert_eq!(rt.emitted_events[2].0, tag_a);
+    }
+
+    #[test]
+    fn test_emit_events_in_results() {
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        rt.emit_event(test_struct_tag("Ev"), vec![0x42]);
+        let results = rt.into_results();
+        assert_eq!(results.emitted_events.len(), 1);
+        assert_eq!(results.emitted_events[0].1, vec![0x42]);
     }
 }

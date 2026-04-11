@@ -1006,6 +1006,16 @@ impl MockEnclave {
                     }
                 }
 
+                // 9. Log emitted events (for debugging / future indexer integration)
+                for (i, (type_tag, bcs_bytes)) in output.events.iter().enumerate() {
+                    tracing::info!(
+                        event_idx = i,
+                        type_tag = %type_tag,
+                        bcs_len = bcs_bytes.len(),
+                        "MoveCall emitted event"
+                    );
+                }
+
                 let mut legacy_state = self.legacy_state.write().await;
                 self.record_event_processed(&mut legacy_state, event, diff);
                 return Ok(());

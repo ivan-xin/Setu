@@ -90,6 +90,7 @@ pub struct MoveExecutionOutput {
     pub state_changes: Vec<MoveStateChange>,
     pub module_changes: Vec<ModuleChange>,
     pub return_values: Vec<Vec<u8>>,
+    pub events: Vec<(String, Vec<u8>)>,
     pub gas_used: u64,
     pub error: Option<String>,
 }
@@ -295,11 +296,17 @@ impl SetuMoveEngine {
                     .map(|(bytes, _layout)| bytes.clone())
                     .collect();
 
+                let events = obj_results.emitted_events
+                    .iter()
+                    .map(|(tag, bytes)| (tag.to_string(), bytes.clone()))
+                    .collect();
+
                 Ok(MoveExecutionOutput {
                     success: true,
                     state_changes,
                     module_changes,
                     return_values: ret,
+                    events,
                     gas_used: gas_meter.instructions_executed(),
                     error: None,
                 })
@@ -309,6 +316,7 @@ impl SetuMoveEngine {
                 state_changes: vec![],
                 module_changes: vec![],
                 return_values: vec![],
+                events: vec![],
                 gas_used: gas_meter.instructions_executed(),
                 error: Some(vm_error.to_string()),
             }),
@@ -592,8 +600,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            11,
-            "Expected 11 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set)"
+            12,
+            "Expected 12 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event)"
         );
     }
 

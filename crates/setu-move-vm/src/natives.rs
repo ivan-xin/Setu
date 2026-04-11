@@ -1,6 +1,6 @@
 //! Native function implementations for Setu stdlib.
 //!
-//! 7 natives registered under `0x1`:
+//! 8 natives registered under `0x1`:
 //! - object::new_uid_internal
 //! - object::delete_uid_internal
 //! - object::uid_to_address_internal
@@ -8,6 +8,7 @@
 //! - transfer::share_internal
 //! - transfer::freeze_internal
 //! - tx_context::derive_id_internal
+//! - event::emit_internal
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -52,6 +53,7 @@ pub fn setu_native_functions() -> NativeFunctionTable {
             ("transfer", "share_internal", native_share_internal),
             ("transfer", "freeze_internal", native_freeze_internal),
             ("tx_context", "derive_id_internal", native_derive_id),
+            ("event", "emit_internal", native_event_emit),
         ],
     )
 }
@@ -317,6 +319,44 @@ fn native_derive_id(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// event::emit_internal<T>
+// ═══════════════════════════════════════════════════════════════
+
+/// Move: `native fun emit_internal<T: copy + drop>(event: T);`
+///
+/// BCS-serializes the event value and records it in SetuObjectRuntime.
+fn native_event_emit(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    let event_value = args.pop_back().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let event_type = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+
+    let type_tag = context.type_to_type_tag(&event_type)?;
+    let struct_tag = match type_tag {
+        move_core_types::language_storage::TypeTag::Struct(st) => *st,
+        _ => return Err(PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)),
+    };
+
+    let layout = context
+        .type_to_type_layout(&event_type)?
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let bcs_bytes = event_value
+        .typed_serialize(&layout)
+        .ok_or_else(|| PartialVMError::new(StatusCode::VALUE_SERIALIZATION_ERROR))?;
+
+    let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+    runtime.emit_event(struct_tag, bcs_bytes);
+
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![]))
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════
 
@@ -342,7 +382,7 @@ mod tests {
     #[test]
     fn test_make_table_count() {
         let table = setu_native_functions();
-        assert_eq!(table.len(), 7);
+        assert_eq!(table.len(), 8);
     }
 
     #[test]
@@ -352,6 +392,7 @@ mod tests {
         assert!(modules.contains(&"object".to_string()));
         assert!(modules.contains(&"transfer".to_string()));
         assert!(modules.contains(&"tx_context".to_string()));
+        assert!(modules.contains(&"event".to_string()));
     }
 
     #[test]

@@ -39,6 +39,7 @@ fn main() {
         "string",
         "vec_map",
         "vec_set",
+        "event",
     ];
 
     let mut code = String::from(
@@ -61,8 +62,7 @@ fn main() {
         } else {
             eprintln!(
                 "cargo:warning=Missing stdlib module: {}. \
-                 Run: cd setu-framework && sui move build && \
-                 cp build/SetuFramework/bytecode_modules/*.mv compiled/",
+                 Run: bash scripts/build_stdlib.sh",
                 mv_path.display()
             );
             all_found = false;
@@ -74,7 +74,7 @@ fn main() {
     // If not all modules found, generate empty array so compilation still works
     if !all_found {
         code = String::from(
-            "/// Setu stdlib (EMPTY — .mv files not found, run sui move build)\n\
+            "/// Setu stdlib (EMPTY — .mv files not found, run: bash scripts/build_stdlib.sh)\n\
              pub const STDLIB_MODULES: &[(&str, &[u8])] = &[];\n",
         );
     }
