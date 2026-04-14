@@ -137,6 +137,9 @@ impl ConsensusValidator {
             Arc::new(SharedStateManager::new(GlobalStateManager::default())),  // Use default state manager
             Arc::clone(&event_store),        // Share the same EventStore!
         ));
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
         
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
@@ -189,6 +192,9 @@ impl ConsensusValidator {
             state_manager,
             Arc::clone(&event_store),  // Share the same EventStore!
         ));
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
         
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
@@ -243,6 +249,9 @@ impl ConsensusValidator {
             state_manager,
             Arc::clone(&event_store),  // Share the same EventStore!
         ));
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
         
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
@@ -312,6 +321,9 @@ impl ConsensusValidator {
             state_manager,
             Arc::clone(&event_store),  // Share the same EventStore!
         ));
+
+        // Wire finalization broadcast channel into engine
+        engine.set_finalization_tx(finalization_tx.clone());
         
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
@@ -772,6 +784,21 @@ impl ConsensusValidator {
     /// Subscribe to CF finalization notifications
     pub fn subscribe_finalization(&self) -> broadcast::Receiver<ConsensusFrame> {
         self.finalization_tx.subscribe()
+    }
+
+    /// Heartbeat: periodically try to create CF for events stuck below vlc_delta_threshold.
+    /// Called by background timer in main.rs. No-op if not Leader or no stale events.
+    pub async fn try_heartbeat(&self, heartbeat_interval: std::time::Duration) -> SetuResult<()> {
+        let result = self.engine.try_create_cf_heartbeat(heartbeat_interval).await?;
+
+        if result.is_some() {
+            // Persist any inline-finalized anchors (same as submit_event)
+            for anchor in self.engine.take_pending_anchors().await {
+                let _ = self.persist_finalized_anchor(&anchor).await;
+            }
+        }
+
+        Ok(())
     }
     
     /// Get the local validator ID

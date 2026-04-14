@@ -17,12 +17,13 @@
 //! 7. After quorum votes, the ConsensusFrame is finalized
 //! 8. Next round begins with the finalized frame as anchor
 
-use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, ValidatorInfo, Vote};
+use setu_types::{ConsensusConfig, ConsensusFrame, Event, EventId, SetuResult, Vote};
 use setu_vlc::VLCSnapshot;
 use setu_storage::{EventStore, EventStoreBackend, SharedStateManager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, RwLock, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, broadcast, RwLock, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::ConsensusBroadcaster;
@@ -82,6 +83,10 @@ pub struct ConsensusEngine {
     /// Anchors from inline-finalized CFs (single-node mode) pending persistence.
     /// Callers should drain this after add_event() to persist finalized anchors.
     pending_persist_anchors: Arc<Mutex<Vec<setu_types::Anchor>>>,
+    /// Broadcast channel for CF finalization notifications.
+    /// Injected by caller (ConsensusValidator) via set_finalization_tx().
+    /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
+    finalization_tx: parking_lot::RwLock<Option<broadcast::Sender<ConsensusFrame>>>,
 }
 
 impl ConsensusEngine {
@@ -122,6 +127,7 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
     
@@ -167,6 +173,7 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
     
@@ -208,6 +215,7 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
     
@@ -248,6 +256,7 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
+            finalization_tx: parking_lot::RwLock::new(None),
         }
     }
 
@@ -285,6 +294,12 @@ impl ConsensusEngine {
     /// Check if a broadcaster is configured
     pub async fn has_broadcaster(&self) -> bool {
         self.broadcaster.read().await.is_some()
+    }
+
+    /// Inject a broadcast sender for CF finalization notifications.
+    /// Called by ConsensusValidator after engine construction.
+    pub fn set_finalization_tx(&self, tx: broadcast::Sender<ConsensusFrame>) {
+        *self.finalization_tx.write() = Some(tx);
     }
     
     /// Get a reference to the broadcaster for making network requests
@@ -568,6 +583,14 @@ impl ConsensusEngine {
                     {
                         let mut pending = self.pending_persist_anchors.lock().await;
                         pending.push(frame.anchor.clone());
+                    }
+
+                    // Notify finalization subscribers (single-node mode)
+                    {
+                        let tx_guard = self.finalization_tx.read();
+                        if let Some(ref tx) = *tx_guard {
+                            let _ = tx.send(frame.clone());
+                        }
                     }
                 }
             }
@@ -881,11 +904,19 @@ impl ConsensusEngine {
         let cf_data = manager.last_finalized_cf().map(|cf| (cf.id.clone(), cf.anchor.clone(), cf.clone()));
         
         let finalized_anchor = if let Some((cf_id, anchor, cf)) = cf_data {
-            // Send finalization to internal channel (for local listeners)
+            // Send finalization to internal channel (legacy, for local listeners)
             let _ = self
                 .message_tx
-                .send(ConsensusMessage::FrameFinalized(cf))
+                .send(ConsensusMessage::FrameFinalized(cf.clone()))
                 .await;
+
+            // Broadcast to external subscribers (governance Task A, etc.)
+            {
+                let tx_guard = self.finalization_tx.read();
+                if let Some(ref tx) = *tx_guard {
+                    let _ = tx.send(cf);
+                }
+            }
 
             // Broadcast finalization to network via broadcaster (if configured)
             let broadcaster = self.broadcaster.read().await;
@@ -1046,6 +1077,93 @@ impl ConsensusEngine {
     pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
         let mut manager = self.consensus_manager.write().await;
         manager.mark_anchor_persisted(anchor_id);
+    }
+
+    /// Heartbeat attempt to create a CF for low-frequency events.
+    ///
+    /// Uses relaxed VLC delta (>= 1 instead of >= vlc_delta_threshold) with a time guard.
+    /// Called by a background timer. No-op if not Leader or no stale events.
+    pub async fn try_create_cf_heartbeat(
+        &self,
+        heartbeat_interval: Duration,
+    ) -> SetuResult<Option<ConsensusFrame>> {
+        // Leader check
+        {
+            let validator_set = self.validator_set.read().await;
+            let round = validator_set.current_round();
+            if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
+                return Ok(None);
+            }
+        }
+
+        let vlc = self.vlc.read().await;
+        let mut manager = self.consensus_manager.write().await;
+        let dag = self.dag.read().await;
+
+        let cf = manager.try_create_cf_heartbeat(&dag, &vlc, heartbeat_interval);
+
+        if let Some(ref frame) = cf {
+            info!(
+                cf_id = %frame.id,
+                event_count = frame.anchor.event_ids.len(),
+                "Heartbeat: CF created for stale events"
+            );
+
+            // Leader self-vote + inline finalization (same logic as try_create_cf)
+            let private_key = self.private_key.read().await;
+            let key_ref = private_key.as_ref().map(|k| k.as_slice());
+
+            let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
+            if self_vote.is_some() {
+                if manager.check_finalization(&frame.id) {
+                    let new_anchor_depth = manager.anchor_builder().anchor_depth();
+                    self.dag_manager.update_min_depth(new_anchor_depth);
+                    info!(cf_id = %frame.id, "Heartbeat CF finalized (single-node)");
+
+                    {
+                        let mut pending = self.pending_persist_anchors.lock().await;
+                        pending.push(frame.anchor.clone());
+                    }
+
+                    // Notify finalization subscribers
+                    {
+                        let tx_guard = self.finalization_tx.read();
+                        if let Some(ref tx) = *tx_guard {
+                            let _ = tx.send(frame.clone());
+                        }
+                    }
+                }
+            }
+
+            // Send to internal channel (legacy)
+            let _ = self
+                .message_tx
+                .send(ConsensusMessage::ProposeFrame(frame.clone()))
+                .await;
+
+            // Broadcast to network (multi-node: followers need to receive and vote)
+            let mut broadcast_frame = frame.clone();
+            if let Some(ref v) = self_vote {
+                broadcast_frame.add_vote(v.clone());
+            }
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                match b.broadcast_cf(&broadcast_frame).await {
+                    Ok(result) => {
+                        info!(
+                            cf_id = %frame.id,
+                            success = result.success_count,
+                            "Heartbeat CF broadcasted to peers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %frame.id, error = %e, "Failed to broadcast heartbeat CF");
+                    }
+                }
+            }
+        }
+
+        Ok(cf)
     }
 
     /// Get the message sender for external communication

@@ -202,6 +202,9 @@ pub struct AnchorBuilder {
     last_anchor_chain_root: [u8; 32],
     /// Total number of anchors created (for statistics)
     total_anchor_count: u64,
+    /// Wall-clock time of the last successful commit_build() / synchronize_finalized_anchor().
+    /// Used by heartbeat to detect "long time no CF" condition.
+    last_fold_instant: Option<std::time::Instant>,
 }
 
 impl AnchorBuilder {
@@ -215,6 +218,7 @@ impl AnchorBuilder {
             last_fold_vlc: 0,
             last_anchor_chain_root: [0u8; 32], // Genesis: all zeros
             total_anchor_count: 0,
+            last_fold_instant: None,
         }
     }
     
@@ -230,6 +234,7 @@ impl AnchorBuilder {
             last_fold_vlc: 0,
             last_anchor_chain_root: [0u8; 32], // Genesis: all zeros
             total_anchor_count: 0,
+            last_fold_instant: None,
         }
     }
     
@@ -476,6 +481,7 @@ impl AnchorBuilder {
         self.last_fold_vlc = pending.new_last_fold_vlc;
         self.last_anchor_chain_root = pending.new_anchor_chain_root;
         self.total_anchor_count += 1;
+        self.last_fold_instant = Some(std::time::Instant::now());
         
         Ok(state_summary)
     }
@@ -615,6 +621,64 @@ impl AnchorBuilder {
         self.last_anchor_chain_root
     }
 
+    /// Time elapsed since the last CF was committed.
+    /// Returns Duration::MAX if no CF has been committed yet (fresh start → heartbeat fires).
+    pub fn elapsed_since_last_fold(&self) -> std::time::Duration {
+        self.last_fold_instant
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::from_secs(u64::MAX))
+    }
+
+    /// Heartbeat variant of prepare_build: relaxed VLC delta requirement.
+    ///
+    /// Conditions (ALL must be true):
+    /// - delta >= 1 (at least one new event since last fold)
+    /// - elapsed_since_last_fold() > heartbeat_interval
+    /// - events.len() >= min_events_per_cf
+    ///
+    /// Does NOT bypass min_events_per_cf — if DAG has 0 pending events, returns NoEvents.
+    pub fn prepare_build_heartbeat(
+        &self,
+        dag: &Dag,
+        vlc: &VLC,
+        heartbeat_interval: std::time::Duration,
+    ) -> Result<PendingAnchorBuild, AnchorBuildError> {
+        let delta = vlc.logical_time().saturating_sub(self.last_fold_vlc);
+        if delta < 1 {
+            return Err(AnchorBuildError::DeltaNotReached {
+                required: 1,
+                current: delta,
+            });
+        }
+
+        if self.elapsed_since_last_fold() < heartbeat_interval {
+            return Err(AnchorBuildError::DeltaNotReached {
+                required: self.config.vlc_delta_threshold,
+                current: delta,
+            });
+        }
+
+        let from_depth = self.anchor_depth;
+        let to_depth = dag.max_depth();
+        let events: Vec<Event> = dag.get_events_in_range(from_depth, to_depth)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        if events.len() < self.config.min_events_per_cf {
+            return Err(AnchorBuildError::InsufficientEvents {
+                required: self.config.min_events_per_cf,
+                found: events.len(),
+            });
+        }
+
+        if events.is_empty() {
+            return Err(AnchorBuildError::NoEvents);
+        }
+
+        self.prepare_build_internal(events, vlc, to_depth)
+    }
+
     /// Synchronize state after a CF is finalized (Follower path, metadata only)
     /// 
     /// This is called by follower nodes when a CF is finalized to synchronize their
@@ -643,6 +707,7 @@ impl AnchorBuilder {
         self.anchor_depth = anchor.depth + 1;
         self.last_fold_vlc = anchor.vlc_snapshot.logical_time;
         self.total_anchor_count += 1;
+        self.last_fold_instant = Some(std::time::Instant::now());
     }
     
     /// Get a subnet's current state root

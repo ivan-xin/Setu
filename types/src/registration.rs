@@ -446,18 +446,19 @@ pub struct UserRegistration {
     
     /// Optional: Nostr public key (32 bytes, Schnorr x-only public key)
     /// Only present for Nostr-based registrations
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Note: must NOT use skip_serializing_if — bincode requires all fields present.
+    #[serde(default)]
     pub nostr_pubkey: Option<Vec<u8>>,
     
     /// Signature proving ownership
     /// - For MetaMask: ECDSA signature (65 bytes)
     /// - For Nostr: Schnorr signature (64 bytes)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub signature: Option<Vec<u8>>,
     
     /// Signed message (for verification)
     /// Format: "Register to Setu: {timestamp}"
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub message: Option<String>,
     
     /// Timestamp (for replay attack prevention)
@@ -479,7 +480,8 @@ pub struct UserRegistration {
     pub invite_code: Option<String>,
 
     /// Setu-native users: Base64-encoded PublicKey (flag || pk_bytes)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Note: must NOT use skip_serializing_if — bincode requires all fields present.
+    #[serde(default)]
     pub public_key: Option<String>,
 }
 

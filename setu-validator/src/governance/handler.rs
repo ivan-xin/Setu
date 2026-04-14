@@ -135,6 +135,7 @@ impl GovernanceHandler {
             content,
             submitted_at: Instant::now(),
             callback_token,
+            created_at: timestamp,
         };
 
         governance_service.insert_pending(pending);

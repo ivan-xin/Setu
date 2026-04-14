@@ -336,7 +336,8 @@ pub struct StateChange {
     pub new_value: Option<Vec<u8>>,
     /// Target subnet for this state change. None = use the Event's own subnet_id.
     /// Enables cross-subnet effects (e.g., Governance event writing to ROOT subnet).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Note: must NOT use skip_serializing_if — bincode requires all fields present.
+    #[serde(default)]
     pub target_subnet: Option<crate::subnet::SubnetId>,
 }
 

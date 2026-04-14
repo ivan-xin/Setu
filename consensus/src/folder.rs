@@ -181,23 +181,7 @@ impl ConsensusManager {
     ) -> Option<ConsensusFrame> {
         // Use AnchorBuilder.prepare_build (deferred commit mode)
         match self.anchor_builder.prepare_build(dag, vlc) {
-            Ok(pending_build) => {
-                let anchor = pending_build.anchor.clone();
-                tracing::info!(
-                    anchor_id = %anchor.id,
-                    event_count = anchor.event_ids.len(),
-                    "CF created with anchor"
-                );
-                
-                // Create ConsensusFrame from anchor
-                let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
-                
-                // Store pending_build for later commit (keyed by cf_id)
-                self.pending_builds.insert(cf.id.clone(), pending_build);
-                self.pending_cfs.insert(cf.id.clone(), cf.clone());
-                
-                Some(cf)
-            }
+            Ok(pending_build) => self.finalize_pending_build(pending_build),
             Err(AnchorBuildError::DeltaNotReached { required, current }) => {
                 tracing::debug!(required, current, "CF not created: DeltaNotReached");
                 None
@@ -215,6 +199,34 @@ impl ConsensusManager {
                 tracing::error!(error = %e, "AnchorBuilder error");
                 None
             }
+        }
+    }
+
+    /// Common post-build logic: create CF from anchor, store pending_build.
+    fn finalize_pending_build(&mut self, pending_build: PendingAnchorBuild) -> Option<ConsensusFrame> {
+        let anchor = pending_build.anchor.clone();
+        tracing::info!(
+            anchor_id = %anchor.id,
+            event_count = anchor.event_ids.len(),
+            "CF created with anchor"
+        );
+        let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
+        self.pending_builds.insert(cf.id.clone(), pending_build);
+        self.pending_cfs.insert(cf.id.clone(), cf.clone());
+        Some(cf)
+    }
+
+    /// Heartbeat: try to create CF with relaxed delta (delta >= 1 + time guard).
+    /// Returns None if conditions not met.
+    pub fn try_create_cf_heartbeat(
+        &mut self,
+        dag: &Dag,
+        vlc: &VLC,
+        heartbeat_interval: std::time::Duration,
+    ) -> Option<ConsensusFrame> {
+        match self.anchor_builder.prepare_build_heartbeat(dag, vlc, heartbeat_interval) {
+            Ok(pending_build) => self.finalize_pending_build(pending_build),
+            Err(_) => None,
         }
     }
 
