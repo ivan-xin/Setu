@@ -229,6 +229,7 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                     current_version: 0,
                     epoch: 0,
                     needs_tx_context: true,
+                    epoch_timestamp_ms: event.timestamp,
                 };
 
                 // Assemble args
@@ -462,6 +463,7 @@ mod tests {
             current_version: 0,
             epoch: 0,
             needs_tx_context: true,
+            epoch_timestamp_ms: 0,
         };
         assert_eq!(ctx.epoch, 0);
         assert!(ctx.needs_tx_context);
@@ -476,6 +478,7 @@ mod tests {
             current_version: 0,
             epoch: 42,
             needs_tx_context: true,
+            epoch_timestamp_ms: 0,
         };
         let bcs_bytes = SetuMoveEngine::build_tx_context_bcs(&ctx);
         // sender address: 32 bytes

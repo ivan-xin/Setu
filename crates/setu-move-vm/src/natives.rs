@@ -1,6 +1,6 @@
 //! Native function implementations for Setu stdlib.
 //!
-//! 8 natives registered under `0x1`:
+//! 9 natives registered under `0x1`:
 //! - object::new_uid_internal
 //! - object::delete_uid_internal
 //! - object::uid_to_address_internal
@@ -9,6 +9,7 @@
 //! - transfer::freeze_internal
 //! - tx_context::derive_id_internal
 //! - event::emit_internal
+//! - clock::timestamp_ms_internal
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -54,6 +55,7 @@ pub fn setu_native_functions() -> NativeFunctionTable {
             ("transfer", "freeze_internal", native_freeze_internal),
             ("tx_context", "derive_id_internal", native_derive_id),
             ("event", "emit_internal", native_event_emit),
+            ("clock", "timestamp_ms_internal", native_clock_timestamp),
         ],
     )
 }
@@ -357,6 +359,23 @@ fn native_event_emit(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// clock::timestamp_ms_internal
+// ═══════════════════════════════════════════════════════════════
+
+/// Move: `native fun timestamp_ms_internal(): u64;`
+///
+/// Returns the epoch timestamp in milliseconds, injected by consensus.
+fn native_clock_timestamp(
+    context: &mut NativeContext,
+    _ty_args: Vec<Type>,
+    _args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+    let ts = runtime.epoch_timestamp_ms();
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![Value::u64(ts)]))
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════
 
@@ -382,7 +401,7 @@ mod tests {
     #[test]
     fn test_make_table_count() {
         let table = setu_native_functions();
-        assert_eq!(table.len(), 8);
+        assert_eq!(table.len(), 9);
     }
 
     #[test]
@@ -393,6 +412,7 @@ mod tests {
         assert!(modules.contains(&"transfer".to_string()));
         assert!(modules.contains(&"tx_context".to_string()));
         assert!(modules.contains(&"event".to_string()));
+        assert!(modules.contains(&"clock".to_string()));
     }
 
     #[test]

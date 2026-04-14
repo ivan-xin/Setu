@@ -955,6 +955,7 @@ impl MockEnclave {
                     current_version: 0,
                     epoch: 0,
                     needs_tx_context: payload.needs_tx_context,
+                    epoch_timestamp_ms: event.timestamp,
                 };
 
                 // 5. Assemble args (R3-ISSUE-7)

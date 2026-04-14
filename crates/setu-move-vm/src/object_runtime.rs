@@ -108,6 +108,7 @@ pub struct SetuObjectRuntime {
     tx_hash: [u8; 32],
     ids_created: u64,
     sender: Address,
+    epoch_timestamp_ms: u64,
 }
 
 impl<'a> NativeExtensionMarker<'a> for SetuObjectRuntime {}
@@ -117,6 +118,7 @@ impl SetuObjectRuntime {
         input_objects: Vec<InputObject>,
         tx_hash: [u8; 32],
         sender: Address,
+        epoch_timestamp_ms: u64,
     ) -> Self {
         let input_map = input_objects
             .into_iter()
@@ -133,6 +135,7 @@ impl SetuObjectRuntime {
             tx_hash,
             ids_created: 0,
             sender,
+            epoch_timestamp_ms,
         }
     }
 
@@ -199,6 +202,11 @@ impl SetuObjectRuntime {
         self.emitted_events.push((type_tag, bcs_bytes));
     }
 
+    /// Epoch timestamp in milliseconds (injected by consensus).
+    pub fn epoch_timestamp_ms(&self) -> u64 {
+        self.epoch_timestamp_ms
+    }
+
     /// Look up a pre-loaded input object.
     pub fn get_input_object(&self, id: &ObjectId) -> Option<&InputObject> {
         self.input_objects.get(id)
@@ -238,8 +246,8 @@ mod tests {
     #[test]
     fn test_fresh_id_deterministic() {
         let tx = test_tx_hash();
-        let mut rt1 = SetuObjectRuntime::new(vec![], tx, test_address());
-        let mut rt2 = SetuObjectRuntime::new(vec![], tx, test_address());
+        let mut rt1 = SetuObjectRuntime::new(vec![], tx, test_address(), 0);
+        let mut rt2 = SetuObjectRuntime::new(vec![], tx, test_address(), 0);
 
         let id1a = rt1.fresh_id();
         let id1b = rt1.fresh_id();
@@ -253,14 +261,14 @@ mod tests {
 
     #[test]
     fn test_fresh_id_tracked_as_created() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         let id = rt.fresh_id();
         assert!(rt.created_ids.contains(&id));
     }
 
     #[test]
     fn test_transfer_object() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         let id = ObjectId::new([0x01; 32]);
         let recipient = AccountAddress::new([0x02; 32]);
         let tag = StructTag {
@@ -278,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_delete_created_is_noop() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         let id = rt.fresh_id();
         assert!(rt.created_ids.contains(&id));
 
@@ -290,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_into_results() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         let _ = rt.fresh_id();
         rt.delete_object(ObjectId::new([0xFF; 32]));
 
@@ -310,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_emit_event_recorded() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         let tag = test_struct_tag("MyEvent");
         rt.emit_event(tag.clone(), vec![0x01, 0x02]);
         assert_eq!(rt.emitted_events.len(), 1);
@@ -320,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_emit_multiple_events_ordered() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         let tag_a = test_struct_tag("EventA");
         let tag_b = test_struct_tag("EventB");
         rt.emit_event(tag_a.clone(), vec![0xAA]);
@@ -335,10 +343,22 @@ mod tests {
 
     #[test]
     fn test_emit_events_in_results() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address());
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         rt.emit_event(test_struct_tag("Ev"), vec![0x42]);
         let results = rt.into_results();
         assert_eq!(results.emitted_events.len(), 1);
         assert_eq!(results.emitted_events[0].1, vec![0x42]);
+    }
+
+    #[test]
+    fn test_epoch_timestamp_stored() {
+        let rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 1712700000000);
+        assert_eq!(rt.epoch_timestamp_ms(), 1712700000000);
+    }
+
+    #[test]
+    fn test_epoch_timestamp_zero() {
+        let rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        assert_eq!(rt.epoch_timestamp_ms(), 0);
     }
 }

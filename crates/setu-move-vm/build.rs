@@ -40,6 +40,7 @@ fn main() {
         "vec_map",
         "vec_set",
         "event",
+        "clock",
     ];
 
     let mut code = String::from(

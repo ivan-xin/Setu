@@ -59,6 +59,8 @@ pub struct MoveExecutionContext {
     pub epoch: u64,
     /// Whether the target function takes `&mut TxContext` as last parameter.
     pub needs_tx_context: bool,
+    /// Epoch timestamp in milliseconds (injected by consensus, not host clock).
+    pub epoch_timestamp_ms: u64,
 }
 
 /// Module publish/change record.
@@ -214,7 +216,7 @@ impl SetuMoveEngine {
 
         // 2. Object runtime
         let object_runtime =
-            SetuObjectRuntime::new(input_objects, ctx.tx_hash, ctx.sender);
+            SetuObjectRuntime::new(input_objects, ctx.tx_hash, ctx.sender, ctx.epoch_timestamp_ms);
 
         // 3. Extensions
         let mut extensions = NativeContextExtensions::default();
@@ -600,8 +602,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            12,
-            "Expected 12 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event)"
+            13,
+            "Expected 13 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock)"
         );
     }
 
@@ -633,7 +635,7 @@ mod tests {
             return;
         }
         let expected = ["object", "transfer", "tx_context", "balance", "coin", "setu",
-                       "vector", "option", "string", "vec_map", "vec_set"];
+                       "vector", "option", "string", "vec_map", "vec_set", "event", "clock"];
         let names: Vec<&str> = STDLIB_MODULES.iter().map(|(n, _)| *n).collect();
         for exp in &expected {
             assert!(
