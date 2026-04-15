@@ -194,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         port: config.port,
         capacity: config.capacity,
         shard_id: config.shard_id.clone(),
+        assigned_shard: None, // Auto-assigned by validator
         resources: config.resources.clone(),
         validator_address: config.validator_address.clone(),
         validator_port: config.validator_port,

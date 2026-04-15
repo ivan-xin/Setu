@@ -100,10 +100,21 @@ pub struct SolverRegistration {
     // ========== Capability Parameters ==========
     /// Maximum concurrent tasks capacity
     pub capacity: u32,
-    /// Optional shard assignment
+    /// Optional shard assignment (legacy, string-based)
     pub shard_id: Option<String>,
+    /// Assigned shard ID (numeric, for shard-based routing)
+    /// Takes precedence over shard_id if both are present
+    #[serde(default)]
+    pub assigned_shard: Option<u16>,
     /// Resource types this solver can handle
     pub resources: Vec<String>,
+    
+    // ========== Subnet Affinity ==========
+    /// Subnets this solver is permitted to serve.
+    /// Empty = universal solver (can serve any subnet).
+    /// Non-empty = dedicated solver (only serves specified subnets).
+    #[serde(default)]
+    pub permitted_subnets: Vec<crate::SubnetId>,
 }
 
 impl SolverRegistration {
@@ -125,7 +136,9 @@ impl SolverRegistration {
             signature,
             capacity: 100,
             shard_id: None,
+            assigned_shard: None,
             resources: vec![],
+            permitted_subnets: vec![],
         }
     }
     
@@ -136,6 +149,11 @@ impl SolverRegistration {
     
     pub fn with_shard(mut self, shard_id: impl Into<String>) -> Self {
         self.shard_id = Some(shard_id.into());
+        self
+    }
+    
+    pub fn with_assigned_shard(mut self, shard: u16) -> Self {
+        self.assigned_shard = Some(shard);
         self
     }
     

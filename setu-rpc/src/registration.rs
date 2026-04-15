@@ -482,6 +482,7 @@ mod tests {
             capacity: 100,
             shard_id: Some("shard-0".to_string()),
             resources: vec!["ETH".to_string(), "BTC".to_string()],
+            permitted_subnets: vec![],
         };
         
         let rpc_request = RpcRequest::RegisterSolver(request);

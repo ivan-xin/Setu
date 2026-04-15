@@ -948,6 +948,7 @@ impl ValidatorNetworkService {
             port: request.port,
             capacity: request.capacity,
             shard_id: request.shard_id.clone(),
+            assigned_shard: request.assigned_shard,
             resources: request.resources.clone(),
             status: "active".to_string(),
             registered_at: current_timestamp_secs(),
@@ -961,13 +962,22 @@ impl ValidatorNetworkService {
 
         // RouterManager still needs Transfer channel for routing decisions
         let (router_tx, _router_rx) = mpsc::unbounded_channel::<Transfer>();
+        
+        // Parse permitted_subnets from hex strings
+        let permitted_subnets: Vec<setu_types::SubnetId> = request.permitted_subnets
+            .iter()
+            .filter_map(|hex_str| setu_types::SubnetId::from_hex(hex_str).ok())
+            .collect();
+        
         self.router_manager.register_solver_with_affinity(
             request.solver_id.clone(),
             format!("{}:{}", request.address, request.port),
             request.capacity,
             router_tx,
             request.shard_id.clone(),
+            request.assigned_shard,
             request.resources.clone(),
+            permitted_subnets,
         );
 
         // Consume channel to avoid memory leak (sync HTTP doesn't use it)
@@ -1125,7 +1135,11 @@ impl ValidatorNetworkService {
                     signature: reg.signature.clone(),
                     capacity: reg.capacity,
                     shard_id: reg.shard_id.clone(),
+                    assigned_shard: reg.assigned_shard,
                     resources: reg.resources.clone(),
+                    permitted_subnets: reg.permitted_subnets.iter()
+                        .map(|s| hex::encode(s.as_bytes()))
+                        .collect(),
                 };
                 self.register_solver_internal(&request);
             }
@@ -1673,7 +1687,9 @@ mod tests {
             signature: vec![],
             capacity: 100,
             shard_id: Some("shard-0".to_string()),
+            assigned_shard: None,
             resources: vec!["ETH".to_string()],
+            permitted_subnets: vec![],
         };
 
         let response = handler.register_solver(request).await;
