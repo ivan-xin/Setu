@@ -19,12 +19,14 @@ use crate::dag::Dag;
 use crate::vlc::VLC;
 use crate::router::{EventRouter, RoutedEvents};
 use crate::merkle_integration::compute_events_root;
+use crate::outcome_sink::OutcomeSink;
 use setu_types::{
     Anchor, AnchorMerkleRoots, ConsensusConfig, ConsensusFrame, Event, EventId, SubnetId,
+    ExecutionOutcome,
     event::StateChange,
 };
-use setu_storage::{GlobalStateManager, SharedStateManager, StateApplySummary, StateApplyError};
-use std::collections::HashMap;
+use setu_storage::{GlobalStateManager, SharedStateManager, StateApplySummary, StateApplyError, ConflictRecord};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // ============================================================================
@@ -205,6 +207,9 @@ pub struct AnchorBuilder {
     /// Wall-clock time of the last successful commit_build() / synchronize_finalized_anchor().
     /// Used by heartbeat to detect "long time no CF" condition.
     last_fold_instant: Option<std::time::Instant>,
+    /// R5 · Optional outcome sink for apply-phase observability.
+    /// Default None; `set_outcomes_sink` wires production sinks (e.g. DashMapOutcomeSink).
+    outcomes_sink: Option<Arc<dyn OutcomeSink>>,
 }
 
 impl AnchorBuilder {
@@ -219,6 +224,7 @@ impl AnchorBuilder {
             last_anchor_chain_root: [0u8; 32], // Genesis: all zeros
             total_anchor_count: 0,
             last_fold_instant: None,
+            outcomes_sink: None,
         }
     }
     
@@ -235,6 +241,7 @@ impl AnchorBuilder {
             last_anchor_chain_root: [0u8; 32], // Genesis: all zeros
             total_anchor_count: 0,
             last_fold_instant: None,
+            outcomes_sink: None,
         }
     }
     
@@ -242,6 +249,75 @@ impl AnchorBuilder {
     pub fn should_fold(&self, current_vlc: &VLC) -> bool {
         let delta = current_vlc.logical_time().saturating_sub(self.last_fold_vlc);
         delta >= self.config.vlc_delta_threshold
+    }
+
+    /// R5 · Inject the outcome sink (optional; default = no sink).
+    ///
+    /// Called once by `ConsensusValidator::new` via the three-layer passthrough:
+    /// `ConsensusEngine::set_outcomes_sink` →
+    /// `ConsensusManager::set_outcomes_sink` → here.
+    pub fn set_outcomes_sink(&mut self, sink: Arc<dyn OutcomeSink>) {
+        self.outcomes_sink = Some(sink);
+    }
+
+    /// R5 · Write per-event apply outcomes to the sink.
+    ///
+    /// Called from both `commit_build` (Leader) and `apply_follower_finalized_cf`
+    /// (Follower), so Leader and Follower paths produce identical outcomes
+    /// (closes §1.2 gap-3).
+    ///
+    /// Genesis events short-circuit to `Applied` regardless of conflict set —
+    /// Genesis is pre-applied at startup, so any apply-phase "conflict" here
+    /// is an expected re-apply, not a real stale read (R1-ISSUE-1).
+    fn ingest_outcomes(
+        &self,
+        cf_id: &str,
+        applied_events: &[Event],
+        summary: &StateApplySummary,
+    ) {
+        let Some(sink) = self.outcomes_sink.as_ref() else {
+            return;
+        };
+
+        let failed: HashSet<&str> =
+            summary.failed_events.iter().map(String::as_str).collect();
+        let conflicted: HashMap<&str, &str> = summary
+            .conflicted_events
+            .iter()
+            .map(|r| (r.event_id.as_str(), r.conflicting_object.as_str()))
+            .collect();
+
+        for ev in applied_events {
+            if ev.is_genesis() {
+                sink.record(
+                    ev.id.clone(),
+                    ExecutionOutcome::Applied { cf_id: cf_id.to_string() },
+                );
+                continue;
+            }
+            let outcome = if let Some(obj) = conflicted.get(ev.id.as_str()) {
+                ExecutionOutcome::StaleRead {
+                    cf_id: cf_id.to_string(),
+                    conflicting_object: (*obj).to_string(),
+                    retry_hint: format!(
+                        "object {} was concurrently modified; re-read and retry",
+                        obj
+                    ),
+                }
+            } else if failed.contains(ev.id.as_str()) {
+                let reason = ev
+                    .execution_result
+                    .as_ref()
+                    .and_then(|r| r.message.clone());
+                ExecutionOutcome::ExecutionFailed {
+                    cf_id: cf_id.to_string(),
+                    reason,
+                }
+            } else {
+                ExecutionOutcome::Applied { cf_id: cf_id.to_string() }
+            };
+            sink.record(ev.id.clone(), outcome);
+        }
     }
     
     /// Get the shared state manager
@@ -466,6 +542,7 @@ impl AnchorBuilder {
         // Apply state changes to SMT and commit in a single write lock
         let events = pending.all_events();
         let anchor_id = self.anchor_depth + 1;
+        let cf_id = pending.anchor.id.clone();
         let state_summary = {
             let mut guard = self.shared.lock_write();
             let summary = guard.apply_committed_events(&events);
@@ -474,6 +551,9 @@ impl AnchorBuilder {
             self.shared.publish_snapshot(&guard);
             summary
         };
+
+        // R5: record per-event outcomes after apply (Leader path).
+        self.ingest_outcomes(&cf_id, &events, &state_summary);
         
         // Update AnchorBuilder state
         self.last_anchor = Some(pending.anchor);
@@ -536,6 +616,10 @@ impl AnchorBuilder {
             self.shared.publish_snapshot(&guard);
             summary
         };
+
+        // R5: record per-event outcomes after apply (Follower path).
+        self.ingest_outcomes(&cf.anchor.id, events, &state_summary);
+
         self.synchronize_finalized_anchor(&cf.anchor);
         
         Ok(state_summary)
@@ -1030,5 +1114,204 @@ mod tests {
         // Last anchor should link to first
         let last_anchor = builder.last_anchor().unwrap();
         assert!(last_anchor.previous_anchor.is_some());
+    }
+
+    // ============================================
+    // R5 · ingest_outcomes tests (U3–U8)
+    // ============================================
+
+    /// In-memory OutcomeSink that captures every `record()` call for
+    /// assertions. Only used in tests.
+    #[derive(Default)]
+    struct CapturingSink {
+        records: std::sync::Mutex<Vec<(String, ExecutionOutcome)>>,
+    }
+
+    impl CapturingSink {
+        fn recorded(&self) -> Vec<(String, ExecutionOutcome)> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    impl OutcomeSink for CapturingSink {
+        fn record(&self, event_id: String, outcome: ExecutionOutcome) {
+            self.records.lock().unwrap().push((event_id, outcome));
+        }
+    }
+
+    fn make_event_transfer(id_suffix: &str) -> Event {
+        let mut ev = Event::new(
+            EventType::Transfer,
+            vec![],
+            VLCSnapshot::default(),
+            format!("creator-{id_suffix}"),
+        );
+        ev.id = format!("ev-{id_suffix}");
+        ev.execution_result = Some(ExecutionResult::success());
+        ev
+    }
+
+    /// U3: No sink wired → `ingest_outcomes` is a no-op (no panic, no record).
+    #[test]
+    fn test_ingest_outcomes_none_sink_noop() {
+        let builder = AnchorBuilder::new(ConsensusConfig::default());
+        let events = vec![make_event_transfer("a")];
+        let summary = StateApplySummary::default();
+        // Should not panic; nothing to observe.
+        builder.ingest_outcomes("cf-x", &events, &summary);
+    }
+
+    /// U4: Applied path — no failure/conflict records → every event recorded
+    /// as `Applied { cf_id }`.
+    #[test]
+    fn test_ingest_outcomes_applied() {
+        let mut builder = AnchorBuilder::new(ConsensusConfig::default());
+        let sink = Arc::new(CapturingSink::default());
+        builder.set_outcomes_sink(sink.clone());
+
+        let events = vec![make_event_transfer("a"), make_event_transfer("b")];
+        let summary = StateApplySummary::default();
+        builder.ingest_outcomes("cf-1", &events, &summary);
+
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 2);
+        for (_, outcome) in &recorded {
+            assert_eq!(outcome.kind(), "applied");
+            assert_eq!(outcome.cf_id(), "cf-1");
+        }
+    }
+
+    /// U5: Conflicted event → `StaleRead` with populated `conflicting_object`
+    /// and deterministic `retry_hint`.
+    #[test]
+    fn test_ingest_outcomes_stale_read() {
+        let mut builder = AnchorBuilder::new(ConsensusConfig::default());
+        let sink = Arc::new(CapturingSink::default());
+        builder.set_outcomes_sink(sink.clone());
+
+        let ev = make_event_transfer("a");
+        let oid = test_oid_key("coin-1");
+        let summary = StateApplySummary {
+            conflicted_events: vec![ConflictRecord {
+                event_id: ev.id.clone(),
+                conflicting_object: oid.clone(),
+            }],
+            ..Default::default()
+        };
+
+        builder.ingest_outcomes("cf-2", &[ev.clone()], &summary);
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0].1 {
+            ExecutionOutcome::StaleRead {
+                cf_id,
+                conflicting_object,
+                retry_hint,
+            } => {
+                assert_eq!(cf_id, "cf-2");
+                assert_eq!(conflicting_object, &oid);
+                assert!(retry_hint.contains(&oid));
+                assert!(retry_hint.contains("re-read and retry"));
+            }
+            other => panic!("expected StaleRead, got {:?}", other),
+        }
+    }
+
+    /// U6: Failed event (execution_result.success=false) → `ExecutionFailed`
+    /// with `reason` pulled from `event.execution_result.message`.
+    #[test]
+    fn test_ingest_outcomes_execution_failed() {
+        let mut builder = AnchorBuilder::new(ConsensusConfig::default());
+        let sink = Arc::new(CapturingSink::default());
+        builder.set_outcomes_sink(sink.clone());
+
+        let mut ev = make_event_transfer("a");
+        ev.execution_result = Some(ExecutionResult::failure("insufficient funds"));
+        let summary = StateApplySummary {
+            failed_events: vec![ev.id.clone()],
+            ..Default::default()
+        };
+
+        builder.ingest_outcomes("cf-3", &[ev.clone()], &summary);
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0].1 {
+            ExecutionOutcome::ExecutionFailed { cf_id, reason } => {
+                assert_eq!(cf_id, "cf-3");
+                assert_eq!(reason.as_deref(), Some("insufficient funds"));
+            }
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    /// U7: Genesis event — even if `conflicted_events` lists it (re-apply at
+    /// startup), it must be recorded as `Applied` (R1-ISSUE-1 regression).
+    #[test]
+    fn test_ingest_outcomes_genesis_short_circuit() {
+        let mut builder = AnchorBuilder::new(ConsensusConfig::default());
+        let sink = Arc::new(CapturingSink::default());
+        builder.set_outcomes_sink(sink.clone());
+
+        let mut genesis = Event::new(
+            EventType::Genesis,
+            vec![],
+            VLCSnapshot::default(),
+            "bootstrap".to_string(),
+        );
+        genesis.id = "ev-genesis".to_string();
+
+        // Adversarial: conflict record tries to mark Genesis as stale.
+        let summary = StateApplySummary {
+            conflicted_events: vec![ConflictRecord {
+                event_id: genesis.id.clone(),
+                conflicting_object: test_oid_key("system"),
+            }],
+            ..Default::default()
+        };
+
+        builder.ingest_outcomes("cf-genesis", &[genesis.clone()], &summary);
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1.kind(), "applied");
+    }
+
+    /// U8: Mixed batch — Applied + StaleRead + ExecutionFailed in one
+    /// invocation; each event gets its correct verdict.
+    #[test]
+    fn test_ingest_outcomes_mixed_batch() {
+        let mut builder = AnchorBuilder::new(ConsensusConfig::default());
+        let sink = Arc::new(CapturingSink::default());
+        builder.set_outcomes_sink(sink.clone());
+
+        let ev_ok = make_event_transfer("ok");
+        let ev_conflict = make_event_transfer("conflict");
+        let mut ev_failed = make_event_transfer("failed");
+        ev_failed.execution_result = Some(ExecutionResult::failure("bad sig"));
+        let oid = test_oid_key("coin-x");
+
+        let summary = StateApplySummary {
+            failed_events: vec![ev_failed.id.clone()],
+            conflicted_events: vec![ConflictRecord {
+                event_id: ev_conflict.id.clone(),
+                conflicting_object: oid.clone(),
+            }],
+            ..Default::default()
+        };
+
+        builder.ingest_outcomes(
+            "cf-mix",
+            &[ev_ok.clone(), ev_conflict.clone(), ev_failed.clone()],
+            &summary,
+        );
+
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 3);
+        // Order preserved.
+        assert_eq!(recorded[0].0, ev_ok.id);
+        assert_eq!(recorded[0].1.kind(), "applied");
+        assert_eq!(recorded[1].0, ev_conflict.id);
+        assert_eq!(recorded[1].1.kind(), "stale_read");
+        assert_eq!(recorded[2].0, ev_failed.id);
+        assert_eq!(recorded[2].1.kind(), "execution_failed");
     }
 }

@@ -47,6 +47,7 @@ use setu_rpc::{
     SubmitTransfersBatchRequest, SubmitTransfersBatchResponse,
 };
 use setu_types::event::{Event, EventPayload};
+use setu_types::ExecutionOutcome;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -132,6 +133,11 @@ pub struct ValidatorNetworkService {
 
     /// Governance service for Agent subnet integration (optional)
     governance_service: Option<Arc<GovernanceService>>,
+
+    /// R5 · Shared map of per-event apply outcomes, written by consensus layer
+    /// (`DashMapOutcomeSink`) and read by `GET /api/v1/event/:id`.
+    /// Empty (and forever so) when constructed without consensus.
+    execution_outcomes: Arc<DashMap<String, ExecutionOutcome>>,
 }
 
 impl ValidatorNetworkService {
@@ -212,6 +218,7 @@ impl ValidatorNetworkService {
             coin_reservation_manager,
             tee_executor,
             governance_service: None,
+            execution_outcomes: Arc::new(DashMap::new()),
         }
     }
 
@@ -269,6 +276,9 @@ impl ValidatorNetworkService {
         // Use the passed-in batch_task_preparer (shares state with TaskPreparer)
         let batch_task_preparer = batch_task_preparer;
 
+        // R5: share the consensus validator's outcome map so RPC can read it.
+        let execution_outcomes = consensus_validator.execution_outcomes();
+
         Self {
             validator_id,
             router_manager,
@@ -293,6 +303,7 @@ impl ValidatorNetworkService {
             coin_reservation_manager,
             tee_executor,
             governance_service: None,
+            execution_outcomes,
         }
     }
 
@@ -499,6 +510,7 @@ impl ValidatorNetworkService {
             // Event endpoints
             .route("/api/v1/event", post(setu_api::http_submit_event::<ValidatorNetworkService>))
             .route("/api/v1/events", get(setu_api::http_get_events::<ValidatorNetworkService>))
+            .route("/api/v1/event/:id", get(setu_api::http_get_event_by_id::<ValidatorNetworkService>))
             // Heartbeat
             .route("/api/v1/heartbeat", post(setu_api::http_heartbeat::<ValidatorNetworkService>))
             // User RPC endpoints
@@ -620,6 +632,57 @@ impl ValidatorNetworkService {
 
     pub fn get_events(&self) -> Vec<Event> {
         EventHandler::get_events(&self.events)
+    }
+
+    /// R5 · Build `GetEventResponse` for a single event, merging execution
+    /// report (from `events` map) and on-chain outcome (from shared sink map).
+    ///
+    /// Returns `None` if the validator has no record of this event.
+    pub fn get_event_by_id(&self, event_id: &str) -> Option<setu_api::GetEventResponse> {
+        let event = self.events.get(event_id)?.clone();
+        let outcome = self.execution_outcomes.get(event_id).map(|v| v.clone());
+
+        let execution = event.execution_result.as_ref().map(|r| {
+            setu_api::ExecutionReport {
+                success: r.success,
+                message: r.message.clone(),
+                state_changes_count: r.state_changes.len(),
+            }
+        });
+
+        let on_chain = outcome.map(|o| match o {
+            ExecutionOutcome::Applied { cf_id } => {
+                setu_api::OnChainOutcome::Applied { cf_id }
+            }
+            ExecutionOutcome::ExecutionFailed { cf_id, reason } => {
+                setu_api::OnChainOutcome::ExecutionFailed { cf_id, reason }
+            }
+            ExecutionOutcome::StaleRead {
+                cf_id,
+                conflicting_object,
+                retry_hint,
+            } => setu_api::OnChainOutcome::StaleRead {
+                cf_id,
+                conflicting_object,
+                retry_hint,
+            },
+        });
+
+        let metadata = setu_api::EventMetadata {
+            event_type: event.event_type.name().to_string(),
+            creator: event.creator.clone(),
+            timestamp: event.timestamp,
+            vlc_time: event.vlc_snapshot.logical_time,
+            parent_count: event.parent_ids.len(),
+        };
+
+        Some(setu_api::GetEventResponse {
+            event_id: event.id.clone(),
+            status: format!("{:?}", event.status),
+            execution,
+            on_chain,
+            metadata,
+        })
     }
 
     pub async fn add_event_to_dag(&self, event: Event) {
@@ -1214,6 +1277,10 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     fn get_events(&self) -> Vec<Event> {
         self.get_events()
+    }
+
+    fn get_event_by_id(&self, event_id: &str) -> Option<setu_api::GetEventResponse> {
+        self.get_event_by_id(event_id)
     }
 
     fn get_balance(&self, account: &str) -> setu_api::GetBalanceResponse {

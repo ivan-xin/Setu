@@ -23,6 +23,7 @@ use setu_merkle::{
     B4Store, MerkleStore,
     SubnetAggregationTree, SubnetStateEntry,
 };
+use serde::{Deserialize, Serialize};
 use setu_types::{SubnetId, AnchorMerkleRoots};
 use setu_types::event::{Event, StateChange, ExecutionResult};
 use setu_types::envelope::{detect_and_parse, StorageFormat};
@@ -1065,7 +1066,10 @@ impl GlobalStateManager {
                                 key = %change.key,
                                 "Conflict detected: old_value mismatch, skipping event (stale read)"
                             );
-                            summary.conflicted_events.push(event.id.clone());
+                            summary.conflicted_events.push(ConflictRecord {
+                                event_id: event.id.clone(),
+                                conflicting_object: change.key.clone(),
+                            });
                             continue 'event_loop;
                         }
                     } else if change.new_value.is_some() {
@@ -1093,7 +1097,10 @@ impl GlobalStateManager {
                                     "Create conflict: key already exists (duplicate coin ID?), skipping event"
                                 );
                             }
-                            summary.conflicted_events.push(event.id.clone());
+                            summary.conflicted_events.push(ConflictRecord {
+                                event_id: event.id.clone(),
+                                conflicting_object: change.key.clone(),
+                            });
                             continue 'event_loop;
                         }
                     }
@@ -1276,21 +1283,34 @@ pub struct RecoverySummary {
 }
 
 /// Summary of state changes applied during anchor processing
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateApplySummary {
     /// Changes per subnet: (event_count, total_changes, final_root)
     pub subnet_stats: HashMap<SubnetId, SubnetApplyStats>,
     /// Events that failed execution (skipped)
     pub failed_events: Vec<String>,
-    /// Events rejected due to stale read (old_value mismatch with current state)
-    pub conflicted_events: Vec<String>,
+    /// Events rejected due to stale read (old_value mismatch with current state).
+    /// R5: each record carries the first conflicting object key ("oid:{hex}", G11)
+    /// so that RPC callers can tell clients which object to re-read.
+    pub conflicted_events: Vec<ConflictRecord>,
     /// Total events processed
     pub total_events: usize,
     /// Total state changes applied
     pub total_changes: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+/// R5 · Detail of one conflicted event.
+///
+/// `conflicting_object` is the key of the first `StateChange` that failed the
+/// byte-level `old_value` check (stale read) or the create-conflict check.
+/// Format: `"oid:{hex}"` (G11). Preserved verbatim from `StateChange.key`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictRecord {
+    pub event_id: String,
+    pub conflicting_object: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubnetApplyStats {
     pub event_count: usize,
     pub change_count: usize,
@@ -1556,7 +1576,12 @@ mod tests {
         
         // T2 should be detected as conflicted (old_value mismatch)
         assert_eq!(summary.conflicted_events.len(), 1, "T2 should be conflicted");
-        assert_eq!(summary.conflicted_events[0], event2.id);
+        assert_eq!(summary.conflicted_events[0].event_id, event2.id);
+        assert_eq!(summary.conflicted_events[0].conflicting_object, coin_key);
+        assert!(
+            summary.conflicted_events[0].conflicting_object.starts_with("oid:"),
+            "conflicting_object must preserve G11 \"oid:{{hex}}\" format"
+        );
         
         // Verify final state: only T1's changes applied
         let smt = manager.root_subnet();
@@ -1710,8 +1735,9 @@ mod tests {
         let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()]);
 
         assert_eq!(summary.total_events, 1, "Only T1 should commit");
-        assert_eq!(summary.conflicted_events, vec![t2.id.clone()],
-            "T2 must be rejected as concurrent-swap conflict");
+        assert_eq!(summary.conflicted_events.len(), 1, "T2 must be rejected as concurrent-swap conflict");
+        assert_eq!(summary.conflicted_events[0].event_id, t2.id);
+        assert_eq!(summary.conflicted_events[0].conflicting_object, key);
 
         let hv = HashValue::from_slice(&shared_oid).unwrap();
         assert_eq!(manager.root_subnet().get(&hv), Some(&env_v2_a),

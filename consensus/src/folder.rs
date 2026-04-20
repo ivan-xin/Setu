@@ -3,6 +3,7 @@ use setu_types::{
 };
 use crate::anchor_builder::{AnchorBuilder, AnchorBuildResult, AnchorBuildError, PendingAnchorBuild};
 use crate::dag::Dag;
+use crate::outcome_sink::OutcomeSink;
 use crate::vlc::VLC;
 use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
@@ -166,6 +167,14 @@ impl ConsensusManager {
             local_validator_id: validator_id,
             last_build_result: None,
         }
+    }
+
+    /// R5 · Inject an outcome sink; forwarded to the underlying AnchorBuilder.
+    ///
+    /// Default = no sink (`ingest_outcomes` short-circuits). Called once by
+    /// `ConsensusEngine::set_outcomes_sink` during validator initialization.
+    pub fn set_outcomes_sink(&mut self, sink: Arc<dyn OutcomeSink>) {
+        self.anchor_builder.set_outcomes_sink(sink);
     }
 
     /// Try to create a ConsensusFrame with full Merkle tree computation

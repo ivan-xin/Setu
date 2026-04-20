@@ -210,3 +210,63 @@ pub struct ListModulesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+
+// ============================================
+// R5 · Event lookup (GET /api/v1/event/:id)
+// ============================================
+
+/// Chain-level verdict projection exposed to HTTP clients.
+///
+/// Distinct from `setu_types::ExecutionOutcome` so the API can evolve its
+/// wire shape (e.g. add fields, rename) without touching consensus/storage
+/// layers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OnChainOutcome {
+    Applied {
+        cf_id: String,
+    },
+    ExecutionFailed {
+        cf_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    StaleRead {
+        cf_id: String,
+        conflicting_object: String,
+        retry_hint: String,
+    },
+}
+
+/// Off-chain (TEE / solver) execution result snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionReport {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub state_changes_count: usize,
+}
+
+/// Minimal event metadata for client display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMetadata {
+    pub event_type: String,
+    pub creator: String,
+    pub timestamp: u64,
+    pub vlc_time: u64,
+    pub parent_count: usize,
+}
+
+/// Response for `GET /api/v1/event/:id`.
+///
+/// `on_chain` is `None` until the event's CF is finalized by the local node.
+/// `execution` is `None` for events that never reached the solver (e.g.
+/// Genesis / validator-executed system events).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetEventResponse {
+    pub event_id: String,
+    pub status: String,
+    pub execution: Option<ExecutionReport>,
+    pub on_chain: Option<OnChainOutcome>,
+    pub metadata: EventMetadata,
+}

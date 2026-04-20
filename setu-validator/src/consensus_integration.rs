@@ -20,12 +20,13 @@
 use consensus::{
     ConsensusEngine, ConsensusMessage, DagStats as ConsensusDagStats,
     ValidatorSet, TeeVerifier, VerificationResult,
-    liveness::Round, ConsensusBroadcaster,
+    liveness::Round, ConsensusBroadcaster, OutcomeSink,
 };
+use crate::outcome_sink::DashMapOutcomeSink;
 use crate::protocol::NetworkEvent;
 use setu_types::{
     Anchor, ConsensusConfig, ConsensusFrame, Event, EventId, Vote,
-    NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId,
+    NodeInfo, ValidatorInfo, SetuResult, SetuError, SubnetId, ExecutionOutcome,
 };
 use setu_storage::SharedStateManager;
 use setu_storage::subnet_state::GlobalStateManager;
@@ -97,6 +98,9 @@ pub struct ConsensusValidator {
     message_rx: Arc<Mutex<mpsc::Receiver<ConsensusMessage>>>,
     /// Broadcast channel for CF finalization notifications
     finalization_tx: broadcast::Sender<ConsensusFrame>,
+    /// R5: shared map of per-event apply outcomes (Applied / StaleRead / ExecutionFailed).
+    /// Written by consensus via `DashMapOutcomeSink`, read by RPC handlers.
+    execution_outcomes: Arc<dashmap::DashMap<String, ExecutionOutcome>>,
     /// Pending votes awaiting quorum (reserved for future use)
     #[allow(dead_code)]
     pending_votes: Arc<RwLock<HashMap<String, Vec<Vote>>>>,
@@ -140,7 +144,12 @@ impl ConsensusValidator {
 
         // Wire finalization broadcast channel into engine
         engine.set_finalization_tx(finalization_tx.clone());
-        
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -155,6 +164,7 @@ impl ConsensusValidator {
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -195,7 +205,12 @@ impl ConsensusValidator {
 
         // Wire finalization broadcast channel into engine
         engine.set_finalization_tx(finalization_tx.clone());
-        
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -210,6 +225,7 @@ impl ConsensusValidator {
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -252,7 +268,12 @@ impl ConsensusValidator {
 
         // Wire finalization broadcast channel into engine
         engine.set_finalization_tx(finalization_tx.clone());
-        
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -267,6 +288,7 @@ impl ConsensusValidator {
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -324,7 +346,12 @@ impl ConsensusValidator {
 
         // Wire finalization broadcast channel into engine
         engine.set_finalization_tx(finalization_tx.clone());
-        
+
+        // R5: wire outcome sink (shared between consensus writer and RPC reader).
+        let outcomes_sink = Arc::new(DashMapOutcomeSink::new());
+        let execution_outcomes = outcomes_sink.map();
+        engine.set_outcomes_sink(outcomes_sink as Arc<dyn OutcomeSink>);
+
         // Create TEE verifier with empty registry (permissive mode for now)
         let tee_verifier = Arc::new(TeeVerifier::permissive());
         
@@ -339,6 +366,7 @@ impl ConsensusValidator {
             message_tx: msg_tx,
             message_rx: Arc::new(Mutex::new(msg_rx)),
             finalization_tx,
+            execution_outcomes,
             pending_votes: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
         }
@@ -400,6 +428,16 @@ impl ConsensusValidator {
     /// Get the anchor store (for queries of finalized anchors)
     pub fn anchor_store(&self) -> Arc<dyn AnchorStoreBackend> {
         Arc::clone(&self.anchor_store)
+    }
+
+    /// R5 · Get the shared execution-outcome map for RPC reads.
+    ///
+    /// The validator's consensus writer (via `DashMapOutcomeSink`) and the
+    /// network service share this same `Arc<DashMap>`, so the service can
+    /// look up `(event_id → ExecutionOutcome)` synchronously during
+    /// `GET /api/v1/event/:id` handling.
+    pub fn execution_outcomes(&self) -> Arc<dashmap::DashMap<String, ExecutionOutcome>> {
+        Arc::clone(&self.execution_outcomes)
     }
 
     /// Add a remote validator to the consensus set.

@@ -69,6 +69,10 @@ pub trait ValidatorService: Send + Sync {
     
     /// Get events
     fn get_events(&self) -> Vec<setu_types::event::Event>;
+
+    /// R5 · Get a single event's full status (execution + on-chain verdict).
+    /// Returns `None` if the event is not known to this validator.
+    fn get_event_by_id(&self, event_id: &str) -> Option<GetEventResponse>;
     
     /// Get balance (state query)
     fn get_balance(&self, account: &str) -> GetBalanceResponse;
@@ -257,6 +261,27 @@ pub async fn http_get_events<S: ValidatorService>(
             "parent_count": e.parent_ids.len(),
         })).collect::<Vec<_>>()
     }))
+}
+
+/// R5 · Get a single event by id.
+///
+/// Returns 404 when the validator has never seen the event.  When the event
+/// exists but has not yet been applied in a finalized CF, `on_chain` is
+/// `null` — callers should poll.
+pub async fn http_get_event_by_id<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+) -> Result<Json<GetEventResponse>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    match service.get_event_by_id(&event_id) {
+        Some(resp) => Ok(Json(resp)),
+        None => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "event not found",
+                "event_id": event_id,
+            })),
+        )),
+    }
 }
 
 // ============================================

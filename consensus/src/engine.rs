@@ -31,6 +31,7 @@ use crate::dag::Dag;
 use crate::dag_manager::{DagManager, DagManagerError};
 use crate::folder::ConsensusManager;
 use crate::liveness::Round;
+use crate::outcome_sink::OutcomeSink;
 use crate::validator_set::ValidatorSet;
 use crate::vlc::VLC;
 
@@ -300,6 +301,23 @@ impl ConsensusEngine {
     /// Called by ConsensusValidator after engine construction.
     pub fn set_finalization_tx(&self, tx: broadcast::Sender<ConsensusFrame>) {
         *self.finalization_tx.write() = Some(tx);
+    }
+
+    /// R5 · Inject an outcome sink for apply-phase observability.
+    ///
+    /// Called by `ConsensusValidator::new` after engine construction. Forwards
+    /// to `ConsensusManager::set_outcomes_sink` → `AnchorBuilder::set_outcomes_sink`.
+    /// Default (no sink injected) keeps `ingest_outcomes` as a no-op, so tests
+    /// that build engines without wiring a sink remain unaffected.
+    ///
+    /// Must be invoked before consensus loops start, identical timing to
+    /// `set_finalization_tx`. Uses `try_write` so the call stays synchronous
+    /// and can run inside `ConsensusValidator::new()` (which is not async).
+    pub fn set_outcomes_sink(&self, sink: Arc<dyn OutcomeSink>) {
+        self.consensus_manager
+            .try_write()
+            .expect("set_outcomes_sink must be called before consensus starts")
+            .set_outcomes_sink(sink);
     }
     
     /// Get a reference to the broadcaster for making network requests
