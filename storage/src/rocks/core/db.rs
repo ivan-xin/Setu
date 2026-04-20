@@ -316,7 +316,14 @@ impl SetuDB {
             }))
     }
 
-    /// Iterate with a prefix
+    /// Iterate with a prefix.
+    ///
+    /// Keys are bincode-decoded, values are BCS-decoded.
+    /// An explicit `take_while` enforces the prefix boundary — RocksDB's
+    /// `prefix_iterator_cf` without a configured `prefix_extractor` only
+    /// seeks to the prefix position but does NOT stop at the prefix boundary,
+    /// so without this filter the iterator would silently leak keys from
+    /// adjacent prefix ranges (mirrors `prefix_scan_keys` behavior).
     pub fn prefix_iter<P, K, V>(
         &self,
         cf: ColumnFamily,
@@ -329,10 +336,15 @@ impl SetuDB {
     {
         let cf_handle = self.cf_handle(cf)?;
         let prefix_bytes = Self::encode_key(prefix)?;
+        let prefix_owned = prefix_bytes.clone();
 
         Ok(self
             .db
             .prefix_iterator_cf(cf_handle, &prefix_bytes)
+            .take_while(move |result| match result {
+                Ok((k, _)) => k.starts_with(&prefix_owned),
+                Err(_) => false,
+            })
             .map(|result| {
                 let (key_bytes, value_bytes) = result?;
                 let key = bincode::decode_from_slice(&key_bytes, bincode::config::standard())
