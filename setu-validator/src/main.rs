@@ -225,18 +225,25 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create SHARED GlobalStateManager (used by both TaskPreparer and ConsensusValidator)
-    let shared_state_manager: Arc<SharedStateManager> = if let Some(ref db) = db {
+    let (shared_state_manager, gsm_recovered) = if let Some(ref db) = db {
         let merkle_store: Arc<dyn B4StoreExt> = Arc::new(RocksDBMerkleStore::from_shared(db.clone()));
         let mut manager = GlobalStateManager::with_store(merkle_store);
         // Recover all subnet SMT trees from persisted state (B4 commit data)
-        match manager.recover() {
-            Ok(summary) => info!("✓ GSM recovered: {} subnets, {} leaves",
-                summary.subnets_recovered, summary.total_leaves),
-            Err(e) => warn!("GSM recovery failed: {}, starting fresh: {}", e, e),
-        }
-        Arc::new(SharedStateManager::new(manager))
+        let recovered = match manager.recover() {
+            Ok(summary) => {
+                let has_data = summary.total_leaves > 0;
+                info!("✓ GSM recovered: {} subnets, {} leaves, {} root mismatches",
+                    summary.subnets_recovered, summary.total_leaves, summary.root_mismatches);
+                has_data
+            }
+            Err(e) => {
+                warn!("GSM recovery failed: {}, starting fresh", e);
+                false
+            }
+        };
+        (Arc::new(SharedStateManager::new(manager)), recovered)
     } else {
-        Arc::new(SharedStateManager::new(GlobalStateManager::new()))
+        (Arc::new(SharedStateManager::new(GlobalStateManager::new())), false)
     };
     
     // Create task preparer with the SHARED state manager
@@ -328,7 +335,16 @@ async fn main() -> anyhow::Result<()> {
     // ========================================
     // Genesis Event: Initialize seed accounts
     // ========================================
-    {
+    if gsm_recovered {
+        info!("✓ Skipping genesis — state recovered from persistent storage");
+        // Rebuild indexes from recovered SMT data so balance/coin queries work
+        {
+            let mut gsm = shared_state_manager.lock_write();
+            let indexed = gsm.rebuild_coin_type_index();
+            shared_state_manager.publish_snapshot(&gsm);
+            info!("✓ Indexes rebuilt from recovered state: {} objects indexed", indexed);
+        }
+    } else {
         match &genesis_result {
             Ok(genesis_config) => {
                 info!(
@@ -504,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
                 warn!("No genesis config loaded ({}), starting with empty state", e);
             }
         }
-    }
+    } // end else (fresh genesis)
     
     // ========================================
     // Phase 2: P2P Network Startup
