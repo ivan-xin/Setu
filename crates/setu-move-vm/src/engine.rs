@@ -84,6 +84,7 @@ pub enum MoveStateChangeType {
     Update,
     Delete,
     Freeze,
+    Share,
 }
 
 /// Full output of a Move function execution.
@@ -368,8 +369,12 @@ impl SetuMoveEngine {
         let mut changes = vec![];
         let new_version = base_version + 1;
 
-        // Transfers (creates + updates)
+        // Transfers (creates + updates). Skip objects that were shared or
+        // frozen in the same TX — share/freeze are terminal ownership transitions.
         for (id, effect) in &results.transfers {
+            if results.shared.contains_key(id) || results.frozen.contains_key(id) {
+                continue;
+            }
             let new_owner = move_addr_to_setu(&effect.new_owner);
             let envelope = ObjectEnvelope::from_move_result(
                 *id,
@@ -399,15 +404,23 @@ impl SetuMoveEngine {
 
         // Mutations (&mut objects modified in-place)
         for (id, effect) in &results.mutated {
-            if results.transfers.contains_key(id) {
-                continue; // transfer takes precedence
+            if results.transfers.contains_key(id)
+                || results.shared.contains_key(id)
+                || results.frozen.contains_key(id)
+            {
+                continue; // transfer / share / freeze take precedence
             }
             let input = results.input_objects.get(id);
             let owner = input
                 .map(|i| i.owner)
                 .unwrap_or(Address::ZERO);
+            // R4-ISSUE-2: preserve the original ownership enum.
+            // InputObject carries `ownership` so &mut mutations of Shared /
+            // Immutable / ObjectOwner inputs persist back with the correct
+            // Ownership variant instead of being silently demoted to
+            // AddressOwner.
             let ownership = input
-                .map(|i| Ownership::AddressOwner(i.owner))
+                .map(|i| i.ownership)
                 .unwrap_or(Ownership::AddressOwner(Address::ZERO));
 
             let envelope = ObjectEnvelope::from_move_result(
@@ -446,6 +459,41 @@ impl SetuMoveEngine {
             changes.push(MoveStateChange {
                 object_id: *id,
                 change_type: MoveStateChangeType::Freeze,
+                old_state: input.map(|i| i.envelope_bytes.clone()),
+                new_state: Some(envelope.to_bytes()),
+            });
+        }
+
+        // Shared objects (PWOO): Ownership → Shared { initial_shared_version }.
+        // For newly-created + same-TX share the effect's initial_shared_version
+        // is 0; the envelope is persisted with version bumped to `new_version`,
+        // so downstream references must use expected_version=new_version.
+        for (id, effect) in &results.shared {
+            let input = results.input_objects.get(id);
+            // Preserve the original owner in `envelope.owner` for historical
+            // traceability; the `ownership` enum is the source of truth.
+            let owner = input.map(|i| i.owner).unwrap_or(Address::ZERO);
+
+            let envelope = ObjectEnvelope::from_move_result(
+                *id,
+                owner,
+                new_version,
+                Ownership::Shared {
+                    initial_shared_version: effect.initial_shared_version,
+                },
+                effect.type_tag.to_string(),
+                effect.bcs_bytes.clone(),
+            );
+
+            let change_type = if results.created_ids.contains(id) {
+                MoveStateChangeType::Create
+            } else {
+                MoveStateChangeType::Share
+            };
+
+            changes.push(MoveStateChange {
+                object_id: *id,
+                change_type,
                 old_state: input.map(|i| i.envelope_bytes.clone()),
                 new_state: Some(envelope.to_bytes()),
             });
@@ -602,8 +650,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            13,
-            "Expected 13 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock)"
+            14,
+            "Expected 14 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control)"
         );
     }
 
@@ -753,5 +801,99 @@ mod tests {
     fn test_detect_needs_tx_context_invalid_bytecode() {
         let result = detect_needs_tx_context(b"not valid bytecode", "anything");
         assert_eq!(result, None, "invalid bytecode should return None (deserialization fails)");
+    }
+
+    // R4-ISSUE-2 regression: mutating a Shared input via `&mut` must NOT
+    // silently demote the persisted envelope to AddressOwner.
+    #[test]
+    fn test_mutated_shared_input_preserves_shared_ownership() {
+        use crate::object_runtime::{
+            InputObject, ObjectMutationEffect, ObjectRuntimeResults,
+        };
+        use indexmap::{IndexMap, IndexSet};
+        use move_core_types::{
+            account_address::AccountAddress, identifier::Identifier,
+            language_storage::StructTag,
+        };
+        use setu_types::{
+            object::{Address, ObjectId},
+            Ownership,
+        };
+        use std::collections::BTreeMap;
+
+        let engine = SetuMoveEngine::new().expect("engine init");
+
+        let id = ObjectId::new([0x42; 32]);
+        let owner = Address::new([0x11; 32]);
+        let isv = 5u64;
+        let tag = StructTag {
+            address: AccountAddress::ONE,
+            module: Identifier::new("pool").unwrap(),
+            name: Identifier::new("Pool").unwrap(),
+            type_params: vec![],
+        };
+
+        // Build a Shared input — this is exactly what the executor gives us
+        // when a `shared_object_ids` entry is loaded.
+        let pre_envelope = setu_types::ObjectEnvelope::from_move_result(
+            id,
+            owner,
+            7, // pre-mutation version
+            Ownership::Shared { initial_shared_version: isv },
+            tag.to_string(),
+            vec![],
+        );
+        let input = InputObject {
+            id,
+            owner,
+            ownership: Ownership::Shared { initial_shared_version: isv },
+            version: 7,
+            envelope_bytes: pre_envelope.to_bytes(),
+            move_data: vec![],
+            type_tag: tag.clone(),
+        };
+
+        let mut input_objects = BTreeMap::new();
+        input_objects.insert(id, input);
+        let mut mutated = IndexMap::new();
+        mutated.insert(
+            id,
+            ObjectMutationEffect { type_tag: tag, bcs_bytes: vec![0xDE, 0xAD] },
+        );
+        let results = ObjectRuntimeResults {
+            input_objects,
+            created_ids: IndexSet::new(),
+            deleted_ids: IndexSet::new(),
+            transfers: IndexMap::new(),
+            frozen: IndexMap::new(),
+            shared: IndexMap::new(),
+            mutated,
+            emitted_events: vec![],
+        };
+
+        let changes = engine
+            .convert_results_to_state_changes(&results, 7)
+            .expect("convert ok");
+        assert_eq!(changes.len(), 1, "one mutation → one state change");
+        let new_bytes = changes[0]
+            .new_state
+            .as_ref()
+            .expect("mutated emits new_state");
+        let new_env = setu_types::ObjectEnvelope::from_bytes(new_bytes)
+            .expect("envelope roundtrips");
+
+        match new_env.metadata.ownership {
+            Ownership::Shared { initial_shared_version } => {
+                assert_eq!(
+                    initial_shared_version, isv,
+                    "R4-ISSUE-2: initial_shared_version preserved across &mut"
+                );
+            }
+            other => panic!(
+                "R4-ISSUE-2: expected Shared after &mut on Shared input, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(new_env.metadata.version, 8, "version bumped by 1");
     }
 }

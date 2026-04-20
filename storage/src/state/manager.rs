@@ -1656,6 +1656,119 @@ mod tests {
     }
 
     // =========================================================================
+    // PWOO: concurrent-swap conflict detection on Shared objects
+    //
+    // Design ref: docs/feat/pwoo/design.md §4.6 — PWOO deliberately reuses
+    // the existing byte-level `old_value` conflict detection above rather
+    // than adding a version-lock field. These tests lock in that guarantee
+    // by running scenarios where two concurrent MoveCall events touch the
+    // same Shared object envelope:
+    //   F1 — two writers conflict on the same shared envelope → T2 rejected
+    //   F2 — writer + independent writer do not conflict
+    // =========================================================================
+
+    #[test]
+    fn test_pwoo_shared_object_concurrent_swap_conflict() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+
+        // Setup: a Shared object envelope bytes (content-opaque to storage)
+        let shared_oid = [0x5A; 32];
+        let key = format!("oid:{}", hex::encode(shared_oid));
+        // Simulate an initial envelope-bytes blob at version v=1
+        let env_v1 = vec![0xE1; 80];
+        manager.upsert_object(SubnetId::ROOT, shared_oid, env_v1.clone());
+
+        // Two concurrent MoveCall events that both read env_v1 and try to
+        // produce an updated envelope. After T1 applies, the SMT value moves
+        // to env_v2_a; T2 still carries old_value=env_v1, so conflict detection
+        // rejects T2.
+        let env_v2_a = vec![0xA2; 80];
+        let env_v2_b = vec![0xB2; 80];
+
+        let mut vlc1 = VLCSnapshot::new();
+        vlc1.logical_time = 1;
+        let mut t1 = Event::new(EventType::Transfer, vec![], vlc1, "v1".to_string());
+        t1.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key.clone(), env_v1.clone(), env_v2_a.clone())],
+        });
+        t1.status = setu_types::event::EventStatus::Executed;
+
+        let mut vlc2 = VLCSnapshot::new();
+        vlc2.logical_time = 2;
+        let mut t2 = Event::new(EventType::Transfer, vec![], vlc2, "v1".to_string());
+        t2.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key.clone(), env_v1.clone(), env_v2_b.clone())],
+        });
+        t2.status = setu_types::event::EventStatus::Executed;
+
+        let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()]);
+
+        assert_eq!(summary.total_events, 1, "Only T1 should commit");
+        assert_eq!(summary.conflicted_events, vec![t2.id.clone()],
+            "T2 must be rejected as concurrent-swap conflict");
+
+        let hv = HashValue::from_slice(&shared_oid).unwrap();
+        assert_eq!(manager.root_subnet().get(&hv), Some(&env_v2_a),
+            "Shared envelope must reflect T1's update, not T2's");
+    }
+
+    #[test]
+    fn test_pwoo_independent_shared_writes_do_not_conflict() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+
+        // Two distinct Shared envelopes, touched by two independent events.
+        let shared_a = [0xAA; 32];
+        let shared_b = [0xBB; 32];
+        let key_a = format!("oid:{}", hex::encode(shared_a));
+        let key_b = format!("oid:{}", hex::encode(shared_b));
+        let env_a = vec![0x01; 48];
+        let env_b = vec![0x02; 48];
+        manager.upsert_object(SubnetId::ROOT, shared_a, env_a.clone());
+        manager.upsert_object(SubnetId::ROOT, shared_b, env_b.clone());
+
+        let new_a = vec![0x11; 48];
+        let new_b = vec![0x22; 48];
+
+        let mut vlc1 = VLCSnapshot::new();
+        vlc1.logical_time = 1;
+        let mut t1 = Event::new(EventType::Transfer, vec![], vlc1, "v1".to_string());
+        t1.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key_a, env_a, new_a.clone())],
+        });
+        t1.status = setu_types::event::EventStatus::Executed;
+
+        let mut vlc2 = VLCSnapshot::new();
+        vlc2.logical_time = 2;
+        let mut t2 = Event::new(EventType::Transfer, vec![], vlc2, "v1".to_string());
+        t2.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::update(key_b, env_b, new_b.clone())],
+        });
+        t2.status = setu_types::event::EventStatus::Executed;
+
+        let summary = manager.apply_committed_events(&[t1, t2]);
+
+        assert_eq!(summary.total_events, 2, "Both events must commit");
+        assert!(summary.conflicted_events.is_empty(),
+            "Distinct shared envelopes must not cross-conflict");
+
+        let smt = manager.root_subnet();
+        assert_eq!(smt.get(&HashValue::from_slice(&shared_a).unwrap()), Some(&new_a));
+        assert_eq!(smt.get(&HashValue::from_slice(&shared_b).unwrap()), Some(&new_b));
+    }
+
+    // =========================================================================
     // §14 Index Generalization Tests
     // =========================================================================
 

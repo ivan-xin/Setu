@@ -7,8 +7,11 @@ module setu::transfer {
         transfer_internal(obj, recipient);
     }
 
-    /// Make an object publicly shared (Phase 0-4: aborts with E_SHARED_NOT_SUPPORTED = 1001)
-    /// ADR-1: Shared Object not supported until Phase 5+
+    /// Make an object publicly shared (PWOO Phase 1+).
+    /// The object becomes `Ownership::Shared { initial_shared_version }` at the
+    /// storage layer. Subsequent MoveCalls must reference it via the
+    /// `shared_object_ids` list so the validator can track concurrent-swap
+    /// conflicts at the byte-level envelope boundary.
     public fun share_object<T: key>(obj: T) {
         share_internal(obj);
     }

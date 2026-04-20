@@ -76,13 +76,18 @@ pub struct MoveCallRequest {
     /// Pure arguments (hex-encoded BCS bytes)
     #[serde(default)]
     pub args: Vec<String>,
-    /// Input object IDs (hex-encoded ObjectIds)
+    /// Input object IDs (hex-encoded ObjectIds) — must be owned by sender (or Immutable)
     #[serde(default)]
     pub input_object_ids: Vec<String>,
-    /// Indices into input_object_ids that are mutably borrowed
+    /// Shared object IDs (hex-encoded ObjectIds) — must have `Ownership::Shared` (PWOO)
+    #[serde(default)]
+    pub shared_object_ids: Vec<String>,
+    /// Indices into the concatenated `[input_object_ids..., shared_object_ids...]`
+    /// list that are mutably borrowed.
     #[serde(default)]
     pub mutable_indices: Vec<usize>,
-    /// Indices into input_object_ids that are consumed (transferred/deleted)
+    /// Indices into `input_object_ids` that are consumed (transferred/deleted).
+    /// Must be < `input_object_ids.len()` — shared objects cannot be consumed in PWOO Phase 1.
     #[serde(default)]
     pub consumed_indices: Vec<usize>,
     /// Whether the function needs TxContext injection

@@ -114,6 +114,21 @@ pub enum TaskPrepareError {
 
     #[error("Object {object_id} not owned by sender {sender}")]
     NotOwnedBySender { object_id: String, sender: String },
+
+    // ---- PWOO (Phase-1 Writable Owned Objects) errors ----
+    /// Caller passed a shared object through `input_object_ids`. Shared objects
+    /// must be declared via `shared_object_ids` so the preparer can mark them
+    /// appropriately for concurrent access detection.
+    #[error("Object {object_id} is Shared; pass it via shared_object_ids")]
+    UseSharedObjectIdsInstead { object_id: String },
+
+    /// Caller passed a non-Shared object through `shared_object_ids`.
+    #[error("Object {object_id} is not Shared; pass it via input_object_ids")]
+    NotShared { object_id: String },
+
+    /// Same object id appears in both `input_object_ids` and `shared_object_ids`.
+    #[error("Object {object_id} appears in both input_object_ids and shared_object_ids")]
+    DuplicateObjectInLists { object_id: String },
 }
 
 /// Convert SimpleMerkleProof to MerkleProof (for TEE)

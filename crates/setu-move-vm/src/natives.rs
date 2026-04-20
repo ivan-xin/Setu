@@ -237,16 +237,40 @@ fn native_transfer_internal(
 
 /// Move: `native fun share_internal<T: key>(obj: T);`
 ///
-/// Phase 0-4: Shared objects not supported (ADR-1). Aborts with code 1001.
+/// PWOO: marks the object as `Ownership::Shared { initial_shared_version }`.
+/// The executor (setu-enclave / runtime) converts this runtime effect into
+/// a StateChange that persists the envelope with the new ownership.
 fn native_share_internal(
-    _context: &mut NativeContext,
-    _ty_args: Vec<Type>,
-    _args: VecDeque<Value>,
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
-    Ok(NativeResult::err(
-        InternalGas::zero(),
-        /* E_SHARED_NOT_SUPPORTED */ 1001,
-    ))
+    let obj_value = args.pop_back().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let obj_type = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+
+    let type_tag = context.type_to_type_tag(&obj_type)?;
+    let struct_tag = match type_tag {
+        move_core_types::language_storage::TypeTag::Struct(st) => *st,
+        _ => return Err(PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)),
+    };
+
+    let layout = context
+        .type_to_type_layout(&obj_type)?
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let bcs_bytes = obj_value
+        .typed_serialize(&layout)
+        .ok_or_else(|| PartialVMError::new(StatusCode::VALUE_SERIALIZATION_ERROR))?;
+
+    let object_id = extract_uid_from_bcs(&bcs_bytes)?;
+
+    let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+    runtime.share_object(object_id, struct_tag, bcs_bytes);
+
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![]))
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -906,15 +906,26 @@ impl TaskPreparer {
         call: &setu_types::event::MoveCallPayload,
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
-        // ADR-1: reject shared objects
-        if !call.shared_object_ids.is_empty() {
-            return Err(TaskPrepareError::SharedObjectNotSupported);
+        // PWOO: shared_object_ids is now supported. Enforce per-list semantics
+        // (owned-only for input_object_ids, shared-only for shared_object_ids)
+        // and detect duplicates across the two lists.
+        {
+            use std::collections::HashSet;
+            let input_set: HashSet<&setu_types::ObjectId> =
+                call.input_object_ids.iter().collect();
+            for oid in &call.shared_object_ids {
+                if input_set.contains(oid) {
+                    return Err(TaskPrepareError::DuplicateObjectInLists {
+                        object_id: hex::encode(oid.as_bytes()),
+                    });
+                }
+            }
         }
 
         // 0. Parse sender address (once, outside loop)
         let sender_addr = setu_types::Address::normalize(&call.sender);
 
-        // 1. Collect input objects
+        // 1. Collect owned input objects (Path A)
         let mut read_set = Vec::new();
         let mut resolved_objects = Vec::new();
 
@@ -942,7 +953,12 @@ impl TaskPreparer {
                         setu_types::Ownership::Immutable => { /* anyone can read */ }
                         setu_types::Ownership::ObjectOwner(_) => { /* Move runtime handles */ }
                         setu_types::Ownership::Shared { .. } => {
-                            return Err(TaskPrepareError::SharedObjectNotSupported);
+                            // PWOO: shared objects must be declared in the
+                            // dedicated list so concurrent-swap detection
+                            // can target them precisely.
+                            return Err(TaskPrepareError::UseSharedObjectIdsInstead {
+                                object_id: hex::encode(object_id.as_bytes()),
+                            });
                         }
                     }
                 }
@@ -976,14 +992,84 @@ impl TaskPreparer {
             });
         }
 
+        // 1b. Collect shared input objects (Path B, PWOO).
+        //
+        // Append after owned inputs so existing `mutable_indices` /
+        // `consumed_indices` (computed against `input_object_ids`) still line
+        // up with the front of `resolved_objects`. Shared objects occupy the
+        // tail and carry their current version as `expected_version`, which
+        // is echoed back to the solver and ultimately surfaces in the
+        // byte-level `old_value` conflict detection in the storage layer.
+        for object_id in &call.shared_object_ids {
+            let data = self.state_provider.get_object(object_id)
+                .ok_or_else(|| TaskPrepareError::ObjectNotFound(
+                    hex::encode(object_id.as_bytes()),
+                ))?;
+
+            let parsed = setu_types::envelope::detect_and_parse(&data);
+
+            // Must be Shared ownership.
+            let version = match &parsed {
+                setu_types::envelope::StorageFormat::Envelope(env) => {
+                    match env.metadata.ownership {
+                        setu_types::Ownership::Shared { .. } => env.metadata.version,
+                        _ => {
+                            return Err(TaskPrepareError::NotShared {
+                                object_id: hex::encode(object_id.as_bytes()),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    return Err(TaskPrepareError::NotShared {
+                        object_id: hex::encode(object_id.as_bytes()),
+                    });
+                }
+            };
+
+            let key = format!("oid:{}", hex::encode(object_id.as_bytes()));
+            read_set.push(ReadSetEntry::new(key, data.clone()));
+
+            resolved_objects.push(ResolvedObject {
+                object_id: *object_id,
+                object_type: "MoveObject".to_string(),
+                expected_version: version,
+            });
+        }
+
         // 2. Validate indices
+        //
+        // Design §3.2 / §6.2: `mutable_indices` and `consumed_indices` index
+        // into the CONCATENATED list `[input_object_ids..., shared_object_ids...]`.
+        // Owned entries occupy `0..owned_count`; shared entries occupy
+        // `owned_count..owned_count+shared_count`.
+        //
+        // Rules:
+        //   * `mutable_indices[i]` may point at either an owned or a shared
+        //     object (up to `owned_count + shared_count`).
+        //   * `consumed_indices[i]` may ONLY point at an owned object —
+        //     shared objects cannot be consumed by-value in Phase 1 (there
+        //     is no `transfer::delete_shared_object`). A shared index in
+        //     `consumed_indices` is an explicit client error.
         let mutable_indices = call.mutable_indices.clone().unwrap_or_default();
         let consumed_indices = call.consumed_indices.clone().unwrap_or_default();
-        let obj_count = call.input_object_ids.len();
-        for &idx in mutable_indices.iter().chain(consumed_indices.iter()) {
-            if idx >= obj_count {
+        let owned_count = call.input_object_ids.len();
+        let total_count = owned_count + call.shared_object_ids.len();
+        for &idx in mutable_indices.iter() {
+            if idx >= total_count {
                 return Err(TaskPrepareError::InvalidInput(format!(
-                    "Index {} out of range (object count: {})", idx, obj_count
+                    "mutable_indices[{}] out of range (total object count: {})",
+                    idx, total_count
+                )));
+            }
+        }
+        for &idx in consumed_indices.iter() {
+            if idx >= owned_count {
+                return Err(TaskPrepareError::InvalidInput(format!(
+                    "consumed_indices[{}] must reference an owned input \
+                     (owned count: {}); shared objects cannot be consumed \
+                     by-value",
+                    idx, owned_count
                 )));
             }
         }
@@ -1005,7 +1091,9 @@ impl TaskPreparer {
 
         // 5. Derive dependencies (for future DAG ordering)
         let _parent_ids = self.derive_dependencies(
-            &call.input_object_ids.iter().collect::<Vec<_>>(),
+            &call.input_object_ids.iter()
+                .chain(call.shared_object_ids.iter())
+                .collect::<Vec<_>>(),
         );
 
         // 6. Build SolverTask
@@ -1381,14 +1469,17 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_move_call_shared_objects_rejected() {
+    fn test_prepare_move_call_shared_object_missing_errors() {
+        // PWOO: passing a shared_object_id for a non-existent object yields
+        // ObjectNotFound (no longer a blanket SharedObjectNotSupported).
         let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
         let event = test_event();
         let mut call = test_move_call_payload("0x1", "coin", "transfer");
         call.shared_object_ids = vec![ObjectId::new([0xAA; 32])];
 
         let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
-        assert!(matches!(result, Err(TaskPrepareError::SharedObjectNotSupported)));
+        assert!(matches!(result, Err(TaskPrepareError::ObjectNotFound(_))),
+            "Expected ObjectNotFound, got: {:?}", result);
     }
 
     #[test]
@@ -1564,7 +1655,9 @@ mod tests {
     }
 
     #[test]
-    fn test_move_call_shared_object_in_envelope_rejected() {
+    fn test_move_call_shared_object_via_input_list_rejected() {
+        // PWOO: a Shared object passed through `input_object_ids` must be
+        // redirected to `shared_object_ids`.
         let alice = setu_types::Address::normalize("alice");
         let obj_id = ObjectId::new([0x44; 32]);
 
@@ -1576,7 +1669,6 @@ mod tests {
         );
         let module_key = format!("mod:{}::counter", addr.to_hex_literal());
 
-        // Shared object in envelope
         let preparer = make_preparer_with_owned_object(
             obj_id, alice,
             setu_types::Ownership::Shared { initial_shared_version: 0 },
@@ -1589,7 +1681,216 @@ mod tests {
         call.input_object_ids = vec![obj_id];
 
         let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
-        assert!(matches!(result, Err(TaskPrepareError::SharedObjectNotSupported)),
-            "Shared objects in envelopes should be rejected (ADR-1), got: {:?}", result);
+        assert!(matches!(result, Err(TaskPrepareError::UseSharedObjectIdsInstead { .. })),
+            "Shared-in-input_object_ids should hint UseSharedObjectIdsInstead, got: {:?}", result);
+    }
+
+    // ========== PWOO positive tests ==========
+
+    #[test]
+    fn test_move_call_shared_object_in_shared_list_passes() {
+        // PWOO: Shared object passed through `shared_object_ids` is accepted,
+        // and `resolved_objects` carries the current envelope version.
+        let alice = setu_types::Address::normalize("alice");
+        let obj_id = ObjectId::new([0x55; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::Shared { initial_shared_version: 7 },
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.input_object_ids = vec![];
+        call.shared_object_ids = vec![obj_id];
+
+        let task = preparer
+            .prepare_move_call_task(&event, &call, SubnetId::ROOT)
+            .expect("shared object via shared_object_ids should be accepted");
+
+        // resolved_objects tail = shared list; expected_version carried.
+        assert_eq!(task.resolved_inputs.input_objects.len(), 1);
+        assert_eq!(task.resolved_inputs.input_objects[0].object_id, obj_id);
+        assert_eq!(task.resolved_inputs.input_objects[0].expected_version, 1,
+            "expected_version should match stored envelope version");
+        assert!(matches!(
+            task.resolved_inputs.operation,
+            setu_types::task::OperationType::MoveCall { .. }
+        ));
+    }
+
+    #[test]
+    fn test_move_call_owned_in_shared_list_rejected() {
+        // PWOO: placing a non-Shared object in shared_object_ids → NotShared.
+        let alice = setu_types::Address::normalize("alice");
+        let obj_id = ObjectId::new([0x66; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::AddressOwner(alice),
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.shared_object_ids = vec![obj_id];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::NotShared { .. })),
+            "Owned-in-shared_object_ids should produce NotShared, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_move_call_duplicate_across_lists_rejected() {
+        // PWOO: same object in both lists → DuplicateObjectInLists.
+        let alice = setu_types::Address::normalize("alice");
+        let obj_id = ObjectId::new([0x77; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::Shared { initial_shared_version: 0 },
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.input_object_ids = vec![obj_id];
+        call.shared_object_ids = vec![obj_id];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::DuplicateObjectInLists { .. })),
+            "Duplicate across lists should be rejected, got: {:?}", result);
+    }
+
+    // R4-ISSUE-1 regression: mutable_indices must allow indices into the
+    // concatenated `[input_object_ids..., shared_object_ids...]` list.
+    #[test]
+    fn test_move_call_mutable_index_into_shared_tail_allowed() {
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider};
+        use setu_types::event::StateChange;
+        use setu_types::envelope::ObjectEnvelope;
+        use std::sync::Arc;
+
+        let alice = setu_types::Address::normalize("alice");
+        let owned_id = ObjectId::new([0xA1; 32]);
+        let shared_id = ObjectId::new([0xA2; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        let shared_state = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let mut gsm = shared_state.lock_write();
+            let owned_env = ObjectEnvelope::from_move_result(
+                owned_id, alice, 1,
+                setu_types::Ownership::AddressOwner(alice),
+                "0xcafe::test::TestObj".to_string(), vec![0u8; 32],
+            );
+            gsm.apply_state_change(
+                SubnetId::ROOT,
+                &StateChange::insert(
+                    format!("oid:{}", hex::encode(owned_id.as_bytes())),
+                    owned_env.to_bytes(),
+                ),
+            );
+            let shared_env = ObjectEnvelope::from_move_result(
+                shared_id, alice, 1,
+                setu_types::Ownership::Shared { initial_shared_version: 0 },
+                "0xcafe::test::TestObj".to_string(), vec![0u8; 32],
+            );
+            gsm.apply_state_change(
+                SubnetId::ROOT,
+                &StateChange::insert(
+                    format!("oid:{}", hex::encode(shared_id.as_bytes())),
+                    shared_env.to_bytes(),
+                ),
+            );
+            gsm.apply_state_change(
+                SubnetId::ROOT,
+                &StateChange::insert(module_key.clone(), bytecode.clone()),
+            );
+            shared_state.publish_snapshot(&gsm);
+        }
+        let provider: Arc<dyn StateProvider> = Arc::new(MerkleStateProvider::new(shared_state));
+        let preparer = TaskPreparer::new("validator-test".to_string(), provider);
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.input_object_ids = vec![owned_id];
+        call.shared_object_ids = vec![shared_id];
+        // idx 1 points at the shared tail — must be accepted
+        call.mutable_indices = Some(vec![1]);
+
+        let task = preparer
+            .prepare_move_call_task(&event, &call, SubnetId::ROOT)
+            .expect("R4-ISSUE-1: mutable idx into shared tail should be accepted");
+        assert_eq!(task.resolved_inputs.input_objects.len(), 2);
+    }
+
+    // R4-ISSUE-1/3 regression: consumed_indices MUST NOT target the shared tail.
+    #[test]
+    fn test_move_call_consumed_index_into_shared_tail_rejected() {
+        let alice = setu_types::Address::normalize("alice");
+        let shared_id = ObjectId::new([0xB1; 32]);
+
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+
+        let preparer = make_preparer_with_owned_object(
+            shared_id, alice,
+            setu_types::Ownership::Shared { initial_shared_version: 0 },
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or(&alice.to_string()).to_string();
+        call.input_object_ids = vec![];
+        call.shared_object_ids = vec![shared_id];
+        // idx 0 is into the shared tail; consumed-by-value is forbidden there
+        call.consumed_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::InvalidInput(_))),
+            "R4-ISSUE-3: consumed idx into shared tail must be rejected, got: {:?}", result);
     }
 }

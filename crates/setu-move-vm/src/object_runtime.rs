@@ -11,6 +11,7 @@ use move_core_types::{account_address::AccountAddress, language_storage::StructT
 use move_vm_runtime::native_extensions::NativeExtensionMarker;
 
 use setu_types::object::{Address, ObjectId};
+use setu_types::Ownership;
 
 // ═══════════════════════════════════════════════════════════════
 // Input / Effect types
@@ -20,6 +21,11 @@ use setu_types::object::{Address, ObjectId};
 pub struct InputObject {
     pub id: ObjectId,
     pub owner: Address,
+    /// Original ownership category preserved from the on-disk envelope.
+    /// Required so that `&mut` mutations of `Shared`/`Immutable`/`ObjectOwner`
+    /// inputs do not silently demote the object back to `AddressOwner`
+    /// when the executor rebuilds the envelope. See R4-ISSUE-2.
+    pub ownership: Ownership,
     pub version: u64,
     /// Full ObjectEnvelope BCS (for old_state in StateChange)
     pub envelope_bytes: Vec<u8>,
@@ -47,6 +53,7 @@ impl InputObject {
         Ok(Self {
             id: *id,
             owner: env.metadata.owner,
+            ownership: env.metadata.ownership,
             version: env.metadata.version,
             envelope_bytes: env.to_bytes(),
             move_data: env.data.clone(),
@@ -68,6 +75,20 @@ pub struct ObjectFreezeEffect {
     pub bcs_bytes: Vec<u8>,
 }
 
+/// Share effect recorded by `native_share_internal` (PWOO).
+///
+/// Ownership of the object transitions from `AddressOwner` to
+/// `Shared { initial_shared_version }`.
+/// The `initial_shared_version` captures the envelope version at the
+/// moment of share: for objects loaded from input_objects it is their
+/// current version; for newly-created + same-TX share it is 0 (the
+/// envelope is persisted with version bumped to 1 by the executor).
+pub struct ObjectShareEffect {
+    pub type_tag: StructTag,
+    pub bcs_bytes: Vec<u8>,
+    pub initial_shared_version: u64,
+}
+
 /// Mutation effect recorded for `&mut` objects.
 pub struct ObjectMutationEffect {
     pub type_tag: StructTag,
@@ -81,6 +102,7 @@ pub struct ObjectRuntimeResults {
     pub deleted_ids: IndexSet<ObjectId>,
     pub transfers: IndexMap<ObjectId, ObjectTransferEffect>,
     pub frozen: IndexMap<ObjectId, ObjectFreezeEffect>,
+    pub shared: IndexMap<ObjectId, ObjectShareEffect>,
     pub mutated: IndexMap<ObjectId, ObjectMutationEffect>,
     pub emitted_events: Vec<(StructTag, Vec<u8>)>,
 }
@@ -102,6 +124,7 @@ pub struct SetuObjectRuntime {
     deleted_ids: IndexSet<ObjectId>,
     transfers: IndexMap<ObjectId, ObjectTransferEffect>,
     frozen: IndexMap<ObjectId, ObjectFreezeEffect>,
+    shared: IndexMap<ObjectId, ObjectShareEffect>,
     mutated: IndexMap<ObjectId, ObjectMutationEffect>,
     pub(crate) emitted_events: Vec<(StructTag, Vec<u8>)>,
     // Context
@@ -130,6 +153,7 @@ impl SetuObjectRuntime {
             deleted_ids: IndexSet::new(),
             transfers: IndexMap::new(),
             frozen: IndexMap::new(),
+            shared: IndexMap::new(),
             mutated: IndexMap::new(),
             emitted_events: Vec::new(),
             tx_hash,
@@ -192,6 +216,36 @@ impl SetuObjectRuntime {
         self.frozen.insert(id, ObjectFreezeEffect { type_tag, bcs_bytes });
     }
 
+    /// Record an object share (PWOO: Ownership → Shared).
+    ///
+    /// The `initial_shared_version` is captured from `input_objects` if the
+    /// object was loaded as input; otherwise it defaults to 0 (same-TX
+    /// newly-created + shared). Callers should have previously removed any
+    /// conflicting transfer effect for the same id.
+    pub fn share_object(
+        &mut self,
+        id: ObjectId,
+        type_tag: StructTag,
+        bcs_bytes: Vec<u8>,
+    ) {
+        let initial_shared_version = self
+            .input_objects
+            .get(&id)
+            .map(|io| io.version)
+            .unwrap_or(0);
+        // `share` is terminal for ownership: drop any prior transfer effect
+        // for the same object so downstream effect application sees Shared only.
+        self.transfers.shift_remove(&id);
+        self.shared.insert(
+            id,
+            ObjectShareEffect {
+                type_tag,
+                bcs_bytes,
+                initial_shared_version,
+            },
+        );
+    }
+
     /// Record an object deletion.
     pub fn delete_object(&mut self, id: ObjectId) {
         self.deleted_ids.insert(id);
@@ -225,6 +279,7 @@ impl SetuObjectRuntime {
             deleted_ids: self.deleted_ids,
             transfers: self.transfers,
             frozen: self.frozen,
+            shared: self.shared,
             mutated: self.mutated,
             emitted_events: self.emitted_events,
         }
@@ -360,5 +415,88 @@ mod tests {
     fn test_epoch_timestamp_zero() {
         let rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
         assert_eq!(rt.epoch_timestamp_ms(), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PWOO: share_object tests
+    // ═══════════════════════════════════════════════════════════════
+
+    fn make_input_object(id: ObjectId, version: u64) -> InputObject {
+        InputObject {
+            id,
+            owner: test_address(),
+            ownership: Ownership::AddressOwner(test_address()),
+            version,
+            envelope_bytes: vec![],
+            move_data: vec![],
+            type_tag: test_struct_tag("Pool"),
+        }
+    }
+
+    #[test]
+    fn test_share_object_records_effect_for_newly_created() {
+        // A3: newly-created + same-TX share → initial_shared_version = 0
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let id = rt.fresh_id();
+        let tag = test_struct_tag("Pool");
+        rt.share_object(id, tag.clone(), vec![0xAB, 0xCD]);
+
+        let results = rt.into_results();
+        assert_eq!(results.shared.len(), 1);
+        let effect = &results.shared[&id];
+        assert_eq!(effect.initial_shared_version, 0);
+        assert_eq!(effect.type_tag, tag);
+        assert_eq!(effect.bcs_bytes, vec![0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn test_share_object_preserves_input_version() {
+        // A2: share of an input object captures its current version
+        let id = ObjectId::new([0x77; 32]);
+        let input = make_input_object(id, 5);
+        let mut rt = SetuObjectRuntime::new(vec![input], test_tx_hash(), test_address(), 0);
+        rt.share_object(id, test_struct_tag("Pool"), vec![0x01]);
+
+        let results = rt.into_results();
+        assert_eq!(results.shared[&id].initial_shared_version, 5);
+    }
+
+    #[test]
+    fn test_share_object_zero_when_not_input() {
+        // A3 (explicit): not in input_objects → version = 0 (synthetic)
+        let id = ObjectId::new([0x99; 32]);
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        rt.share_object(id, test_struct_tag("Pool"), vec![]);
+
+        let results = rt.into_results();
+        assert_eq!(results.shared[&id].initial_shared_version, 0);
+    }
+
+    #[test]
+    fn test_share_removes_prior_transfer_effect() {
+        // A4: share is terminal — if transfer was recorded first, share wins
+        let id = ObjectId::new([0x55; 32]);
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let tag = test_struct_tag("Pool");
+        rt.transfer_object(id, AccountAddress::new([0x11; 32]), tag.clone(), vec![0xAA]);
+        rt.share_object(id, tag, vec![0xBB]);
+
+        let results = rt.into_results();
+        assert!(!results.transfers.contains_key(&id));
+        assert!(results.shared.contains_key(&id));
+        assert_eq!(results.shared[&id].bcs_bytes, vec![0xBB]);
+    }
+
+    #[test]
+    fn test_share_and_freeze_are_independent_maps() {
+        // Defense-in-depth: share and freeze are recorded separately
+        let id1 = ObjectId::new([0xA1; 32]);
+        let id2 = ObjectId::new([0xA2; 32]);
+        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        rt.share_object(id1, test_struct_tag("P"), vec![]);
+        rt.freeze_object(id2, test_struct_tag("F"), vec![]);
+        let r = rt.into_results();
+        assert_eq!(r.shared.len(), 1);
+        assert_eq!(r.frozen.len(), 1);
     }
 }

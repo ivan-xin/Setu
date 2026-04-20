@@ -35,6 +35,8 @@ impl From<MoveStateChange> for StateChange {
             MoveStateChangeType::Delete => StateChangeType::Delete,
             // Freeze is represented as Update (ownership change to Immutable)
             MoveStateChangeType::Freeze => StateChangeType::Update,
+            // Share is represented as Update (ownership change to Shared)
+            MoveStateChangeType::Share => StateChangeType::Update,
         };
         StateChange {
             change_type,
@@ -373,6 +375,7 @@ mod tests {
         let obj_a = InputObject {
             id: setu_types::ObjectId::new([0xAA; 32]),
             owner: setu_types::Address::new([0; 32]),
+            ownership: setu_types::Ownership::AddressOwner(setu_types::Address::new([0; 32])),
             version: 1,
             envelope_bytes: vec![],
             move_data: vec![0xA0],
@@ -386,6 +389,7 @@ mod tests {
         let obj_b = InputObject {
             id: setu_types::ObjectId::new([0xBB; 32]),
             owner: setu_types::Address::new([0; 32]),
+            ownership: setu_types::Ownership::AddressOwner(setu_types::Address::new([0; 32])),
             version: 1,
             envelope_bytes: vec![],
             move_data: vec![0xB0],

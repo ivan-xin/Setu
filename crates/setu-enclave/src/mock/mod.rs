@@ -905,6 +905,15 @@ impl MockEnclave {
                     .map_err(|e| format!("Invalid sender: {}", e))?;
 
                 // 1. Construct InputObjects with ownership check (TEE defense-in-depth)
+                //
+                // PWOO: an object is allowed to be `Shared` iff it was declared
+                // in the event's `shared_object_ids` list. Owned-object entries
+                // (from `input_object_ids`) keep the stricter sender-ownership
+                // check. We build the shared-id set from the MoveCall payload
+                // since ResolvedInputs concatenates owned-then-shared.
+                let shared_id_set: std::collections::HashSet<setu_types::ObjectId> =
+                    payload.shared_object_ids.iter().copied().collect();
+
                 let input_objects: Vec<InputObject> = resolved_inputs.input_objects.iter()
                     .map(|ro| {
                         let env = local_runtime.state().get_envelope(&ro.object_id)
@@ -924,7 +933,13 @@ impl MockEnclave {
                             setu_types::Ownership::Immutable => { /* anyone can read */ }
                             setu_types::Ownership::ObjectOwner(_) => { /* Move runtime handles */ }
                             setu_types::Ownership::Shared { .. } => {
-                                return Err(format!("Shared object {} not supported (ADR-1)", ro.object_id));
+                                if !shared_id_set.contains(&ro.object_id) {
+                                    return Err(format!(
+                                        "Shared object {} not declared in shared_object_ids",
+                                        ro.object_id
+                                    ));
+                                }
+                                // Accepted: declared shared input (PWOO).
                             }
                         }
 

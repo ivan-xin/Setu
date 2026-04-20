@@ -238,11 +238,19 @@ impl MoveCallHandler {
             })
             .collect::<Result<_, _>>()?;
 
-        // Decode hex object IDs
+        // Decode hex object IDs (owned)
         let input_object_ids: Vec<ObjectId> = request.input_object_ids.iter()
             .map(|hex_str| {
                 ObjectId::from_hex(hex_str)
                     .map_err(|e| format!("Invalid ObjectId '{}': {}", hex_str, e))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Decode hex object IDs (shared, PWOO)
+        let shared_object_ids: Vec<ObjectId> = request.shared_object_ids.iter()
+            .map(|hex_str| {
+                ObjectId::from_hex(hex_str)
+                    .map_err(|e| format!("Invalid shared ObjectId '{}': {}", hex_str, e))
             })
             .collect::<Result<_, _>>()?;
 
@@ -254,7 +262,7 @@ impl MoveCallHandler {
             type_args: request.type_args.clone(),
             args,
             input_object_ids,
-            shared_object_ids: vec![],
+            shared_object_ids,
             mutable_indices: if request.mutable_indices.is_empty() { None } else { Some(request.mutable_indices.clone()) },
             consumed_indices: if request.consumed_indices.is_empty() { None } else { Some(request.consumed_indices.clone()) },
             needs_tx_context: request.needs_tx_context,
