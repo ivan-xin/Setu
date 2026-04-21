@@ -991,6 +991,7 @@ impl MockEnclave {
                 let output = engine.execute(
                     local_runtime.state(),
                     input_objects,
+                    resolved_inputs.dynamic_fields.clone(),
                     &module_id,
                     func_name,
                     type_args,

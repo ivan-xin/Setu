@@ -1,15 +1,13 @@
 //! Native function implementations for Setu stdlib.
 //!
-//! 9 natives registered under `0x1`:
-//! - object::new_uid_internal
-//! - object::delete_uid_internal
-//! - object::uid_to_address_internal
-//! - transfer::transfer_internal
-//! - transfer::share_internal
-//! - transfer::freeze_internal
+//! 14 natives registered under `0x1`:
+//! - object::new_uid_internal / delete_uid_internal / uid_to_address_internal
+//! - transfer::transfer_internal / share_internal / freeze_internal
 //! - tx_context::derive_id_internal
 //! - event::emit_internal
 //! - clock::timestamp_ms_internal
+//! - dynamic_field::{add_internal, remove_internal,
+//!   borrow_internal, borrow_mut_internal, exists_internal}
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -25,13 +23,30 @@ use move_vm_runtime::native_functions::{NativeContext, NativeFunction, NativeFun
 use move_vm_types::{
     loaded_data::runtime_types::Type,
     natives::function::NativeResult,
-    values::{Struct, Value},
+    values::{Struct, StructRef, Value, VMValueCast},
 };
 use smallvec::smallvec;
 
+use setu_types::dynamic_field::{derive_df_oid, DfAccessMode};
 use setu_types::object::ObjectId;
 
-use crate::object_runtime::SetuObjectRuntime;
+use crate::object_runtime::{DfCreateEffect, ObjectMutationEffect, SetuObjectRuntime};
+
+// ═══════════════════════════════════════════════════════════════
+// Dynamic Field native abort codes (mirrors setu-framework/.../dynamic_field.move)
+// ═══════════════════════════════════════════════════════════════
+
+/// DF not preloaded by TaskPreparer (access mode missing or wrong).
+const E_DF_NOT_PRELOADED: u64 = 0;
+/// DF already exists on `add`.
+const E_DF_ALREADY_EXISTS: u64 = 1;
+/// DF does not exist on `remove` / `borrow` / `borrow_mut`.
+const E_DF_DOES_NOT_EXIST: u64 = 2;
+/// DF type_tag for V mismatches preloaded value_type_tag.
+const E_DF_TYPE_MISMATCH: u64 = 3;
+/// V: key — value UID would collide with a loaded input object
+/// (defence against key-ability impersonation, v1.3 R3-ISSUE-1).
+const E_DF_VALUE_HAS_KEY_ABILITY: u64 = 4;
 
 // ═══════════════════════════════════════════════════════════════
 // Registration table
@@ -56,6 +71,15 @@ pub fn setu_native_functions() -> NativeFunctionTable {
             ("tx_context", "derive_id_internal", native_derive_id),
             ("event", "emit_internal", native_event_emit),
             ("clock", "timestamp_ms_internal", native_clock_timestamp),
+            ("dynamic_field", "add_internal", native_df_add_internal),
+            ("dynamic_field", "remove_internal", native_df_remove_internal),
+            ("dynamic_field", "borrow_internal", native_df_borrow_internal),
+            (
+                "dynamic_field",
+                "borrow_mut_internal",
+                native_df_borrow_mut_internal,
+            ),
+            ("dynamic_field", "exists_internal", native_df_exists_internal),
         ],
     )
 }
@@ -400,6 +424,410 @@ fn native_clock_timestamp(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// dynamic_field natives (M2)
+// ═══════════════════════════════════════════════════════════════
+//
+// Layout contract (matches setu-framework/sources/dynamic_field.move):
+//
+//   native fun add_internal<K: copy + drop + store, V: store>(
+//       parent: &mut UID, name: K, value: V);
+//   native fun remove_internal<K: copy + drop + store, V: store>(
+//       parent: &mut UID, name: K): V;
+//   native fun borrow_internal<K: copy + drop + store, V: store>(
+//       parent: &UID, name: K): &V;
+//   native fun borrow_mut_internal<K: copy + drop + store, V: store>(
+//       parent: &mut UID, name: K): &mut V;
+//   native fun exists_internal<K: copy + drop + store>(
+//       parent: &UID, name: K): bool;
+//
+// Arg order after `pop_back` (Move pushes left-to-right, natives pop RTL):
+//   1st pop: `name`        (K)
+//   2nd pop: `parent`      (&UID or &mut UID)
+// For add/remove `value` is pushed last → popped first:
+//   1st pop: `value`       (V)
+//   2nd pop: `name`        (K)
+//   3rd pop: `parent`      (&mut UID)
+
+/// Pop a `&UID` / `&mut UID` reference value from the args and extract the
+/// underlying parent ObjectId (the inner address of `UID { id: ID { bytes } }`).
+fn extract_parent_oid_from_uid_ref(uid_ref_val: Value) -> PartialVMResult<ObjectId> {
+    // &UID → StructRef → read_ref → Value(Struct(UID)) → unpack first field
+    // which is ID { bytes: address } → unpack first field which is address.
+    let struct_ref: StructRef = uid_ref_val.cast()?;
+    let uid_struct: Struct = struct_ref.read_ref()?.cast()?;
+    let mut uid_fields = uid_struct.unpack()?;
+    let id_val = uid_fields.next().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+            .with_message("UID struct missing id field".to_string())
+    })?;
+    let id_struct: Struct = id_val.cast()?;
+    let mut id_fields = id_struct.unpack()?;
+    let addr_val = id_fields.next().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+            .with_message("ID struct missing bytes field".to_string())
+    })?;
+    let addr: AccountAddress = addr_val.cast()?;
+    Ok(ObjectId::new(addr.into_bytes()))
+}
+
+/// Resolve K's canonical type tag string and BCS-serialize `name`.
+fn serialize_name(
+    context: &mut NativeContext,
+    name_type: &Type,
+    name_value: Value,
+) -> PartialVMResult<(String, Vec<u8>)> {
+    let tag = context.type_to_type_tag(name_type)?;
+    let layout = context
+        .type_to_type_layout(name_type)?
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let bcs = name_value
+        .typed_serialize(&layout)
+        .ok_or_else(|| PartialVMError::new(StatusCode::VALUE_SERIALIZATION_ERROR))?;
+    Ok((tag.to_canonical_string(/* with_prefix */ true), bcs))
+}
+
+/// Resolve V's canonical type tag string + layout + BCS.
+fn serialize_value(
+    context: &mut NativeContext,
+    value_type: &Type,
+    value_value: Value,
+) -> PartialVMResult<(String, Vec<u8>)> {
+    let tag = context.type_to_type_tag(value_type)?;
+    let layout = context
+        .type_to_type_layout(value_type)?
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let bcs = value_value
+        .typed_serialize(&layout)
+        .ok_or_else(|| PartialVMError::new(StatusCode::VALUE_SERIALIZATION_ERROR))?;
+    Ok((tag.to_canonical_string(true), bcs))
+}
+
+/// Deserialize cached DF `value_bcs` back into a Move `Value` using V's layout.
+fn deserialize_value_bytes(
+    context: &mut NativeContext,
+    value_type: &Type,
+    bcs: &[u8],
+) -> PartialVMResult<Value> {
+    let layout = context
+        .type_to_type_layout(value_type)?
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    Value::simple_deserialize(bcs, &layout)
+        .ok_or_else(|| PartialVMError::new(StatusCode::VALUE_DESERIALIZATION_ERROR))
+}
+
+/// `dynamic_field::add_internal<K, V>(parent: &mut UID, name: K, value: V)`
+fn native_df_add_internal(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    // ty_args: [K, V]
+    let v_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let k_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    // args reverse order: value, name, parent
+    let value_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let name_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let parent_ref_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+
+    let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
+    let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
+    let (value_tag, value_bcs) = serialize_value(context, &v_ty, value_val)?;
+
+    let df_oid = derive_df_oid(&parent_oid, &name_tag, &name_bcs);
+    let cache_key = (parent_oid, name_tag.clone(), name_bcs.clone());
+
+    let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+
+    // V:key collision defence — if value_bcs first 32B match an input_object,
+    // the caller likely crafted a `V: key` to impersonate an existing object.
+    if value_bcs.len() >= 32 {
+        let mut candidate = [0u8; 32];
+        candidate.copy_from_slice(&value_bcs[..32]);
+        if runtime.input_object_exists(&ObjectId::new(candidate)) {
+            return Ok(NativeResult::err(
+                InternalGas::zero(),
+                E_DF_VALUE_HAS_KEY_ABILITY,
+            ));
+        }
+    }
+
+    // Must be preloaded in Create mode.
+    let entry = match runtime.df_cache_get(&cache_key) {
+        Some(e) => e,
+        None => {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+        }
+    };
+    if entry.mode != DfAccessMode::Create {
+        return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+    }
+    if entry.value_bytes.is_some() {
+        return Ok(NativeResult::err(
+            InternalGas::zero(),
+            E_DF_ALREADY_EXISTS,
+        ));
+    }
+    if entry.value_type_tag != value_tag {
+        return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
+    }
+    if entry.df_oid != df_oid {
+        // derive mismatch → preload inconsistency; surface as NOT_PRELOADED
+        return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+    }
+
+    runtime.record_df_create(
+        df_oid,
+        DfCreateEffect {
+            parent: parent_oid,
+            key_type_tag: name_tag.clone(),
+            key_bcs: name_bcs.clone(),
+            value_type_tag: value_tag,
+            value_bcs: value_bcs.clone(),
+        },
+    );
+    // Keep the cache coherent so a later `borrow` in the same tx sees it.
+    if let Some(e) = runtime.df_cache_get_mut(&cache_key) {
+        e.value_bytes = Some(value_bcs);
+    }
+
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![]))
+}
+
+/// `dynamic_field::remove_internal<K, V>(parent: &mut UID, name: K): V`
+fn native_df_remove_internal(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    let v_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let k_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let name_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let parent_ref_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+
+    let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
+    let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
+    let v_tag = context
+        .type_to_type_tag(&v_ty)?
+        .to_canonical_string(true);
+    let cache_key = (parent_oid, name_tag.clone(), name_bcs.clone());
+
+    // Extract needed info under the runtime borrow, then deserialize after drop.
+    let (df_oid, value_bcs) = {
+        let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+        let entry = match runtime.df_cache_get(&cache_key) {
+            Some(e) => e,
+            None => {
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+            }
+        };
+        if !matches!(entry.mode, DfAccessMode::Delete | DfAccessMode::Mutate) {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+        }
+        if entry.value_type_tag != v_tag {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
+        }
+        let bytes = match &entry.value_bytes {
+            Some(b) => b.clone(),
+            None => {
+                return Ok(NativeResult::err(
+                    InternalGas::zero(),
+                    E_DF_DOES_NOT_EXIST,
+                ));
+            }
+        };
+        let df_oid = entry.df_oid;
+        runtime.record_df_delete(df_oid);
+        // Invalidate cache so a later borrow returns DOES_NOT_EXIST.
+        if let Some(e) = runtime.df_cache_get_mut(&cache_key) {
+            e.value_bytes = None;
+        }
+        (df_oid, bytes)
+    };
+
+    let value = deserialize_value_bytes(context, &v_ty, &value_bcs)?;
+    let _ = df_oid; // recorded above; returned by value not needed here
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value]))
+}
+
+/// `dynamic_field::borrow_internal<K, V>(parent: &UID, name: K): &V`
+///
+/// NOTE (M2 simplification): the Move front-end calls this native via
+/// `public fun borrow<K, V>(p: &UID, n: K): &V { &borrow_internal(...) }`.
+/// Returning `Value` (owned) vs `&V` (reference) is reconciled by the Move
+/// source using `&move` / temporary binding. The native returns a fresh
+/// owned Value; the Move fun wraps it into a reference via standard borrow.
+fn native_df_borrow_internal(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    let v_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let k_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let name_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let parent_ref_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+
+    let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
+    let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
+    let v_tag = context.type_to_type_tag(&v_ty)?.to_canonical_string(true);
+    let cache_key = (parent_oid, name_tag, name_bcs);
+
+    let bytes = {
+        let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+        let entry = match runtime.df_cache_get(&cache_key) {
+            Some(e) => e,
+            None => {
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+            }
+        };
+        if entry.value_type_tag != v_tag {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
+        }
+        match &entry.value_bytes {
+            Some(b) => b.clone(),
+            None => {
+                return Ok(NativeResult::err(
+                    InternalGas::zero(),
+                    E_DF_DOES_NOT_EXIST,
+                ));
+            }
+        }
+    };
+    let value = deserialize_value_bytes(context, &v_ty, &bytes)?;
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value]))
+}
+
+/// `dynamic_field::borrow_mut_internal<K, V>(parent: &mut UID, name: K): &mut V`
+///
+/// M2 behaviour: returns current value + pre-records a `df_mutated` entry
+/// carrying the *current* bcs bytes. M3 will merge the real post-execution
+/// value from the VM's `mutable_reference_outputs` back into the effect.
+fn native_df_borrow_mut_internal(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    let v_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let k_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let name_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let parent_ref_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+
+    let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
+    let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
+    let v_tag = context.type_to_type_tag(&v_ty)?.to_canonical_string(true);
+    // Capture the StructTag form for the mutation effect (M3 consumers expect it).
+    let v_struct_tag = match context.type_to_type_tag(&v_ty)? {
+        move_core_types::language_storage::TypeTag::Struct(st) => Some(*st),
+        _ => None,
+    };
+    let cache_key = (parent_oid, name_tag, name_bcs);
+
+    let bytes = {
+        let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+        let entry = match runtime.df_cache_get(&cache_key) {
+            Some(e) => e,
+            None => {
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+            }
+        };
+        if !matches!(entry.mode, DfAccessMode::Mutate) {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+        }
+        if entry.value_type_tag != v_tag {
+            return Ok(NativeResult::err(InternalGas::zero(), E_DF_TYPE_MISMATCH));
+        }
+        let bytes = match &entry.value_bytes {
+            Some(b) => b.clone(),
+            None => {
+                return Ok(NativeResult::err(
+                    InternalGas::zero(),
+                    E_DF_DOES_NOT_EXIST,
+                ));
+            }
+        };
+        let df_oid = entry.df_oid;
+        if let Some(st) = v_struct_tag {
+            // M2 pre-mark dirty with current bytes. M3 will overwrite.
+            runtime.record_df_mutate(
+                df_oid,
+                ObjectMutationEffect {
+                    type_tag: st,
+                    bcs_bytes: bytes.clone(),
+                },
+            );
+        }
+        // If V is a primitive, M3 must derive StructTag differently; skip pre-mark.
+        bytes
+    };
+    let value = deserialize_value_bytes(context, &v_ty, &bytes)?;
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value]))
+}
+
+/// `dynamic_field::exists_internal<K>(parent: &UID, name: K): bool`
+fn native_df_exists_internal(
+    context: &mut NativeContext,
+    mut ty_args: Vec<Type>,
+    mut args: VecDeque<Value>,
+) -> PartialVMResult<NativeResult> {
+    let k_ty = ty_args.pop().ok_or_else(|| {
+        PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR)
+    })?;
+    let name_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+    let parent_ref_val = args
+        .pop_back()
+        .ok_or_else(|| PartialVMError::new(StatusCode::INTERNAL_TYPE_ERROR))?;
+
+    let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
+    let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
+    let cache_key = (parent_oid, name_tag, name_bcs);
+
+    let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
+    let exists = runtime
+        .df_cache_get(&cache_key)
+        .map(|e| e.value_bytes.is_some())
+        .unwrap_or(false);
+    Ok(NativeResult::ok(
+        InternalGas::zero(),
+        smallvec![Value::bool(exists)],
+    ))
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════
 
@@ -425,7 +853,7 @@ mod tests {
     #[test]
     fn test_make_table_count() {
         let table = setu_native_functions();
-        assert_eq!(table.len(), 9);
+        assert_eq!(table.len(), 14);
     }
 
     #[test]
@@ -437,6 +865,31 @@ mod tests {
         assert!(modules.contains(&"tx_context".to_string()));
         assert!(modules.contains(&"event".to_string()));
         assert!(modules.contains(&"clock".to_string()));
+        assert!(modules.contains(&"dynamic_field".to_string()));
+    }
+
+    #[test]
+    fn test_make_table_includes_df_natives() {
+        let table = setu_native_functions();
+        let df_fns: Vec<String> = table
+            .iter()
+            .filter(|(_, m, _, _)| m.as_str() == "dynamic_field")
+            .map(|(_, _, f, _)| f.to_string())
+            .collect();
+        for expected in [
+            "add_internal",
+            "remove_internal",
+            "borrow_internal",
+            "borrow_mut_internal",
+            "exists_internal",
+        ] {
+            assert!(
+                df_fns.contains(&expected.to_string()),
+                "dynamic_field::{} not registered",
+                expected
+            );
+        }
+        assert_eq!(df_fns.len(), 5);
     }
 
     #[test]

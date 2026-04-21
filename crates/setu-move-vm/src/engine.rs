@@ -205,6 +205,7 @@ impl SetuMoveEngine {
         &self,
         store: &S,
         input_objects: Vec<InputObject>,
+        df_preload: Vec<setu_types::task::ResolvedDynamicField>,
         module_id: &ModuleId,
         function: &IdentStr,
         type_args: Vec<TypeTag>,
@@ -216,8 +217,13 @@ impl SetuMoveEngine {
         let resolver = SetuModuleResolver::new(store, &self.stdlib_modules);
 
         // 2. Object runtime
-        let object_runtime =
-            SetuObjectRuntime::new(input_objects, ctx.tx_hash, ctx.sender, ctx.epoch_timestamp_ms);
+        let object_runtime = SetuObjectRuntime::new(
+            input_objects,
+            df_preload,
+            ctx.tx_hash,
+            ctx.sender,
+            ctx.epoch_timestamp_ms,
+        );
 
         // 3. Extensions
         let mut extensions = NativeContextExtensions::default();
@@ -650,8 +656,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            14,
-            "Expected 14 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control)"
+            15,
+            "Expected 15 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control, dynamic_field)"
         );
     }
 
@@ -869,6 +875,9 @@ mod tests {
             shared: IndexMap::new(),
             mutated,
             emitted_events: vec![],
+            df_created: IndexMap::new(),
+            df_mutated: IndexMap::new(),
+            df_deleted: IndexSet::new(),
         };
 
         let changes = engine

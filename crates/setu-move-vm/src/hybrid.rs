@@ -243,6 +243,7 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                 let move_output = engine.execute(
                     self.native.state(),
                     input_objects,
+                    resolved_inputs.dynamic_fields.clone(),
                     &module_id,
                     func_name,
                     ty_args,

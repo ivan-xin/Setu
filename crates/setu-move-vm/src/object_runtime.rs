@@ -10,7 +10,9 @@ use indexmap::{IndexMap, IndexSet};
 use move_core_types::{account_address::AccountAddress, language_storage::StructTag};
 use move_vm_runtime::native_extensions::NativeExtensionMarker;
 
+use setu_types::dynamic_field::DfAccessMode;
 use setu_types::object::{Address, ObjectId};
+use setu_types::task::ResolvedDynamicField;
 use setu_types::Ownership;
 
 // ═══════════════════════════════════════════════════════════════
@@ -95,6 +97,38 @@ pub struct ObjectMutationEffect {
     pub bcs_bytes: Vec<u8>,
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Dynamic Field runtime types (M2)
+// ═══════════════════════════════════════════════════════════════
+
+/// One DF entry pre-loaded into the runtime.
+///
+/// `value_bytes == None` ⇔ Create mode (no on-disk envelope yet).
+/// `value_bytes == Some(bcs)` ⇔ Read / Mutate / Delete (existing entry).
+pub(crate) struct DfEntry {
+    pub df_oid: ObjectId,
+    pub value_bytes: Option<Vec<u8>>,
+    pub value_type_tag: String,
+    pub mode: DfAccessMode,
+}
+
+/// Effect produced by `dynamic_field::add_internal` — a brand-new DF entry.
+///
+/// Distinct from `ObjectMutationEffect` because M3 needs `parent` + key info
+/// to build the `ObjectEnvelope` with `Ownership::ObjectOwner(parent)` and
+/// `data = bcs(DfFieldValue { parent, name_type_tag, name_bcs, value_bcs })`.
+pub struct DfCreateEffect {
+    pub parent: ObjectId,
+    pub key_type_tag: String,
+    pub key_bcs: Vec<u8>,
+    pub value_type_tag: String,
+    pub value_bcs: Vec<u8>,
+}
+
+/// Cache key: `(parent_oid, key_type_tag, key_bcs)`.
+/// Same shape on both the preload side and the native lookup side.
+pub(crate) type DfCacheKey = (ObjectId, String, Vec<u8>);
+
 /// Aggregated results after a session finishes.
 pub struct ObjectRuntimeResults {
     pub input_objects: BTreeMap<ObjectId, InputObject>,
@@ -105,6 +139,14 @@ pub struct ObjectRuntimeResults {
     pub shared: IndexMap<ObjectId, ObjectShareEffect>,
     pub mutated: IndexMap<ObjectId, ObjectMutationEffect>,
     pub emitted_events: Vec<(StructTag, Vec<u8>)>,
+    // --- M2 Dynamic Field effects ---
+    /// DF entries newly added by `dynamic_field::add` (ordered by first insert).
+    pub df_created: IndexMap<ObjectId, DfCreateEffect>,
+    /// DF entries mutated via `borrow_mut` (placeholder value in M2;
+    /// M3 merges real post-execution value from `mutable_reference_outputs`).
+    pub df_mutated: IndexMap<ObjectId, ObjectMutationEffect>,
+    /// DF entries removed via `dynamic_field::remove`.
+    pub df_deleted: IndexSet<ObjectId>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -127,6 +169,11 @@ pub struct SetuObjectRuntime {
     shared: IndexMap<ObjectId, ObjectShareEffect>,
     mutated: IndexMap<ObjectId, ObjectMutationEffect>,
     pub(crate) emitted_events: Vec<(StructTag, Vec<u8>)>,
+    // --- M2 Dynamic Field state ---
+    df_cache: BTreeMap<DfCacheKey, DfEntry>,
+    df_created: IndexMap<ObjectId, DfCreateEffect>,
+    df_mutated: IndexMap<ObjectId, ObjectMutationEffect>,
+    df_deleted: IndexSet<ObjectId>,
     // Context
     tx_hash: [u8; 32],
     ids_created: u64,
@@ -139,6 +186,7 @@ impl<'a> NativeExtensionMarker<'a> for SetuObjectRuntime {}
 impl SetuObjectRuntime {
     pub fn new(
         input_objects: Vec<InputObject>,
+        df_preload: Vec<ResolvedDynamicField>,
         tx_hash: [u8; 32],
         sender: Address,
         epoch_timestamp_ms: u64,
@@ -146,6 +194,19 @@ impl SetuObjectRuntime {
         let input_map = input_objects
             .into_iter()
             .map(|obj| (obj.id, obj))
+            .collect();
+        let df_cache: BTreeMap<DfCacheKey, DfEntry> = df_preload
+            .into_iter()
+            .map(|rdf| {
+                let key = (rdf.parent_object_id, rdf.name_type_tag.clone(), rdf.name_bcs.clone());
+                let entry = DfEntry {
+                    df_oid: rdf.df_object_id,
+                    value_bytes: rdf.value_bytes,
+                    value_type_tag: rdf.value_type_tag,
+                    mode: rdf.mode,
+                };
+                (key, entry)
+            })
             .collect();
         Self {
             input_objects: input_map,
@@ -156,6 +217,10 @@ impl SetuObjectRuntime {
             shared: IndexMap::new(),
             mutated: IndexMap::new(),
             emitted_events: Vec::new(),
+            df_cache,
+            df_created: IndexMap::new(),
+            df_mutated: IndexMap::new(),
+            df_deleted: IndexSet::new(),
             tx_hash,
             ids_created: 0,
             sender,
@@ -271,6 +336,44 @@ impl SetuObjectRuntime {
         &self.sender
     }
 
+    // ─── M2 Dynamic Field helpers (native-facing) ───
+
+    /// Check whether `id` is registered as an input object.
+    /// Used by DF natives (v1.3 R3-ISSUE-4) to reject df_oids that collide
+    /// with already-loaded input objects — a defence against a malicious
+    /// `V: key` attempting to impersonate an input object.
+    pub(crate) fn input_object_exists(&self, id: &ObjectId) -> bool {
+        self.input_objects.contains_key(id)
+    }
+
+    /// Read-only cache lookup for DF natives.
+    pub(crate) fn df_cache_get(&self, key: &DfCacheKey) -> Option<&DfEntry> {
+        self.df_cache.get(key)
+    }
+
+    /// Mutable cache lookup for DF natives that need to update cached value
+    /// bytes in-place after a `remove` (prevents a later `borrow` in the same
+    /// tx from seeing stale bytes). M2 uses this only from remove/add.
+    pub(crate) fn df_cache_get_mut(&mut self, key: &DfCacheKey) -> Option<&mut DfEntry> {
+        self.df_cache.get_mut(key)
+    }
+
+    /// Record a DF create (from `dynamic_field::add_internal`).
+    pub(crate) fn record_df_create(&mut self, df_oid: ObjectId, effect: DfCreateEffect) {
+        self.df_created.insert(df_oid, effect);
+    }
+
+    /// Record a DF mutation placeholder (from `dynamic_field::borrow_mut_internal`).
+    /// M2 stores current bytes; M3 will overwrite with real post-exec value.
+    pub(crate) fn record_df_mutate(&mut self, df_oid: ObjectId, effect: ObjectMutationEffect) {
+        self.df_mutated.insert(df_oid, effect);
+    }
+
+    /// Record a DF delete (from `dynamic_field::remove_internal`).
+    pub(crate) fn record_df_delete(&mut self, df_oid: ObjectId) {
+        self.df_deleted.insert(df_oid);
+    }
+
     /// Consume self and return aggregated results.
     pub fn into_results(self) -> ObjectRuntimeResults {
         ObjectRuntimeResults {
@@ -282,6 +385,9 @@ impl SetuObjectRuntime {
             shared: self.shared,
             mutated: self.mutated,
             emitted_events: self.emitted_events,
+            df_created: self.df_created,
+            df_mutated: self.df_mutated,
+            df_deleted: self.df_deleted,
         }
     }
 }
@@ -301,8 +407,8 @@ mod tests {
     #[test]
     fn test_fresh_id_deterministic() {
         let tx = test_tx_hash();
-        let mut rt1 = SetuObjectRuntime::new(vec![], tx, test_address(), 0);
-        let mut rt2 = SetuObjectRuntime::new(vec![], tx, test_address(), 0);
+        let mut rt1 = SetuObjectRuntime::new(vec![], vec![], tx, test_address(), 0);
+        let mut rt2 = SetuObjectRuntime::new(vec![], vec![], tx, test_address(), 0);
 
         let id1a = rt1.fresh_id();
         let id1b = rt1.fresh_id();
@@ -316,14 +422,14 @@ mod tests {
 
     #[test]
     fn test_fresh_id_tracked_as_created() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let id = rt.fresh_id();
         assert!(rt.created_ids.contains(&id));
     }
 
     #[test]
     fn test_transfer_object() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let id = ObjectId::new([0x01; 32]);
         let recipient = AccountAddress::new([0x02; 32]);
         let tag = StructTag {
@@ -341,19 +447,19 @@ mod tests {
 
     #[test]
     fn test_delete_created_is_noop() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let id = rt.fresh_id();
         assert!(rt.created_ids.contains(&id));
 
         // Deleting a freshly created object removes from created_ids
         // (mimics native_object_delete_uid behavior — tested externally)
-        rt.created_ids.remove(&id);
+        rt.created_ids.swap_remove(&id);
         assert!(!rt.created_ids.contains(&id));
     }
 
     #[test]
     fn test_into_results() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let _ = rt.fresh_id();
         rt.delete_object(ObjectId::new([0xFF; 32]));
 
@@ -373,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_emit_event_recorded() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let tag = test_struct_tag("MyEvent");
         rt.emit_event(tag.clone(), vec![0x01, 0x02]);
         assert_eq!(rt.emitted_events.len(), 1);
@@ -383,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_emit_multiple_events_ordered() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let tag_a = test_struct_tag("EventA");
         let tag_b = test_struct_tag("EventB");
         rt.emit_event(tag_a.clone(), vec![0xAA]);
@@ -398,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_emit_events_in_results() {
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         rt.emit_event(test_struct_tag("Ev"), vec![0x42]);
         let results = rt.into_results();
         assert_eq!(results.emitted_events.len(), 1);
@@ -407,13 +513,13 @@ mod tests {
 
     #[test]
     fn test_epoch_timestamp_stored() {
-        let rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 1712700000000);
+        let rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 1712700000000);
         assert_eq!(rt.epoch_timestamp_ms(), 1712700000000);
     }
 
     #[test]
     fn test_epoch_timestamp_zero() {
-        let rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         assert_eq!(rt.epoch_timestamp_ms(), 0);
     }
 
@@ -436,7 +542,7 @@ mod tests {
     #[test]
     fn test_share_object_records_effect_for_newly_created() {
         // A3: newly-created + same-TX share → initial_shared_version = 0
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let id = rt.fresh_id();
         let tag = test_struct_tag("Pool");
         rt.share_object(id, tag.clone(), vec![0xAB, 0xCD]);
@@ -454,7 +560,7 @@ mod tests {
         // A2: share of an input object captures its current version
         let id = ObjectId::new([0x77; 32]);
         let input = make_input_object(id, 5);
-        let mut rt = SetuObjectRuntime::new(vec![input], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![input], vec![], test_tx_hash(), test_address(), 0);
         rt.share_object(id, test_struct_tag("Pool"), vec![0x01]);
 
         let results = rt.into_results();
@@ -465,7 +571,7 @@ mod tests {
     fn test_share_object_zero_when_not_input() {
         // A3 (explicit): not in input_objects → version = 0 (synthetic)
         let id = ObjectId::new([0x99; 32]);
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         rt.share_object(id, test_struct_tag("Pool"), vec![]);
 
         let results = rt.into_results();
@@ -476,7 +582,7 @@ mod tests {
     fn test_share_removes_prior_transfer_effect() {
         // A4: share is terminal — if transfer was recorded first, share wins
         let id = ObjectId::new([0x55; 32]);
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let tag = test_struct_tag("Pool");
         rt.transfer_object(id, AccountAddress::new([0x11; 32]), tag.clone(), vec![0xAA]);
         rt.share_object(id, tag, vec![0xBB]);
@@ -492,11 +598,193 @@ mod tests {
         // Defense-in-depth: share and freeze are recorded separately
         let id1 = ObjectId::new([0xA1; 32]);
         let id2 = ObjectId::new([0xA2; 32]);
-        let mut rt = SetuObjectRuntime::new(vec![], test_tx_hash(), test_address(), 0);
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         rt.share_object(id1, test_struct_tag("P"), vec![]);
         rt.freeze_object(id2, test_struct_tag("F"), vec![]);
         let r = rt.into_results();
         assert_eq!(r.shared.len(), 1);
         assert_eq!(r.frozen.len(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // M2 Dynamic Field tests
+    // ═══════════════════════════════════════════════════════════════
+
+    fn rdf(
+        parent: ObjectId,
+        name_tag: &str,
+        name_bcs: Vec<u8>,
+        value_bytes: Option<Vec<u8>>,
+        value_tag: &str,
+        mode: DfAccessMode,
+    ) -> ResolvedDynamicField {
+        let df_oid = setu_types::dynamic_field::derive_df_oid(&parent, name_tag, &name_bcs);
+        ResolvedDynamicField {
+            parent_object_id: parent,
+            df_object_id: df_oid,
+            name_type_tag: name_tag.to_string(),
+            name_bcs,
+            value_bytes,
+            value_type_tag: value_tag.to_string(),
+            mode,
+        }
+    }
+
+    #[test]
+    fn test_new_with_df_preload_builds_cache() {
+        // U1: preload 3 entries (1 Create + 2 Read) → cache populated correctly.
+        let p = ObjectId::new([0x10; 32]);
+        let preload = vec![
+            rdf(p, "u64", vec![0, 0, 0, 0, 0, 0, 0, 1], None, "u64", DfAccessMode::Create),
+            rdf(p, "u64", vec![0, 0, 0, 0, 0, 0, 0, 2], Some(vec![0xAA]), "u64", DfAccessMode::Read),
+            rdf(p, "u64", vec![0, 0, 0, 0, 0, 0, 0, 3], Some(vec![0xBB]), "u64", DfAccessMode::Mutate),
+        ];
+        let rt = SetuObjectRuntime::new(vec![], preload, test_tx_hash(), test_address(), 0);
+
+        let k1 = (p, "u64".to_string(), vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        let k2 = (p, "u64".to_string(), vec![0, 0, 0, 0, 0, 0, 0, 2]);
+        let k3 = (p, "u64".to_string(), vec![0, 0, 0, 0, 0, 0, 0, 3]);
+
+        assert!(rt.df_cache_get(&k1).unwrap().value_bytes.is_none());
+        assert_eq!(rt.df_cache_get(&k2).unwrap().value_bytes, Some(vec![0xAA]));
+        assert_eq!(rt.df_cache_get(&k3).unwrap().value_bytes, Some(vec![0xBB]));
+    }
+
+    #[test]
+    fn test_df_cache_get_hit_and_miss() {
+        // U2: present key → Some; absent key → None.
+        let p = ObjectId::new([0x11; 32]);
+        let preload = vec![rdf(
+            p,
+            "u32",
+            vec![1, 0, 0, 0],
+            Some(vec![0xCC]),
+            "u32",
+            DfAccessMode::Read,
+        )];
+        let rt = SetuObjectRuntime::new(vec![], preload, test_tx_hash(), test_address(), 0);
+
+        let hit = (p, "u32".to_string(), vec![1, 0, 0, 0]);
+        let miss = (p, "u32".to_string(), vec![9, 9, 9, 9]);
+        assert!(rt.df_cache_get(&hit).is_some());
+        assert!(rt.df_cache_get(&miss).is_none());
+    }
+
+    #[test]
+    fn test_input_object_exists() {
+        // U3: input_object_exists recognises loaded input IDs only.
+        let id_in = ObjectId::new([0x20; 32]);
+        let id_out = ObjectId::new([0x21; 32]);
+        let rt = SetuObjectRuntime::new(
+            vec![make_input_object(id_in, 1)],
+            vec![],
+            test_tx_hash(),
+            test_address(),
+            0,
+        );
+        assert!(rt.input_object_exists(&id_in));
+        assert!(!rt.input_object_exists(&id_out));
+    }
+
+    #[test]
+    fn test_record_df_create_accumulates() {
+        // U4: two creates preserved in insertion order.
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let p = ObjectId::new([0x30; 32]);
+        let df1 = ObjectId::new([0xD1; 32]);
+        let df2 = ObjectId::new([0xD2; 32]);
+        let mk = |parent: ObjectId, kb: u8| DfCreateEffect {
+            parent,
+            key_type_tag: "u64".into(),
+            key_bcs: vec![kb, 0, 0, 0, 0, 0, 0, 0],
+            value_type_tag: "u64".into(),
+            value_bcs: vec![kb; 8],
+        };
+        rt.record_df_create(df1, mk(p, 1));
+        rt.record_df_create(df2, mk(p, 2));
+        let r = rt.into_results();
+        assert_eq!(r.df_created.len(), 2);
+        let ordered: Vec<_> = r.df_created.keys().copied().collect();
+        assert_eq!(ordered, vec![df1, df2]);
+    }
+
+    #[test]
+    fn test_record_df_mutate_overwrites_same_oid() {
+        // U5: second mutate on same df_oid wins.
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let df = ObjectId::new([0xDA; 32]);
+        let tag = test_struct_tag("V");
+        rt.record_df_mutate(df, ObjectMutationEffect { type_tag: tag.clone(), bcs_bytes: vec![0x01] });
+        rt.record_df_mutate(df, ObjectMutationEffect { type_tag: tag.clone(), bcs_bytes: vec![0x02] });
+        let r = rt.into_results();
+        assert_eq!(r.df_mutated.len(), 1);
+        assert_eq!(r.df_mutated[&df].bcs_bytes, vec![0x02]);
+    }
+
+    #[test]
+    fn test_record_df_delete_dedup() {
+        // U6: double-delete is idempotent (IndexSet dedup).
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let df = ObjectId::new([0xDB; 32]);
+        rt.record_df_delete(df);
+        rt.record_df_delete(df);
+        let r = rt.into_results();
+        assert_eq!(r.df_deleted.len(), 1);
+    }
+
+    #[test]
+    fn test_df_create_then_delete_both_recorded() {
+        // U7: M2 does not cancel create/delete — M3 reconciles.
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let p = ObjectId::new([0x40; 32]);
+        let df = ObjectId::new([0xDC; 32]);
+        rt.record_df_create(
+            df,
+            DfCreateEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![7; 8],
+                value_type_tag: "u64".into(),
+                value_bcs: vec![8; 8],
+            },
+        );
+        rt.record_df_delete(df);
+        let r = rt.into_results();
+        assert!(r.df_created.contains_key(&df));
+        assert!(r.df_deleted.contains(&df));
+    }
+
+    #[test]
+    fn test_into_results_exports_df_fields() {
+        // U8: all 4 DF fields visible in ObjectRuntimeResults.
+        let p = ObjectId::new([0x50; 32]);
+        let preload = vec![rdf(
+            p,
+            "u64",
+            vec![1; 8],
+            Some(vec![2; 8]),
+            "u64",
+            DfAccessMode::Mutate,
+        )];
+        let mut rt = SetuObjectRuntime::new(vec![], preload, test_tx_hash(), test_address(), 0);
+        rt.record_df_create(
+            ObjectId::new([0xE1; 32]),
+            DfCreateEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![3; 8],
+                value_type_tag: "u64".into(),
+                value_bcs: vec![4; 8],
+            },
+        );
+        rt.record_df_mutate(
+            ObjectId::new([0xE2; 32]),
+            ObjectMutationEffect { type_tag: test_struct_tag("V"), bcs_bytes: vec![5; 8] },
+        );
+        rt.record_df_delete(ObjectId::new([0xE3; 32]));
+        let r = rt.into_results();
+        assert_eq!(r.df_created.len(), 1);
+        assert_eq!(r.df_mutated.len(), 1);
+        assert_eq!(r.df_deleted.len(), 1);
     }
 }
