@@ -12,6 +12,7 @@ pub mod merkle;          // Merkle tree types for state commitment
 pub mod task;            // Task types for Validator → Solver communication
 pub mod envelope;        // ObjectEnvelope — unified storage for Move objects and legacy coins
 pub mod execution_outcome; // R5: on-chain apply verdict (Applied/ExecutionFailed/StaleRead)
+pub mod dynamic_field;   // Dynamic Fields — DfFieldValue, DfAccessMode, derive_df_oid (DF FDP M1)
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)
@@ -49,6 +50,9 @@ pub use state_key::{object_key, parse_object_key, is_known_metadata_key};
 
 // R5: Execution outcome (apply-phase verdict)
 pub use execution_outcome::ExecutionOutcome;
+
+// Dynamic Fields (DF FDP M1)
+pub use dynamic_field::{DfAccessMode, DfFieldValue, derive_df_oid};
 
 // Export from consensus module
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};

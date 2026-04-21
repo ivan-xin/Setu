@@ -42,6 +42,7 @@ fn main() {
         "event",
         "clock",
         "access_control",
+        "dynamic_field",
     ];
 
     let mut code = String::from(

@@ -951,7 +951,14 @@ impl TaskPreparer {
                             }
                         }
                         setu_types::Ownership::Immutable => { /* anyone can read */ }
-                        setu_types::Ownership::ObjectOwner(_) => { /* Move runtime handles */ }
+                        setu_types::Ownership::ObjectOwner(_) => {
+                            // Owned by another object (e.g. a dynamic field
+                            // entry). Sender authorization is proxied through
+                            // the parent object — which must itself appear in
+                            // input_object_ids / shared_object_ids and be
+                            // authorized there. See docs/feat/dynamic-fields/
+                            // design.md §3.8.
+                        }
                         setu_types::Ownership::Shared { .. } => {
                             // PWOO: shared objects must be declared in the
                             // dedicated list so concurrent-swap detection

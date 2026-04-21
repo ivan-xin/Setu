@@ -931,7 +931,13 @@ impl MockEnclave {
                                 }
                             }
                             setu_types::Ownership::Immutable => { /* anyone can read */ }
-                            setu_types::Ownership::ObjectOwner(_) => { /* Move runtime handles */ }
+                            setu_types::Ownership::ObjectOwner(_) => {
+                                // Owned by another object (e.g. a dynamic
+                                // field entry). Sender authorization is
+                                // proxied through the parent object — which
+                                // must itself be authorized above. See
+                                // docs/feat/dynamic-fields/design.md §3.8.
+                            }
                             setu_types::Ownership::Shared { .. } => {
                                 if !shared_id_set.contains(&ro.object_id) {
                                     return Err(format!(

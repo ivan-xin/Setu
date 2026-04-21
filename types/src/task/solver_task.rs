@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use crate::{Event, ObjectId, SubnetId};
+use crate::dynamic_field::DfAccessMode;
 use super::gas::GasBudget;
 
 /// Solver Task sent from Validator to Solver
@@ -108,6 +109,16 @@ pub struct ResolvedInputs {
     
     /// Input objects (referenced by index in operation)
     pub input_objects: Vec<ResolvedObject>,
+
+    /// Resolved dynamic field accesses (DF FDP v1.3 — top-level field).
+    ///
+    /// Populated by `TaskPreparer` when the client declares
+    /// `MoveCallPayload.dynamic_field_accesses`. Kept top-level (rather than
+    /// nested inside `OperationType::MoveCall`) so other operations can adopt
+    /// DF later without a breaking enum layout change, and `#[serde(default)]`
+    /// preserves compatibility with payloads produced before M1.
+    #[serde(default)]
+    pub dynamic_fields: Vec<ResolvedDynamicField>,
 }
 
 impl ResolvedInputs {
@@ -116,6 +127,7 @@ impl ResolvedInputs {
         Self {
             operation: OperationType::NoOp,
             input_objects: Vec::new(),
+            dynamic_fields: Vec::new(),
         }
     }
     
@@ -127,6 +139,7 @@ impl ResolvedInputs {
                 amount,
             },
             input_objects: vec![coin],
+            dynamic_fields: Vec::new(),
         }
     }
     
@@ -142,6 +155,7 @@ impl ResolvedInputs {
                 source_indices,
             },
             input_objects: objects,
+            dynamic_fields: Vec::new(),
         }
     }
     
@@ -153,6 +167,7 @@ impl ResolvedInputs {
                 amounts,
             },
             input_objects: vec![source],
+            dynamic_fields: Vec::new(),
         }
     }
     
@@ -175,6 +190,7 @@ impl ResolvedInputs {
                 amount,
             },
             input_objects: objects,
+            dynamic_fields: Vec::new(),
         }
     }
 
@@ -200,6 +216,7 @@ impl ResolvedInputs {
                 consumed_indices,
             },
             input_objects,
+            dynamic_fields: Vec::new(),
         }
     }
     
@@ -296,6 +313,26 @@ pub enum OperationType {
         /// Module bytecode list
         modules: Vec<Vec<u8>>,
     },
+}
+
+/// Resolved dynamic field access (DF FDP v1.3 — consumed by Enclave/VM via
+/// `SetuObjectRuntime.df_cache`).
+///
+/// Produced by `TaskPreparer` from a client-declared `DynamicFieldAccess`:
+/// - `df_object_id` is `derive_df_oid(parent, name_type_tag, name_bcs)`.
+/// - `value_bytes` is `None` for `DfAccessMode::Create` (nothing exists yet)
+///   and `Some(bcs_data)` for Read/Mutate/Delete (decoded from the on-disk
+///   `ObjectEnvelope.data` segment).
+/// - `name_type_tag` / `value_type_tag` are canonical Move type tag strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedDynamicField {
+    pub parent_object_id: ObjectId,
+    pub df_object_id: ObjectId,
+    pub name_type_tag: String,
+    pub name_bcs: Vec<u8>,
+    pub value_bytes: Option<Vec<u8>>,
+    pub value_type_tag: String,
+    pub mode: DfAccessMode,
 }
 
 /// Single resolved object reference
@@ -411,5 +448,92 @@ mod tests {
         let budget = GasBudget::default();
         assert_eq!(budget.max_gas_units, u64::MAX);
         assert_eq!(budget.estimated_fee, 0);
+    }
+
+    // ── DF FDP M1 — ResolvedInputs.dynamic_fields coverage ──
+
+    #[test]
+    fn resolved_inputs_serde_default_dynamic_fields() {
+        // Legacy client payload that predates M1 — no `dynamic_fields` field.
+        // With `#[serde(default)]` on the new field this MUST round-trip to
+        // an empty Vec instead of a decode error.
+        // NoOp is a unit variant — serde's default externally-tagged repr
+        // serializes unit variants as the bare variant string.
+        let legacy_json = r#"{
+            "operation": "NoOp",
+            "input_objects": []
+        }"#;
+        let parsed: ResolvedInputs = serde_json::from_str(legacy_json)
+            .expect("legacy payload without dynamic_fields should still decode");
+        assert!(parsed.dynamic_fields.is_empty());
+    }
+
+    #[test]
+    fn resolved_dynamic_field_bcs_roundtrip() {
+        use crate::dynamic_field::DfAccessMode;
+
+        // Create-mode entry (value_bytes = None).
+        let create = ResolvedDynamicField {
+            parent_object_id: ObjectId::new([1u8; 32]),
+            df_object_id: ObjectId::new([2u8; 32]),
+            name_type_tag: "u64".to_string(),
+            name_bcs: vec![42, 0, 0, 0, 0, 0, 0, 0],
+            value_bytes: None,
+            value_type_tag: "0xcafe::pool::Liquidity".to_string(),
+            mode: DfAccessMode::Create,
+        };
+        let bytes = bcs::to_bytes(&create).unwrap();
+        let decoded: ResolvedDynamicField = bcs::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.parent_object_id, create.parent_object_id);
+        assert_eq!(decoded.df_object_id, create.df_object_id);
+        assert_eq!(decoded.name_type_tag, create.name_type_tag);
+        assert_eq!(decoded.name_bcs, create.name_bcs);
+        assert_eq!(decoded.value_bytes, None);
+        assert_eq!(decoded.value_type_tag, create.value_type_tag);
+        assert_eq!(decoded.mode, DfAccessMode::Create);
+
+        // Read-mode entry (value_bytes = Some).
+        let read = ResolvedDynamicField {
+            parent_object_id: ObjectId::new([3u8; 32]),
+            df_object_id: ObjectId::new([4u8; 32]),
+            name_type_tag: "address".to_string(),
+            name_bcs: vec![5; 32],
+            value_bytes: Some(vec![10, 20, 30]),
+            value_type_tag: "u64".to_string(),
+            mode: DfAccessMode::Read,
+        };
+        let bytes = bcs::to_bytes(&read).unwrap();
+        let decoded: ResolvedDynamicField = bcs::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.value_bytes, Some(vec![10, 20, 30]));
+        assert_eq!(decoded.mode, DfAccessMode::Read);
+    }
+
+    #[test]
+    fn resolved_inputs_dynamic_fields_roundtrip() {
+        use crate::dynamic_field::DfAccessMode;
+
+        let coin = ResolvedObject::coin(ObjectId::new([9u8; 32])).with_version(7);
+        let mut inputs = ResolvedInputs::transfer(coin, 100);
+        inputs.dynamic_fields.push(ResolvedDynamicField {
+            parent_object_id: ObjectId::new([1u8; 32]),
+            df_object_id: ObjectId::new([2u8; 32]),
+            name_type_tag: "u64".to_string(),
+            name_bcs: vec![1, 0, 0, 0, 0, 0, 0, 0],
+            value_bytes: Some(vec![0xab, 0xcd]),
+            value_type_tag: "0xdead::beef::T".to_string(),
+            mode: DfAccessMode::Mutate,
+        });
+
+        let bytes = bcs::to_bytes(&inputs).unwrap();
+        let decoded: ResolvedInputs = bcs::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.dynamic_fields.len(), 1);
+        let df = &decoded.dynamic_fields[0];
+        assert_eq!(df.parent_object_id, ObjectId::new([1u8; 32]));
+        assert_eq!(df.df_object_id, ObjectId::new([2u8; 32]));
+        assert_eq!(df.name_type_tag, "u64");
+        assert_eq!(df.name_bcs, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(df.value_bytes, Some(vec![0xab, 0xcd]));
+        assert_eq!(df.value_type_tag, "0xdead::beef::T");
+        assert_eq!(df.mode, DfAccessMode::Mutate);
     }
 }
