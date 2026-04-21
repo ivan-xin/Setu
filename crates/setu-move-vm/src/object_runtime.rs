@@ -105,11 +105,16 @@ pub struct ObjectMutationEffect {
 ///
 /// `value_bytes == None` ⇔ Create mode (no on-disk envelope yet).
 /// `value_bytes == Some(bcs)` ⇔ Read / Mutate / Delete (existing entry).
+///
+/// `envelope_bytes` carries the full on-disk `ObjectEnvelope::to_bytes()` so
+/// the engine's state-change converter can emit `old_state` that byte-matches
+/// the current SMT — required to avoid false stale_read at CF apply.
 pub(crate) struct DfEntry {
     pub df_oid: ObjectId,
     pub value_bytes: Option<Vec<u8>>,
     pub value_type_tag: String,
     pub mode: DfAccessMode,
+    pub envelope_bytes: Option<Vec<u8>>,
 }
 
 /// Effect produced by `dynamic_field::add_internal` — a brand-new DF entry.
@@ -138,6 +143,11 @@ pub struct DfMutateEffect {
     pub value_type_tag: String,
     pub old_value_bcs: Vec<u8>,
     pub new_value_bcs: Vec<u8>,
+    /// On-disk `ObjectEnvelope::to_bytes()` for this DF entry at tx-prepare time.
+    /// When present, the engine uses it verbatim as `StateChange.old_value`
+    /// (matching current SMT byte-for-byte) rather than rebuilding an envelope
+    /// with an out-of-date version.
+    pub on_disk_envelope: Option<Vec<u8>>,
 }
 
 /// Effect produced by `dynamic_field::remove_internal`.
@@ -150,6 +160,9 @@ pub struct DfDeleteEffect {
     pub key_bcs: Vec<u8>,
     pub value_type_tag: String,
     pub old_value_bcs: Vec<u8>,
+    /// On-disk `ObjectEnvelope::to_bytes()` for this DF entry at tx-prepare time.
+    /// Used by the engine for `StateChange.old_value` (see `DfMutateEffect`).
+    pub on_disk_envelope: Option<Vec<u8>>,
 }
 
 /// Cache key: `(parent_oid, key_type_tag, key_bcs)`.
@@ -231,6 +244,7 @@ impl SetuObjectRuntime {
                     value_bytes: rdf.value_bytes,
                     value_type_tag: rdf.value_type_tag,
                     mode: rdf.mode,
+                    envelope_bytes: rdf.envelope_bytes,
                 };
                 (key, entry)
             })
@@ -399,6 +413,14 @@ impl SetuObjectRuntime {
     /// Record a DF delete (from `dynamic_field::remove_internal`).
     pub(crate) fn record_df_delete(&mut self, df_oid: ObjectId, effect: DfDeleteEffect) {
         self.df_deleted.insert(df_oid, effect);
+    }
+
+    /// Take and remove a previously-recorded DF delete effect.
+    ///
+    /// Used by mutate-replace flows (`remove` then `add` on the same key in
+    /// one transaction) to collapse create+delete into a single update effect.
+    pub(crate) fn take_df_delete(&mut self, df_oid: &ObjectId) -> Option<DfDeleteEffect> {
+        self.df_deleted.swap_remove(df_oid)
     }
 
     /// Consume self and return aggregated results.
@@ -654,6 +676,7 @@ mod tests {
             value_bytes,
             value_type_tag: value_tag.to_string(),
             mode,
+            envelope_bytes: None,
         }
     }
 
@@ -748,6 +771,7 @@ mod tests {
             value_type_tag: "u64".into(),
             old_value_bcs: vec![0; 8],
             new_value_bcs: new_bytes,
+            on_disk_envelope: None,
         };
         rt.record_df_mutate(df, mk(vec![0x01]));
         rt.record_df_mutate(df, mk(vec![0x02]));
@@ -768,6 +792,7 @@ mod tests {
             key_bcs: vec![2; 8],
             value_type_tag: "u64".into(),
             old_value_bcs: vec![9; 8],
+            on_disk_envelope: None,
         };
         rt.record_df_delete(df, mk());
         rt.record_df_delete(df, mk());
@@ -799,6 +824,7 @@ mod tests {
                 key_bcs: vec![7; 8],
                 value_type_tag: "u64".into(),
                 old_value_bcs: vec![8; 8],
+                on_disk_envelope: None,
             },
         );
         let r = rt.into_results();
@@ -838,6 +864,7 @@ mod tests {
                 value_type_tag: "u64".into(),
                 old_value_bcs: vec![6; 8],
                 new_value_bcs: vec![7; 8],
+                on_disk_envelope: None,
             },
         );
         rt.record_df_delete(
@@ -848,6 +875,7 @@ mod tests {
                 key_bcs: vec![8; 8],
                 value_type_tag: "u64".into(),
                 old_value_bcs: vec![9; 8],
+                on_disk_envelope: None,
             },
         );
         let r = rt.into_results();
@@ -869,6 +897,7 @@ mod tests {
             value_type_tag: "u128".into(),
             old_value_bcs: vec![0xAA; 16],
             new_value_bcs: vec![0xBB; 16],
+            on_disk_envelope: None,
         };
         rt.record_df_mutate(df, eff);
         let r = rt.into_results();
@@ -893,6 +922,7 @@ mod tests {
             key_bcs: vec![0xCD; 32],
             value_type_tag: "u64".into(),
             old_value_bcs: vec![0xEF; 8],
+            on_disk_envelope: None,
         };
         rt.record_df_delete(df, eff);
         let r = rt.into_results();

@@ -3,7 +3,7 @@
 //! Types used by the HTTP API layer that are not part of the core RPC protocol.
 
 use serde::{Deserialize, Serialize};
-use setu_types::event::Event;
+use setu_types::event::{DynamicFieldAccess, Event};
 
 // ============================================
 // Event Submission
@@ -96,6 +96,12 @@ pub struct MoveCallRequest {
     /// Target subnet (defaults to ROOT)
     #[serde(default)]
     pub subnet_id: Option<String>,
+    /// Dynamic-field access declarations (DF FDP M5).
+    /// Each entry declares a (parent, key, mode) triple so the validator
+    /// can preload the DF envelope + Merkle proof before TEE execution.
+    /// Empty by default — pre-M5 JSON clients keep working unchanged.
+    #[serde(default)]
+    pub dynamic_field_accesses: Vec<DynamicFieldAccess>,
 }
 
 /// Response to Move function call
@@ -269,4 +275,64 @@ pub struct GetEventResponse {
     pub execution: Option<ExecutionReport>,
     pub on_chain: Option<OnChainOutcome>,
     pub metadata: EventMetadata,
+}
+
+// ============================================
+// M5-Pre tests — MoveCallRequest.dynamic_field_accesses
+// ============================================
+
+#[cfg(test)]
+mod m5_pre_tests {
+    use super::*;
+    use setu_types::dynamic_field::DfAccessMode;
+
+    /// Pre-M5 clients that omit `dynamic_field_accesses` must still deserialize;
+    /// field defaults to an empty Vec. This guarantees wire back-compat.
+    #[test]
+    fn move_call_request_defaults_df_empty_when_missing() {
+        let json = r#"{
+            "sender": "alice",
+            "package": "0xcafe",
+            "module": "m",
+            "function": "f"
+        }"#;
+        let req: MoveCallRequest = serde_json::from_str(json).unwrap();
+        assert!(req.dynamic_field_accesses.is_empty());
+        // Sanity: other defaulted fields unaffected.
+        assert!(req.needs_tx_context);
+    }
+
+    /// Serialize → deserialize preserves every DF access entry end-to-end.
+    #[test]
+    fn move_call_request_df_roundtrip() {
+        let orig = MoveCallRequest {
+            sender: "alice".to_string(),
+            package: "0xcafe".to_string(),
+            module: "df_registry".to_string(),
+            function: "put_u64".to_string(),
+            type_args: vec![],
+            args: vec![],
+            input_object_ids: vec!["aa".repeat(32)],
+            shared_object_ids: vec![],
+            mutable_indices: vec![0],
+            consumed_indices: vec![],
+            needs_tx_context: false,
+            subnet_id: None,
+            dynamic_field_accesses: vec![DynamicFieldAccess {
+                parent_object_id: format!("oid:{}", "aa".repeat(32)),
+                key_type: "u64".to_string(),
+                key_bcs_hex: "0100000000000000".to_string(),
+                mode: DfAccessMode::Create,
+                value_type: Some("u64".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: MoveCallRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dynamic_field_accesses.len(), 1);
+        assert_eq!(back.dynamic_field_accesses[0].mode, DfAccessMode::Create);
+        assert_eq!(
+            back.dynamic_field_accesses[0].value_type.as_deref(),
+            Some("u64")
+        );
+    }
 }

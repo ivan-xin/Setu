@@ -23,7 +23,7 @@ use move_vm_runtime::native_functions::{NativeContext, NativeFunction, NativeFun
 use move_vm_types::{
     loaded_data::runtime_types::Type,
     natives::function::NativeResult,
-    values::{Struct, StructRef, Value, VMValueCast},
+    values::{Locals, Struct, StructRef, Value, VMValueCast},
 };
 use smallvec::smallvec;
 
@@ -564,13 +564,16 @@ fn native_df_add_internal(
     }
 
     // Must be preloaded in Create mode.
+    // Exception: mutate-mode replace (`remove` then `add` in the same tx)
+    // is allowed when the cache slot is currently empty.
     let entry = match runtime.df_cache_get(&cache_key) {
         Some(e) => e,
         None => {
             return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
         }
     };
-    if entry.mode != DfAccessMode::Create {
+    let mutate_replace = entry.mode == DfAccessMode::Mutate && entry.value_bytes.is_none();
+    if entry.mode != DfAccessMode::Create && !mutate_replace {
         return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
     }
     if entry.value_bytes.is_some() {
@@ -587,16 +590,40 @@ fn native_df_add_internal(
         return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
     }
 
-    runtime.record_df_create(
-        df_oid,
-        DfCreateEffect {
-            parent: parent_oid,
-            key_type_tag: name_tag.clone(),
-            key_bcs: name_bcs.clone(),
-            value_type_tag: value_tag,
-            value_bcs: value_bcs.clone(),
-        },
-    );
+    if mutate_replace {
+        // `remove` must have recorded an old-value effect earlier in this tx.
+        let prior_delete = match runtime.take_df_delete(&df_oid) {
+            Some(eff) => eff,
+            None => {
+                return Ok(NativeResult::err(InternalGas::zero(), E_DF_NOT_PRELOADED));
+            }
+        };
+
+        runtime.record_df_mutate(
+            df_oid,
+            DfMutateEffect {
+                parent: parent_oid,
+                key_type_tag: name_tag.clone(),
+                key_bcs: name_bcs.clone(),
+                value_type_tag: value_tag.clone(),
+                old_value_bcs: prior_delete.old_value_bcs,
+                new_value_bcs: value_bcs.clone(),
+                on_disk_envelope: prior_delete.on_disk_envelope,
+            },
+        );
+    } else {
+        runtime.record_df_create(
+            df_oid,
+            DfCreateEffect {
+                parent: parent_oid,
+                key_type_tag: name_tag.clone(),
+                key_bcs: name_bcs.clone(),
+                value_type_tag: value_tag,
+                value_bcs: value_bcs.clone(),
+            },
+        );
+    }
+
     // Keep the cache coherent so a later `borrow` in the same tx sees it.
     if let Some(e) = runtime.df_cache_get_mut(&cache_key) {
         e.value_bytes = Some(value_bcs);
@@ -656,6 +683,7 @@ fn native_df_remove_internal(
             }
         };
         let df_oid = entry.df_oid;
+        let on_disk_envelope = entry.envelope_bytes.clone();
         runtime.record_df_delete(
             df_oid,
             DfDeleteEffect {
@@ -664,6 +692,7 @@ fn native_df_remove_internal(
                 key_bcs: name_bcs.clone(),
                 value_type_tag: v_tag.clone(),
                 old_value_bcs: bytes.clone(),
+                on_disk_envelope,
             },
         );
         // Invalidate cache so a later borrow returns DOES_NOT_EXIST.
@@ -730,7 +759,16 @@ fn native_df_borrow_internal(
         }
     };
     let value = deserialize_value_bytes(context, &v_ty, &bytes)?;
-    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value]))
+
+    // Native signatures require returning `&V`.
+    // Use a struct-backed container to produce a stable field reference.
+    let mut locals = Locals::new(1);
+    locals.store_loc(0, Value::struct_(Struct::pack(vec![value])), false)?;
+    let struct_ref_val = locals.borrow_loc(0)?;
+    let struct_ref: StructRef = struct_ref_val.cast()?;
+    let value_ref = struct_ref.borrow_field(0)?;
+
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value_ref]))
 }
 
 /// `dynamic_field::borrow_mut_internal<K, V>(parent: &mut UID, name: K): &mut V`
@@ -787,6 +825,7 @@ fn native_df_borrow_mut_internal(
             }
         };
         let df_oid = entry.df_oid;
+        let on_disk_envelope = entry.envelope_bytes.clone();
         runtime.record_df_mutate(
             df_oid,
             DfMutateEffect {
@@ -796,12 +835,21 @@ fn native_df_borrow_mut_internal(
                 value_type_tag: v_tag.clone(),
                 old_value_bcs: bytes.clone(),
                 new_value_bcs: bytes.clone(),
+                on_disk_envelope,
             },
         );
         bytes
     };
     let value = deserialize_value_bytes(context, &v_ty, &bytes)?;
-    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value]))
+
+    // Same reference-construction approach as immutable borrow.
+    let mut locals = Locals::new(1);
+    locals.store_loc(0, Value::struct_(Struct::pack(vec![value])), false)?;
+    let struct_ref_val = locals.borrow_loc(0)?;
+    let struct_ref: StructRef = struct_ref_val.cast()?;
+    let value_ref = struct_ref.borrow_field(0)?;
+
+    Ok(NativeResult::ok(InternalGas::zero(), smallvec![value_ref]))
 }
 
 /// `dynamic_field::exists_internal<K>(parent: &UID, name: K): bool`

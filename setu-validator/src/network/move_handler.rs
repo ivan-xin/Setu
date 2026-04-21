@@ -266,6 +266,11 @@ impl MoveCallHandler {
             mutable_indices: if request.mutable_indices.is_empty() { None } else { Some(request.mutable_indices.clone()) },
             consumed_indices: if request.consumed_indices.is_empty() { None } else { Some(request.consumed_indices.clone()) },
             needs_tx_context: request.needs_tx_context,
+            // DF FDP M5-Pre: forward client-declared DF accesses from the HTTP
+            // request straight into the MoveCallPayload. `MoveCallRequest.dynamic_field_accesses`
+            // is `#[serde(default)]`, so pre-M5 clients that omit the field
+            // land here as an empty Vec (behavior identical to before).
+            dynamic_field_accesses: request.dynamic_field_accesses.clone(),
         })
     }
 

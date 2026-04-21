@@ -320,6 +320,20 @@ impl MockEnclave {
                         "Invalid object ID: {}", e
                     )))?;
 
+                // DF FDP M5: Dynamic-field Create-mode entries carry an empty
+                // `value` — they exist in read_set purely as Merkle
+                // absence-proofs. There is no ObjectEnvelope or CoinState to
+                // load into the store; the VM picks the DF up from
+                // `ResolvedInputs.dynamic_fields` → `SetuObjectRuntime.df_cache`
+                // on the hybrid.rs side. Skip silently here.
+                if entry.value.is_empty() {
+                    debug!(
+                        key = %entry.key,
+                        "Skipping empty DF absence-proof read_set entry"
+                    );
+                    continue;
+                }
+
                 // Try ObjectEnvelope first (magic bytes check)
                 if entry.value.len() >= 2 {
                     let magic = u16::from_le_bytes([entry.value[0], entry.value[1]]);
@@ -1005,11 +1019,21 @@ impl MockEnclave {
                 }
 
                 // 7. Write state changes to StateDiff
+                //    Preserve `sc.old_state` into the WriteSetEntry so the
+                //    downstream storage layer sees it as an Update (with the
+                //    exact pre-tx envelope bytes captured by TaskPreparer)
+                //    instead of mis-classifying every MoveCall state change
+                //    as a Create. Dropping `old_state` here caused every DF
+                //    Mutate/Delete to surface as "Create conflict" at CF apply.
                 for sc in &output.state_changes {
                     let key = setu_types::object_key(&sc.object_id);
                     match &sc.new_state {
                         Some(new_state) => {
-                            diff.add_write(WriteSetEntry::new(key, new_state.clone()));
+                            let mut entry = WriteSetEntry::new(key, new_state.clone());
+                            if let Some(old) = sc.old_state.clone() {
+                                entry = entry.with_old_value(old);
+                            }
+                            diff.add_write(entry);
                         }
                         None => {
                             diff.add_delete(key);

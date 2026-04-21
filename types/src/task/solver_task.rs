@@ -333,6 +333,12 @@ pub struct ResolvedDynamicField {
     pub value_bytes: Option<Vec<u8>>,
     pub value_type_tag: String,
     pub mode: DfAccessMode,
+    /// Full on-disk `ObjectEnvelope::to_bytes()` for Read/Mutate/Delete modes.
+    /// `None` for Create (nothing exists yet). Used by the Move VM engine to
+    /// emit `StateChange.old_value` with bytes that exactly match current SMT,
+    /// avoiding false stale_read at CF apply time.
+    #[serde(default)]
+    pub envelope_bytes: Option<Vec<u8>>,
 }
 
 /// Single resolved object reference
@@ -481,6 +487,7 @@ mod tests {
             value_bytes: None,
             value_type_tag: "0xcafe::pool::Liquidity".to_string(),
             mode: DfAccessMode::Create,
+            envelope_bytes: None,
         };
         let bytes = bcs::to_bytes(&create).unwrap();
         let decoded: ResolvedDynamicField = bcs::from_bytes(&bytes).unwrap();
@@ -501,6 +508,7 @@ mod tests {
             value_bytes: Some(vec![10, 20, 30]),
             value_type_tag: "u64".to_string(),
             mode: DfAccessMode::Read,
+            envelope_bytes: Some(vec![0xde, 0xad, 0xbe, 0xef]),
         };
         let bytes = bcs::to_bytes(&read).unwrap();
         let decoded: ResolvedDynamicField = bcs::from_bytes(&bytes).unwrap();
@@ -522,6 +530,7 @@ mod tests {
             value_bytes: Some(vec![0xab, 0xcd]),
             value_type_tag: "0xdead::beef::T".to_string(),
             mode: DfAccessMode::Mutate,
+            envelope_bytes: Some(vec![1, 2, 3, 4]),
         });
 
         let bytes = bcs::to_bytes(&inputs).unwrap();

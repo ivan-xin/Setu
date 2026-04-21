@@ -3,7 +3,7 @@
 //! Application-level singleton created once at startup.
 //! Thread-safe: MoveVM uses Arc internally.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use move_core_types::{
     effects::{ChangeSet, Op},
@@ -588,8 +588,22 @@ impl SetuMoveEngine {
         // conflict check still functions correctly because `value_bcs` is
         // the load-bearing field.
 
+        // Same-TX DF replacement path (`remove` + `add` on the same key)
+        // appears as both df_deleted[df_oid] and df_created[df_oid].
+        // Emit a single Update for that intersection, and skip the
+        // individual create/delete entries below.
+        let replaced_df_oids: BTreeSet<ObjectId> = results
+            .df_created
+            .keys()
+            .filter(|df_oid| results.df_deleted.contains_key(*df_oid))
+            .copied()
+            .collect();
+
         // DF creates
         for (df_oid, eff) in &results.df_created {
+            if replaced_df_oids.contains(df_oid) {
+                continue;
+            }
             let envelope = build_df_envelope(
                 *df_oid,
                 eff.parent,
@@ -609,15 +623,23 @@ impl SetuMoveEngine {
 
         // DF mutations
         for (df_oid, eff) in &results.df_mutated {
-            let old_env = build_df_envelope(
-                *df_oid,
-                eff.parent,
-                &eff.key_type_tag,
-                &eff.key_bcs,
-                &eff.value_type_tag,
-                &eff.old_value_bcs,
-                base_version,
-            );
+            // Prefer the on-disk envelope bytes captured at tx-prepare time
+            // so `old_state` matches the current SMT byte-for-byte. Rebuilding
+            // with `base_version` would produce a different envelope version
+            // than what is on disk and trigger a false stale_read at CF apply.
+            let old_state_bytes = match &eff.on_disk_envelope {
+                Some(b) => b.clone(),
+                None => build_df_envelope(
+                    *df_oid,
+                    eff.parent,
+                    &eff.key_type_tag,
+                    &eff.key_bcs,
+                    &eff.value_type_tag,
+                    &eff.old_value_bcs,
+                    base_version,
+                )
+                .to_bytes(),
+            };
             let new_env = build_df_envelope(
                 *df_oid,
                 eff.parent,
@@ -630,26 +652,76 @@ impl SetuMoveEngine {
             changes.push(MoveStateChange {
                 object_id: *df_oid,
                 change_type: MoveStateChangeType::Update,
-                old_state: Some(old_env.to_bytes()),
+                old_state: Some(old_state_bytes),
+                new_state: Some(new_env.to_bytes()),
+            });
+        }
+
+        // DF replacements (`remove` + `add` same df_oid in one tx)
+        for df_oid in &replaced_df_oids {
+            let (Some(create_eff), Some(delete_eff)) = (
+                results.df_created.get(df_oid),
+                results.df_deleted.get(df_oid),
+            ) else {
+                return Err(RuntimeError::InvalidTransaction(format!(
+                    "DF replacement effect missing for oid:{}",
+                    hex::encode(df_oid.as_bytes()),
+                )));
+            };
+
+            let old_state_bytes = match &delete_eff.on_disk_envelope {
+                Some(b) => b.clone(),
+                None => build_df_envelope(
+                    *df_oid,
+                    delete_eff.parent,
+                    &delete_eff.key_type_tag,
+                    &delete_eff.key_bcs,
+                    &delete_eff.value_type_tag,
+                    &delete_eff.old_value_bcs,
+                    base_version,
+                )
+                .to_bytes(),
+            };
+            let new_env = build_df_envelope(
+                *df_oid,
+                create_eff.parent,
+                &create_eff.key_type_tag,
+                &create_eff.key_bcs,
+                &create_eff.value_type_tag,
+                &create_eff.value_bcs,
+                new_version,
+            );
+
+            changes.push(MoveStateChange {
+                object_id: *df_oid,
+                change_type: MoveStateChangeType::Update,
+                old_state: Some(old_state_bytes),
                 new_state: Some(new_env.to_bytes()),
             });
         }
 
         // DF deletions
         for (df_oid, eff) in &results.df_deleted {
-            let old_env = build_df_envelope(
-                *df_oid,
-                eff.parent,
-                &eff.key_type_tag,
-                &eff.key_bcs,
-                &eff.value_type_tag,
-                &eff.old_value_bcs,
-                base_version,
-            );
+            if replaced_df_oids.contains(df_oid) {
+                continue;
+            }
+            let old_state_bytes = match &eff.on_disk_envelope {
+                Some(b) => b.clone(),
+                None => build_df_envelope(
+                    *df_oid,
+                    eff.parent,
+                    &eff.key_type_tag,
+                    &eff.key_bcs,
+                    &eff.value_type_tag,
+                    &eff.old_value_bcs,
+                    base_version,
+                )
+                .to_bytes(),
+            };
             changes.push(MoveStateChange {
                 object_id: *df_oid,
                 change_type: MoveStateChangeType::Delete,
-                old_state: Some(old_env.to_bytes()),
+                old_state: Some(old_state_bytes),
                 new_state: None,
             });
         }
@@ -1139,6 +1211,7 @@ mod tests {
                     value_type_tag: "u64".into(),
                     old_value_bcs: vec![0xA; 8],
                     new_value_bcs: vec![0xB; 8],
+                    on_disk_envelope: None,
                 },
             );
 
@@ -1182,6 +1255,7 @@ mod tests {
                     key_bcs: vec![0xCD; 32],
                     value_type_tag: "u64".into(),
                     old_value_bcs: vec![0x99; 8],
+                    on_disk_envelope: None,
                 },
             );
 
@@ -1232,6 +1306,7 @@ mod tests {
                     value_type_tag: "u64".into(),
                     old_value_bcs: vec![2; 8],
                     new_value_bcs: vec![3; 8],
+                    on_disk_envelope: None,
                 },
             );
             results.df_deleted.insert(
@@ -1242,6 +1317,7 @@ mod tests {
                     key_bcs: vec![3; 8],
                     value_type_tag: "u64".into(),
                     old_value_bcs: vec![4; 8],
+                    on_disk_envelope: None,
                 },
             );
 

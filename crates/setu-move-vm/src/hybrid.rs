@@ -315,24 +315,25 @@ pub fn build_move_call_args(
     let mut mutable_arg_map = Vec::new();
     let mutable_set: std::collections::HashSet<usize> = mutable_indices.iter().copied().collect();
 
-    // Input objects are placed first, in their original index order.
-    // Both consumed (by-value) and mutable (&mut) objects contribute their
-    // BCS data to the args vector. The parameter order in the Move function
-    // must match the order of input_object_ids.
-    let object_indices: std::collections::BTreeSet<usize> = consumed_indices.iter()
-        .chain(mutable_indices.iter())
-        .copied()
-        .collect();
-
-    for &idx in &object_indices {
-        if idx < input_objects.len() {
-            let arg_pos = args.len();
-            args.push(input_objects[idx].move_data.clone());
-            if mutable_set.contains(&idx) {
-                mutable_arg_map.push((arg_pos, input_objects[idx].id));
-            }
+    // Input objects are placed first, in their declared index order.
+    // EVERY declared input object contributes its BCS data, regardless of
+    // whether it was marked consumed or mutable — this covers immutable
+    // borrows (`&T`), which live in `input_object_ids` but are in neither
+    // `consumed_indices` nor `mutable_indices`. Dropping them here used to
+    // cause `NUMBER_OF_ARGUMENTS_MISMATCH` for any entry fn taking `&T`
+    // (see docs/bugs/20260421-hybrid-drops-immutable-input-object.md).
+    for (idx, obj) in input_objects.iter().enumerate() {
+        let arg_pos = args.len();
+        args.push(obj.move_data.clone());
+        if mutable_set.contains(&idx) {
+            mutable_arg_map.push((arg_pos, obj.id));
         }
     }
+    // `consumed_indices` is still tracked by the caller (for by-value
+    // transfer/delete semantics) but does not affect argument ordering
+    // here — by-value args occupy the same slot as any other input
+    // object from the Move VM's perspective.
+    let _ = consumed_indices;
 
     // Pure arguments follow all object args
     args.extend_from_slice(pure_args);

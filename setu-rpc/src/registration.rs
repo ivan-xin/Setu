@@ -481,6 +481,7 @@ mod tests {
             signature: vec![4, 5, 6],
             capacity: 100,
             shard_id: Some("shard-0".to_string()),
+            assigned_shard: None,
             resources: vec!["ETH".to_string(), "BTC".to_string()],
             permitted_subnets: vec![],
         };

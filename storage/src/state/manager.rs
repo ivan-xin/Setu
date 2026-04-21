@@ -1058,9 +1058,22 @@ impl GlobalStateManager {
                             self.get_subnet_mut(target).get(&object_id).cloned()
                         };
                         if effective_current.as_ref() != Some(expected_old) {
+                            // Idempotency escape: MoveCall events are pre-applied
+                            // locally in network::move_handler for read-your-writes
+                            // visibility before consensus finalization. At CF apply
+                            // time the SMT already holds `new_value`, so the raw
+                            // `expected_old != current` check would falsely reject
+                            // events that are, in fact, already correctly applied.
+                            // If current matches the declared new_value, accept the
+                            // change as a byte-level idempotent no-op and move on.
+                            if effective_current.as_deref() == change.new_value.as_deref() {
+                                pending_writes.insert((target, object_id), change.new_value.clone());
+                                continue;
+                            }
                             // Stale read detected: current state differs from what
-                            // the Solver saw when it executed this event.
-                            // This is the double-spend safety net.
+                            // the Solver saw when it executed this event, and also
+                            // differs from the target new_value → this is a real
+                            // write-write conflict.
                             tracing::warn!(
                                 event_id = %event.id,
                                 key = %change.key,
@@ -1080,8 +1093,19 @@ impl GlobalStateManager {
                         let exists_in_pending = pending_writes.get(&(target, object_id))
                             .map(|v| v.is_some())
                             .unwrap_or(false);
-                        let exists_in_smt = self.get_subnet_mut(target).get(&object_id).is_some();
+                        let existing_in_smt = self.get_subnet_mut(target).get(&object_id).cloned();
+                        let exists_in_smt = existing_in_smt.is_some();
                         if exists_in_pending || exists_in_smt {
+                            // Idempotency escape (see Update branch): MoveCall
+                            // Create was already applied locally before CF. If the
+                            // existing bytes match the declared new_value, accept
+                            // as no-op.
+                            if existing_in_smt.as_deref() == change.new_value.as_deref()
+                                && !exists_in_pending
+                            {
+                                pending_writes.insert((target, object_id), change.new_value.clone());
+                                continue;
+                            }
                             if event.is_genesis() {
                                 // Genesis state was pre-applied to GSM at startup for
                                 // immediate availability (before CF forms). The duplicate

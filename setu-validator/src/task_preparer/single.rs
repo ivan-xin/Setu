@@ -1044,6 +1044,128 @@ impl TaskPreparer {
             });
         }
 
+        // 1c. Resolve declared dynamic-field accesses (DF FDP M4).
+        //
+        // Design `docs/feat/dynamic-fields/design.md` §3.4: each
+        // `DynamicFieldAccess` is resolved against the pre-TX SMT so the
+        // TEE receives the DF entry's value bytes (or `None` for Create)
+        // plus a byte-copy in `read_set` for PWOO conflict detection.
+        //
+        // Ordering constraint: runs AFTER owned + shared input collection
+        // (so `declared_parents` is complete) and BEFORE index validation
+        // (so failures short-circuit cheaply).
+        let declared_parents: std::collections::HashSet<ObjectId> = call
+            .input_object_ids
+            .iter()
+            .chain(call.shared_object_ids.iter())
+            .copied()
+            .collect();
+
+        let mut resolved_dfs: Vec<setu_types::task::ResolvedDynamicField> = Vec::new();
+        for df in &call.dynamic_field_accesses {
+            let parent_oid = parse_oid_with_optional_prefix(&df.parent_object_id)?;
+
+            if !declared_parents.contains(&parent_oid) {
+                return Err(TaskPrepareError::DynamicFieldParentNotDeclared {
+                    parent: df.parent_object_id.clone(),
+                });
+            }
+
+            // Parent ownership / authorisation (§3.4).
+            let parent_env = load_envelope(&*self.state_provider, &parent_oid)?
+                .ok_or_else(|| TaskPrepareError::ObjectNotFound(
+                    hex::encode(parent_oid.as_bytes()),
+                ))?;
+            match parent_env.metadata.ownership {
+                setu_types::Ownership::AddressOwner(owner) => {
+                    if owner != sender_addr {
+                        return Err(TaskPrepareError::NotOwnedBySender {
+                            object_id: hex::encode(parent_oid.as_bytes()),
+                            sender: call.sender.clone(),
+                        });
+                    }
+                }
+                setu_types::Ownership::Shared { .. } => { /* any sender OK */ }
+                setu_types::Ownership::Immutable => {
+                    if df.mode != setu_types::dynamic_field::DfAccessMode::Read {
+                        return Err(TaskPrepareError::DynamicFieldOnImmutableParent);
+                    }
+                }
+                setu_types::Ownership::ObjectOwner(_) => {
+                    // Parent is itself a DF entry — nested DF not supported.
+                    return Err(TaskPrepareError::DynamicFieldParentNotRoot);
+                }
+            }
+
+            let key_bytes = hex::decode(&df.key_bcs_hex).map_err(|e| {
+                TaskPrepareError::InvalidInput(format!(
+                    "invalid key_bcs_hex for DF parent={}: {}",
+                    df.parent_object_id, e,
+                ))
+            })?;
+            let df_oid = setu_types::dynamic_field::derive_df_oid(
+                &parent_oid,
+                &df.key_type,
+                &key_bytes,
+            );
+
+            let (value_bytes, value_type_tag_resolved, envelope_bytes) = match df.mode {
+                setu_types::dynamic_field::DfAccessMode::Read
+                | setu_types::dynamic_field::DfAccessMode::Mutate
+                | setu_types::dynamic_field::DfAccessMode::Delete => {
+                    let df_env = load_envelope(&*self.state_provider, &df_oid)?
+                        .ok_or_else(|| TaskPrepareError::DynamicFieldNotFound {
+                            parent: df.parent_object_id.clone(),
+                            key_type: df.key_type.clone(),
+                        })?;
+                    ensure_df_ownership(&df_env, parent_oid)?;
+                    let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                    let envelope_bytes = df_env.to_bytes();
+                    read_set.push(ReadSetEntry::new(key, envelope_bytes.clone()));
+
+                    // Decode the on-disk DfFieldValue and hand the native
+                    // its INNER `value_bcs`, not the envelope wrapper. The
+                    // dynamic_field natives call `deserialize_value_bytes`
+                    // with Move type `V`, so passing the wrapper bytes
+                    // triggers VALUE_DESERIALIZATION_ERROR in the VM.
+                    //
+                    // The full `envelope_bytes` is also carried through so
+                    // the VM engine can emit `StateChange.old_value` that
+                    // byte-matches the current SMT at CF apply time.
+                    let on_disk = bcs::from_bytes::<
+                        setu_types::dynamic_field::DfFieldValue,
+                    >(&df_env.data)
+                    .map_err(|e| TaskPrepareError::InvalidInput(format!(
+                        "malformed DfFieldValue at df_oid={}: {}",
+                        hex::encode(df_oid.as_bytes()), e,
+                    )))?;
+                    (Some(on_disk.value_bcs), on_disk.value_type_tag, Some(envelope_bytes))
+                }
+                setu_types::dynamic_field::DfAccessMode::Create => {
+                    if load_envelope(&*self.state_provider, &df_oid)?.is_some() {
+                        return Err(TaskPrepareError::DynamicFieldAlreadyExists {
+                            parent: df.parent_object_id.clone(),
+                            key_type: df.key_type.clone(),
+                        });
+                    }
+                    let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                    read_set.push(ReadSetEntry::new(key, Vec::new()));
+                    (None, df.value_type.clone().unwrap_or_default(), None)
+                }
+            };
+
+            resolved_dfs.push(setu_types::task::ResolvedDynamicField {
+                parent_object_id: parent_oid,
+                df_object_id: df_oid,
+                name_type_tag: df.key_type.clone(),
+                name_bcs: key_bytes,
+                value_bytes,
+                value_type_tag: value_type_tag_resolved,
+                mode: df.mode,
+                envelope_bytes,
+            });
+        }
+
         // 2. Validate indices
         //
         // Design §3.2 / §6.2: `mutable_indices` and `consumed_indices` index
@@ -1085,7 +1207,7 @@ impl TaskPreparer {
         let module_read_set = self.resolve_module_dependencies(&call.package, &call.module)?;
 
         // 4. Build ResolvedInputs::MoveCall
-        let resolved_inputs = ResolvedInputs::move_call(
+        let mut resolved_inputs = ResolvedInputs::move_call(
             call.package.clone(),
             call.module.clone(),
             call.function.clone(),
@@ -1095,6 +1217,7 @@ impl TaskPreparer {
             mutable_indices,
             consumed_indices,
         );
+        resolved_inputs.dynamic_fields = resolved_dfs;
 
         // 5. Derive dependencies (for future DAG ordering)
         let _parent_ids = self.derive_dependencies(
@@ -1183,6 +1306,75 @@ impl TaskPreparer {
         }
 
         Ok(result)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// DF FDP M4 — module-level helpers
+// ═══════════════════════════════════════════════════════════
+
+/// Parse an ObjectId from an optional `"oid:"` prefix + hex string.
+fn parse_oid_with_optional_prefix(raw: &str) -> Result<ObjectId, TaskPrepareError> {
+    let trimmed = raw.strip_prefix("oid:").unwrap_or(raw);
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        TaskPrepareError::InvalidInput(format!(
+            "invalid object id hex '{}': {}",
+            raw, e,
+        ))
+    })?;
+    if bytes.len() != 32 {
+        return Err(TaskPrepareError::InvalidInput(format!(
+            "object id must be 32 bytes (got {} from '{}')",
+            bytes.len(),
+            raw,
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(ObjectId::new(arr))
+}
+
+/// Load + decode an ObjectEnvelope from the state provider.
+///
+/// Uses `detect_and_parse` (the same guard PWOO uses in `single.rs:~940`
+/// and `manager.rs:779/915/951`) so corrupted / legacy bytes are rejected
+/// explicitly instead of being silently accepted by `bcs::from_bytes`.
+fn load_envelope(
+    state_provider: &dyn StateProvider,
+    oid: &ObjectId,
+) -> Result<Option<setu_types::ObjectEnvelope>, TaskPrepareError> {
+    let Some(bytes) = state_provider.get_object(oid) else {
+        return Ok(None);
+    };
+    match setu_types::envelope::detect_and_parse(&bytes) {
+        setu_types::envelope::StorageFormat::Envelope(env) => Ok(Some(env)),
+        // DF parent entries must be Move envelopes — legacy coin state is
+        // never a DF parent. Reuse the mismatch variant to keep the error
+        // surface focused.
+        setu_types::envelope::StorageFormat::LegacyCoinState(_) => {
+            Err(TaskPrepareError::DynamicFieldParentMismatch)
+        }
+        setu_types::envelope::StorageFormat::Unknown => {
+            Err(TaskPrepareError::EnvelopeDecode(format!(
+                "unknown storage format for oid {}",
+                hex::encode(oid.as_bytes()),
+            )))
+        }
+    }
+}
+
+/// Assert the DF envelope's ownership points back at `expected_parent`.
+///
+/// Defence-in-depth: even if the client computed a valid-looking `df_oid`,
+/// the on-disk DF entry must declare the same parent via
+/// `Ownership::ObjectOwner(parent)`.
+fn ensure_df_ownership(
+    env: &setu_types::ObjectEnvelope,
+    expected_parent: ObjectId,
+) -> Result<(), TaskPrepareError> {
+    match env.metadata.ownership {
+        setu_types::Ownership::ObjectOwner(parent) if parent == expected_parent => Ok(()),
+        _ => Err(TaskPrepareError::DynamicFieldParentMismatch),
     }
 }
 
@@ -1427,6 +1619,7 @@ mod tests {
             mutable_indices: None,
             consumed_indices: None,
             needs_tx_context: false,
+            dynamic_field_accesses: vec![],
         }
     }
 
@@ -1899,5 +2092,405 @@ mod tests {
         let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
         assert!(matches!(result, Err(TaskPrepareError::InvalidInput(_))),
             "R4-ISSUE-3: consumed idx into shared tail must be rejected, got: {:?}", result);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // DF FDP M4 — Dynamic Field access resolution tests
+    // ═══════════════════════════════════════════════════════════
+
+    mod m4_df {
+        use super::*;
+        use setu_types::dynamic_field::{derive_df_oid, DfAccessMode, DfFieldValue};
+        use setu_types::event::DynamicFieldAccess;
+        use setu_types::envelope::ObjectEnvelope;
+
+        /// Build a TaskPreparer seeded with a parent object (owned by sender
+        /// unless overridden) and optionally a DF entry hanging off it.
+        fn make_preparer_with_df(
+            parent_id: ObjectId,
+            parent_owner: setu_types::Ownership,
+            df_entry: Option<(ObjectId, ObjectId, DfFieldValue)>,
+            module_key: (&str, &[u8]),
+        ) -> TaskPreparer {
+            use setu_storage::{
+                GlobalStateManager, MerkleStateProvider, SharedStateManager,
+            };
+            use setu_types::event::StateChange;
+            use std::sync::Arc;
+
+            let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+            {
+                let mut gsm = shared.lock_write();
+
+                let parent_env = ObjectEnvelope::from_move_result(
+                    parent_id,
+                    setu_types::Address::ZERO,
+                    1,
+                    parent_owner,
+                    "0xcafe::pool::Pool".to_string(),
+                    vec![0u8; 16],
+                );
+                let pkey = format!("oid:{}", hex::encode(parent_id.as_bytes()));
+                gsm.apply_state_change(
+                    SubnetId::ROOT,
+                    &StateChange::insert(pkey, parent_env.to_bytes()),
+                );
+
+                if let Some((df_oid, expected_parent, payload)) = df_entry {
+                    let data = bcs::to_bytes(&payload).unwrap();
+                    let df_env = ObjectEnvelope::from_move_result(
+                        df_oid,
+                        setu_types::Address::ZERO,
+                        1,
+                        setu_types::Ownership::ObjectOwner(expected_parent),
+                        format!(
+                            "0x1::dynamic_field::Field<{}, {}>",
+                            payload.name_type_tag, payload.value_type_tag
+                        ),
+                        data,
+                    );
+                    let dkey = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                    gsm.apply_state_change(
+                        SubnetId::ROOT,
+                        &StateChange::insert(dkey, df_env.to_bytes()),
+                    );
+                }
+
+                let (mk, mb) = module_key;
+                gsm.apply_state_change(
+                    SubnetId::ROOT,
+                    &StateChange::insert(mk.to_string(), mb.to_vec()),
+                );
+
+                shared.publish_snapshot(&gsm);
+            }
+            let provider: Arc<dyn StateProvider> =
+                Arc::new(MerkleStateProvider::new(shared));
+            TaskPreparer::new("validator-test".to_string(), provider)
+        }
+
+        fn module_setup() -> (
+            String,
+            Vec<u8>,
+            move_core_types::account_address::AccountAddress,
+        ) {
+            let addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+                "0xdead",
+            )
+            .unwrap();
+            let bytecode = make_module_bytes(
+                move_binary_format::file_format::AddressIdentifierIndex(0),
+                addr,
+                "counter",
+            );
+            let key = format!("mod:{}::counter", addr.to_hex_literal());
+            (key, bytecode, addr)
+        }
+
+        /// V1: Create mode — DF not yet present; resolved value_bytes=None.
+        #[test]
+        fn test_df_create_path() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x70; 32]);
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+                (&mkey, &mbytes),
+            );
+
+            let key_bcs = vec![1, 0, 0, 0, 0, 0, 0, 0];
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode(&key_bcs),
+                mode: DfAccessMode::Create,
+                value_type: Some("u64".to_string()),
+            }];
+
+            let task = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .expect("prepare ok");
+            assert_eq!(task.resolved_inputs.dynamic_fields.len(), 1);
+            let rdf = &task.resolved_inputs.dynamic_fields[0];
+            assert_eq!(rdf.parent_object_id, parent_id);
+            assert_eq!(rdf.mode, DfAccessMode::Create);
+            assert!(rdf.value_bytes.is_none());
+            assert_eq!(rdf.value_type_tag, "u64");
+            // read_set has the df entry with empty value
+            let df_oid = derive_df_oid(&parent_id, "u64", &key_bcs);
+            let want_key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+            assert!(task.read_set.iter().any(|e| e.key == want_key && e.value.is_empty()));
+        }
+
+        /// V2/V3/V4: Read/Mutate/Delete mode on existing DF entry.
+        fn check_existing_df_mode(mode: DfAccessMode) {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x71; 32]);
+            let key_bcs = vec![2, 0, 0, 0, 0, 0, 0, 0];
+            let df_oid = derive_df_oid(&parent_id, "u64", &key_bcs);
+            let payload = DfFieldValue {
+                name_type_tag: "u64".into(),
+                name_bcs: key_bcs.clone(),
+                value_type_tag: "u64".into(),
+                value_bcs: vec![9u8; 8],
+            };
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                Some((df_oid, parent_id, payload.clone())),
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode(&key_bcs),
+                mode,
+                value_type: None,
+            }];
+
+            let task = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .expect("prepare ok");
+            assert_eq!(task.resolved_inputs.dynamic_fields.len(), 1);
+            let rdf = &task.resolved_inputs.dynamic_fields[0];
+            assert_eq!(rdf.mode, mode);
+            assert_eq!(rdf.df_object_id, df_oid);
+            let got_value = rdf.value_bytes.as_ref().expect("value_bytes set");
+            let on_disk: DfFieldValue = bcs::from_bytes(got_value).unwrap();
+            assert_eq!(on_disk.value_bcs, payload.value_bcs);
+            assert_eq!(rdf.value_type_tag, "u64", "value_type_tag read from disk");
+        }
+
+        #[test]
+        fn test_df_read_path() {
+            check_existing_df_mode(DfAccessMode::Read);
+        }
+
+        #[test]
+        fn test_df_mutate_path() {
+            check_existing_df_mode(DfAccessMode::Mutate);
+        }
+
+        #[test]
+        fn test_df_delete_path() {
+            check_existing_df_mode(DfAccessMode::Delete);
+        }
+
+        /// V5: parent not declared in input_object_ids/shared_object_ids.
+        #[test]
+        fn test_df_parent_not_declared() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x72; 32]);
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![]; // parent NOT declared
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode([1u8; 8]),
+                mode: DfAccessMode::Create,
+                value_type: Some("u64".into()),
+            }];
+
+            let err = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .unwrap_err();
+            assert!(matches!(err, TaskPrepareError::DynamicFieldParentNotDeclared { .. }));
+        }
+
+        /// V6: Create mode but df_oid already populated.
+        #[test]
+        fn test_df_already_exists_on_create() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x73; 32]);
+            let key_bcs = vec![3, 0, 0, 0, 0, 0, 0, 0];
+            let df_oid = derive_df_oid(&parent_id, "u64", &key_bcs);
+            let payload = DfFieldValue {
+                name_type_tag: "u64".into(),
+                name_bcs: key_bcs.clone(),
+                value_type_tag: "u64".into(),
+                value_bcs: vec![1u8; 8],
+            };
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                Some((df_oid, parent_id, payload)),
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode(&key_bcs),
+                mode: DfAccessMode::Create,
+                value_type: Some("u64".into()),
+            }];
+
+            let err = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .unwrap_err();
+            assert!(matches!(err, TaskPrepareError::DynamicFieldAlreadyExists { .. }));
+        }
+
+        /// V7: Read mode but df_oid not in state.
+        #[test]
+        fn test_df_not_found_on_read() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x74; 32]);
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode([4u8; 8]),
+                mode: DfAccessMode::Read,
+                value_type: None,
+            }];
+
+            let err = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .unwrap_err();
+            assert!(matches!(err, TaskPrepareError::DynamicFieldNotFound { .. }));
+        }
+
+        /// V8: DF envelope's ObjectOwner points at a different parent.
+        #[test]
+        fn test_df_parent_mismatch() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x75; 32]);
+            let other_parent = ObjectId::new([0xAA; 32]);
+            let key_bcs = vec![5, 0, 0, 0, 0, 0, 0, 0];
+            let df_oid = derive_df_oid(&parent_id, "u64", &key_bcs);
+            let payload = DfFieldValue {
+                name_type_tag: "u64".into(),
+                name_bcs: key_bcs.clone(),
+                value_type_tag: "u64".into(),
+                value_bcs: vec![0u8; 8],
+            };
+            // seed df entry but ownership -> other_parent (mismatch)
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                Some((df_oid, other_parent, payload)),
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode(&key_bcs),
+                mode: DfAccessMode::Read,
+                value_type: None,
+            }];
+
+            let err = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .unwrap_err();
+            assert!(matches!(err, TaskPrepareError::DynamicFieldParentMismatch));
+        }
+
+        /// V9: Immutable parent + Mutate mode must be rejected.
+        #[test]
+        fn test_df_immutable_parent_mutate_rejected() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x76; 32]);
+            let key_bcs = vec![6, 0, 0, 0, 0, 0, 0, 0];
+            let df_oid = derive_df_oid(&parent_id, "u64", &key_bcs);
+            let payload = DfFieldValue {
+                name_type_tag: "u64".into(),
+                name_bcs: key_bcs.clone(),
+                value_type_tag: "u64".into(),
+                value_bcs: vec![0u8; 8],
+            };
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::Immutable,
+                Some((df_oid, parent_id, payload)),
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode(&key_bcs),
+                mode: DfAccessMode::Mutate,
+                value_type: None,
+            }];
+
+            let err = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .unwrap_err();
+            assert!(matches!(err, TaskPrepareError::DynamicFieldOnImmutableParent));
+        }
+
+        /// V10: empty `dynamic_field_accesses` preserves pre-M4 behaviour.
+        #[test]
+        fn test_move_call_no_df_back_compat() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x77; 32]);
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            // no DF accesses declared
+            let task = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .expect("prepare ok");
+            assert!(task.resolved_inputs.dynamic_fields.is_empty());
+        }
     }
 }
