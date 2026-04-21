@@ -3,7 +3,7 @@
 //! Application-level singleton created once at startup.
 //! Thread-safe: MoveVM uses Arc internally.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use move_core_types::{
     effects::{ChangeSet, Op},
@@ -588,22 +588,33 @@ impl SetuMoveEngine {
         // conflict check still functions correctly because `value_bcs` is
         // the load-bearing field.
 
-        // Same-TX DF replacement path (`remove` + `add` on the same key)
-        // appears as both df_deleted[df_oid] and df_created[df_oid].
-        // Emit a single Update for that intersection, and skip the
-        // individual create/delete entries below.
-        let replaced_df_oids: BTreeSet<ObjectId> = results
-            .df_created
-            .keys()
-            .filter(|df_oid| results.df_deleted.contains_key(*df_oid))
-            .copied()
-            .collect();
+        // Invariant: `df_created ∩ df_deleted ≡ ∅`.
+        //
+        // Enforced by the natives (crates/setu-move-vm/src/natives.rs):
+        //   - `native_df_add_internal` only writes to `df_created` when
+        //     `entry.mode == Create`.
+        //   - `native_df_remove_internal` only writes to `df_deleted` when
+        //     `entry.mode ∈ {Delete, Mutate}`.
+        //   - The mutate-replace branch in `add_internal` consumes the
+        //     prior `df_deleted` via `take_df_delete` and writes to
+        //     `df_mutated` instead.
+        // Since `DfAccessMode` is single-valued per preloaded cache entry,
+        // no oid can satisfy both insertion guards in the same tx.
+        //
+        // `df_mutated ∩ df_deleted` is NOT currently enforced empty — the
+        // `remove → add → remove` sequence can produce such overlap. That
+        // is tracked separately in
+        // `docs/bugs/20260421-df-mutate-delete-same-oid.md`.
+        debug_assert!(
+            results
+                .df_created
+                .keys()
+                .all(|k| !results.df_deleted.contains_key(k)),
+            "df_created ∩ df_deleted must be empty; natives mode-check invariant violated"
+        );
 
         // DF creates
         for (df_oid, eff) in &results.df_created {
-            if replaced_df_oids.contains(df_oid) {
-                continue;
-            }
             let envelope = build_df_envelope(
                 *df_oid,
                 eff.parent,
@@ -657,54 +668,8 @@ impl SetuMoveEngine {
             });
         }
 
-        // DF replacements (`remove` + `add` same df_oid in one tx)
-        for df_oid in &replaced_df_oids {
-            let (Some(create_eff), Some(delete_eff)) = (
-                results.df_created.get(df_oid),
-                results.df_deleted.get(df_oid),
-            ) else {
-                return Err(RuntimeError::InvalidTransaction(format!(
-                    "DF replacement effect missing for oid:{}",
-                    hex::encode(df_oid.as_bytes()),
-                )));
-            };
-
-            let old_state_bytes = match &delete_eff.on_disk_envelope {
-                Some(b) => b.clone(),
-                None => build_df_envelope(
-                    *df_oid,
-                    delete_eff.parent,
-                    &delete_eff.key_type_tag,
-                    &delete_eff.key_bcs,
-                    &delete_eff.value_type_tag,
-                    &delete_eff.old_value_bcs,
-                    base_version,
-                )
-                .to_bytes(),
-            };
-            let new_env = build_df_envelope(
-                *df_oid,
-                create_eff.parent,
-                &create_eff.key_type_tag,
-                &create_eff.key_bcs,
-                &create_eff.value_type_tag,
-                &create_eff.value_bcs,
-                new_version,
-            );
-
-            changes.push(MoveStateChange {
-                object_id: *df_oid,
-                change_type: MoveStateChangeType::Update,
-                old_state: Some(old_state_bytes),
-                new_state: Some(new_env.to_bytes()),
-            });
-        }
-
         // DF deletions
         for (df_oid, eff) in &results.df_deleted {
-            if replaced_df_oids.contains(df_oid) {
-                continue;
-            }
             let old_state_bytes = match &eff.on_disk_envelope {
                 Some(b) => b.clone(),
                 None => build_df_envelope(
