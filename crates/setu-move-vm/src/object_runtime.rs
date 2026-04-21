@@ -125,6 +125,33 @@ pub struct DfCreateEffect {
     pub value_bcs: Vec<u8>,
 }
 
+/// Effect produced by `dynamic_field::borrow_mut_internal`.
+///
+/// M3 carries both old/new bytes so the converter can emit an Update
+/// StateChange with the proper old envelope for byte-level conflict
+/// detection. In M3 `new_value_bcs == old_value_bcs` (placeholder) until
+/// full reference-tracking is added in a later milestone.
+pub struct DfMutateEffect {
+    pub parent: ObjectId,
+    pub key_type_tag: String,
+    pub key_bcs: Vec<u8>,
+    pub value_type_tag: String,
+    pub old_value_bcs: Vec<u8>,
+    pub new_value_bcs: Vec<u8>,
+}
+
+/// Effect produced by `dynamic_field::remove_internal`.
+///
+/// Carries the original `value_bcs` so the converter can reconstruct the
+/// old envelope for byte-level conflict detection.
+pub struct DfDeleteEffect {
+    pub parent: ObjectId,
+    pub key_type_tag: String,
+    pub key_bcs: Vec<u8>,
+    pub value_type_tag: String,
+    pub old_value_bcs: Vec<u8>,
+}
+
 /// Cache key: `(parent_oid, key_type_tag, key_bcs)`.
 /// Same shape on both the preload side and the native lookup side.
 pub(crate) type DfCacheKey = (ObjectId, String, Vec<u8>);
@@ -142,11 +169,11 @@ pub struct ObjectRuntimeResults {
     // --- M2 Dynamic Field effects ---
     /// DF entries newly added by `dynamic_field::add` (ordered by first insert).
     pub df_created: IndexMap<ObjectId, DfCreateEffect>,
-    /// DF entries mutated via `borrow_mut` (placeholder value in M2;
-    /// M3 merges real post-execution value from `mutable_reference_outputs`).
-    pub df_mutated: IndexMap<ObjectId, ObjectMutationEffect>,
+    /// DF entries mutated via `borrow_mut` (M3: placeholder old==new value_bcs;
+    /// full reference-tracking deferred).
+    pub df_mutated: IndexMap<ObjectId, DfMutateEffect>,
     /// DF entries removed via `dynamic_field::remove`.
-    pub df_deleted: IndexSet<ObjectId>,
+    pub df_deleted: IndexMap<ObjectId, DfDeleteEffect>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -172,8 +199,8 @@ pub struct SetuObjectRuntime {
     // --- M2 Dynamic Field state ---
     df_cache: BTreeMap<DfCacheKey, DfEntry>,
     df_created: IndexMap<ObjectId, DfCreateEffect>,
-    df_mutated: IndexMap<ObjectId, ObjectMutationEffect>,
-    df_deleted: IndexSet<ObjectId>,
+    df_mutated: IndexMap<ObjectId, DfMutateEffect>,
+    df_deleted: IndexMap<ObjectId, DfDeleteEffect>,
     // Context
     tx_hash: [u8; 32],
     ids_created: u64,
@@ -220,7 +247,7 @@ impl SetuObjectRuntime {
             df_cache,
             df_created: IndexMap::new(),
             df_mutated: IndexMap::new(),
-            df_deleted: IndexSet::new(),
+            df_deleted: IndexMap::new(),
             tx_hash,
             ids_created: 0,
             sender,
@@ -363,15 +390,15 @@ impl SetuObjectRuntime {
         self.df_created.insert(df_oid, effect);
     }
 
-    /// Record a DF mutation placeholder (from `dynamic_field::borrow_mut_internal`).
-    /// M2 stores current bytes; M3 will overwrite with real post-exec value.
-    pub(crate) fn record_df_mutate(&mut self, df_oid: ObjectId, effect: ObjectMutationEffect) {
+    /// Record a DF mutation (from `dynamic_field::borrow_mut_internal`).
+    /// M3 stores old_value_bcs = new_value_bcs until ref-tracking is added.
+    pub(crate) fn record_df_mutate(&mut self, df_oid: ObjectId, effect: DfMutateEffect) {
         self.df_mutated.insert(df_oid, effect);
     }
 
     /// Record a DF delete (from `dynamic_field::remove_internal`).
-    pub(crate) fn record_df_delete(&mut self, df_oid: ObjectId) {
-        self.df_deleted.insert(df_oid);
+    pub(crate) fn record_df_delete(&mut self, df_oid: ObjectId, effect: DfDeleteEffect) {
+        self.df_deleted.insert(df_oid, effect);
     }
 
     /// Consume self and return aggregated results.
@@ -713,21 +740,37 @@ mod tests {
         // U5: second mutate on same df_oid wins.
         let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let df = ObjectId::new([0xDA; 32]);
-        let tag = test_struct_tag("V");
-        rt.record_df_mutate(df, ObjectMutationEffect { type_tag: tag.clone(), bcs_bytes: vec![0x01] });
-        rt.record_df_mutate(df, ObjectMutationEffect { type_tag: tag.clone(), bcs_bytes: vec![0x02] });
+        let p = ObjectId::new([0x31; 32]);
+        let mk = |new_bytes: Vec<u8>| DfMutateEffect {
+            parent: p,
+            key_type_tag: "u64".into(),
+            key_bcs: vec![1; 8],
+            value_type_tag: "u64".into(),
+            old_value_bcs: vec![0; 8],
+            new_value_bcs: new_bytes,
+        };
+        rt.record_df_mutate(df, mk(vec![0x01]));
+        rt.record_df_mutate(df, mk(vec![0x02]));
         let r = rt.into_results();
         assert_eq!(r.df_mutated.len(), 1);
-        assert_eq!(r.df_mutated[&df].bcs_bytes, vec![0x02]);
+        assert_eq!(r.df_mutated[&df].new_value_bcs, vec![0x02]);
     }
 
     #[test]
     fn test_record_df_delete_dedup() {
-        // U6: double-delete is idempotent (IndexSet dedup).
+        // U6: double-delete is idempotent (IndexMap dedup — second insert wins).
         let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
         let df = ObjectId::new([0xDB; 32]);
-        rt.record_df_delete(df);
-        rt.record_df_delete(df);
+        let p = ObjectId::new([0x32; 32]);
+        let mk = || DfDeleteEffect {
+            parent: p,
+            key_type_tag: "u64".into(),
+            key_bcs: vec![2; 8],
+            value_type_tag: "u64".into(),
+            old_value_bcs: vec![9; 8],
+        };
+        rt.record_df_delete(df, mk());
+        rt.record_df_delete(df, mk());
         let r = rt.into_results();
         assert_eq!(r.df_deleted.len(), 1);
     }
@@ -748,10 +791,19 @@ mod tests {
                 value_bcs: vec![8; 8],
             },
         );
-        rt.record_df_delete(df);
+        rt.record_df_delete(
+            df,
+            DfDeleteEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![7; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![8; 8],
+            },
+        );
         let r = rt.into_results();
         assert!(r.df_created.contains_key(&df));
-        assert!(r.df_deleted.contains(&df));
+        assert!(r.df_deleted.contains_key(&df));
     }
 
     #[test]
@@ -779,12 +831,76 @@ mod tests {
         );
         rt.record_df_mutate(
             ObjectId::new([0xE2; 32]),
-            ObjectMutationEffect { type_tag: test_struct_tag("V"), bcs_bytes: vec![5; 8] },
+            DfMutateEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![5; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![6; 8],
+                new_value_bcs: vec![7; 8],
+            },
         );
-        rt.record_df_delete(ObjectId::new([0xE3; 32]));
+        rt.record_df_delete(
+            ObjectId::new([0xE3; 32]),
+            DfDeleteEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![8; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![9; 8],
+            },
+        );
         let r = rt.into_results();
         assert_eq!(r.df_created.len(), 1);
         assert_eq!(r.df_mutated.len(), 1);
         assert_eq!(r.df_deleted.len(), 1);
+    }
+
+    #[test]
+    fn test_df_mutate_effect_roundtrip() {
+        // U11: DfMutateEffect fields survive round-trip through runtime.
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let p = ObjectId::new([0x60; 32]);
+        let df = ObjectId::new([0xE5; 32]);
+        let eff = DfMutateEffect {
+            parent: p,
+            key_type_tag: "u64".into(),
+            key_bcs: vec![10; 8],
+            value_type_tag: "u128".into(),
+            old_value_bcs: vec![0xAA; 16],
+            new_value_bcs: vec![0xBB; 16],
+        };
+        rt.record_df_mutate(df, eff);
+        let r = rt.into_results();
+        let out = &r.df_mutated[&df];
+        assert_eq!(out.parent, p);
+        assert_eq!(out.key_type_tag, "u64");
+        assert_eq!(out.key_bcs, vec![10; 8]);
+        assert_eq!(out.value_type_tag, "u128");
+        assert_eq!(out.old_value_bcs, vec![0xAA; 16]);
+        assert_eq!(out.new_value_bcs, vec![0xBB; 16]);
+    }
+
+    #[test]
+    fn test_df_delete_effect_roundtrip() {
+        // U12: DfDeleteEffect fields survive round-trip through runtime.
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let p = ObjectId::new([0x61; 32]);
+        let df = ObjectId::new([0xE6; 32]);
+        let eff = DfDeleteEffect {
+            parent: p,
+            key_type_tag: "address".into(),
+            key_bcs: vec![0xCD; 32],
+            value_type_tag: "u64".into(),
+            old_value_bcs: vec![0xEF; 8],
+        };
+        rt.record_df_delete(df, eff);
+        let r = rt.into_results();
+        let out = &r.df_deleted[&df];
+        assert_eq!(out.parent, p);
+        assert_eq!(out.key_type_tag, "address");
+        assert_eq!(out.key_bcs, vec![0xCD; 32]);
+        assert_eq!(out.value_type_tag, "u64");
+        assert_eq!(out.old_value_bcs, vec![0xEF; 8]);
     }
 }

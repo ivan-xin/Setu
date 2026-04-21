@@ -30,7 +30,9 @@ use smallvec::smallvec;
 use setu_types::dynamic_field::{derive_df_oid, DfAccessMode};
 use setu_types::object::ObjectId;
 
-use crate::object_runtime::{DfCreateEffect, ObjectMutationEffect, SetuObjectRuntime};
+use crate::object_runtime::{
+    DfCreateEffect, DfDeleteEffect, DfMutateEffect, SetuObjectRuntime,
+};
 
 // ═══════════════════════════════════════════════════════════════
 // Dynamic Field native abort codes (mirrors setu-framework/.../dynamic_field.move)
@@ -654,7 +656,16 @@ fn native_df_remove_internal(
             }
         };
         let df_oid = entry.df_oid;
-        runtime.record_df_delete(df_oid);
+        runtime.record_df_delete(
+            df_oid,
+            DfDeleteEffect {
+                parent: parent_oid,
+                key_type_tag: name_tag.clone(),
+                key_bcs: name_bcs.clone(),
+                value_type_tag: v_tag.clone(),
+                old_value_bcs: bytes.clone(),
+            },
+        );
         // Invalidate cache so a later borrow returns DOES_NOT_EXIST.
         if let Some(e) = runtime.df_cache_get_mut(&cache_key) {
             e.value_bytes = None;
@@ -724,9 +735,11 @@ fn native_df_borrow_internal(
 
 /// `dynamic_field::borrow_mut_internal<K, V>(parent: &mut UID, name: K): &mut V`
 ///
-/// M2 behaviour: returns current value + pre-records a `df_mutated` entry
-/// carrying the *current* bcs bytes. M3 will merge the real post-execution
-/// value from the VM's `mutable_reference_outputs` back into the effect.
+/// M3 behaviour: returns the current value + records a `DfMutateEffect`
+/// with `new_value_bcs == old_value_bcs` as a placeholder. Real in-place
+/// writeback of `&mut V` requires Move VM reference-tracking, which is
+/// deferred to a later milestone. Until then, `borrow_mut` is byte-wise
+/// idempotent at the StateChange layer.
 fn native_df_borrow_mut_internal(
     context: &mut NativeContext,
     mut ty_args: Vec<Type>,
@@ -748,12 +761,7 @@ fn native_df_borrow_mut_internal(
     let parent_oid = extract_parent_oid_from_uid_ref(parent_ref_val)?;
     let (name_tag, name_bcs) = serialize_name(context, &k_ty, name_val)?;
     let v_tag = context.type_to_type_tag(&v_ty)?.to_canonical_string(true);
-    // Capture the StructTag form for the mutation effect (M3 consumers expect it).
-    let v_struct_tag = match context.type_to_type_tag(&v_ty)? {
-        move_core_types::language_storage::TypeTag::Struct(st) => Some(*st),
-        _ => None,
-    };
-    let cache_key = (parent_oid, name_tag, name_bcs);
+    let cache_key = (parent_oid, name_tag.clone(), name_bcs.clone());
 
     let bytes = {
         let runtime = context.extensions_mut().get_mut::<SetuObjectRuntime>()?;
@@ -779,17 +787,17 @@ fn native_df_borrow_mut_internal(
             }
         };
         let df_oid = entry.df_oid;
-        if let Some(st) = v_struct_tag {
-            // M2 pre-mark dirty with current bytes. M3 will overwrite.
-            runtime.record_df_mutate(
-                df_oid,
-                ObjectMutationEffect {
-                    type_tag: st,
-                    bcs_bytes: bytes.clone(),
-                },
-            );
-        }
-        // If V is a primitive, M3 must derive StructTag differently; skip pre-mark.
+        runtime.record_df_mutate(
+            df_oid,
+            DfMutateEffect {
+                parent: parent_oid,
+                key_type_tag: name_tag.clone(),
+                key_bcs: name_bcs.clone(),
+                value_type_tag: v_tag.clone(),
+                old_value_bcs: bytes.clone(),
+                new_value_bcs: bytes.clone(),
+            },
+        );
         bytes
     };
     let value = deserialize_value_bytes(context, &v_ty, &bytes)?;

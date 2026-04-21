@@ -16,6 +16,7 @@ use move_vm_runtime::{
 };
 
 use setu_runtime::{error::RuntimeError, state::RawStore};
+use setu_types::dynamic_field::DfFieldValue;
 use setu_types::object::{Address, ObjectId, Ownership};
 use setu_types::envelope::ObjectEnvelope;
 
@@ -96,6 +97,50 @@ pub struct MoveExecutionOutput {
     pub events: Vec<(String, Vec<u8>)>,
     pub gas_used: u64,
     pub error: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Dynamic Field envelope builder (M3)
+// ═══════════════════════════════════════════════════════════════
+
+/// Build the `ObjectEnvelope` for a dynamic-field entry.
+///
+/// Contract (see DF FDP v1.5 §3.7):
+/// - `owner = Address::ZERO` — DF entries have no direct owner
+/// - `ownership = Ownership::ObjectOwner(parent)` — makes apply-layer
+///   byte-level conflict detection work without any change to storage
+/// - `type_tag = "0x1::dynamic_field::Field<{K}, {V}>"` — canonical form
+/// - `data = bcs(DfFieldValue { name_type_tag, name_bcs, value_type_tag, value_bcs })`
+fn build_df_envelope(
+    df_oid: ObjectId,
+    parent: ObjectId,
+    key_type_tag: &str,
+    key_bcs: &[u8],
+    value_type_tag: &str,
+    value_bcs: &[u8],
+    version: u64,
+) -> ObjectEnvelope {
+    let payload = DfFieldValue {
+        name_type_tag: key_type_tag.to_string(),
+        name_bcs: key_bcs.to_vec(),
+        value_type_tag: value_type_tag.to_string(),
+        value_bcs: value_bcs.to_vec(),
+    };
+    // BCS of DfFieldValue is deterministic — used by R1 layer for
+    // byte-level conflict detection.
+    let data_bcs = bcs::to_bytes(&payload)
+        .expect("DfFieldValue BCS serialization is infallible for owned data");
+    ObjectEnvelope::from_move_result(
+        df_oid,
+        Address::ZERO,
+        version,
+        Ownership::ObjectOwner(parent),
+        format!(
+            "0x1::dynamic_field::Field<{}, {}>",
+            key_type_tag, value_type_tag
+        ),
+        data_bcs,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -417,6 +462,18 @@ impl SetuMoveEngine {
                 continue; // transfer / share / freeze take precedence
             }
             let input = results.input_objects.get(id);
+
+            // §3.7a — Parent byte-preservation rule (DF FDP v1.1 R1-ISSUE-2).
+            // If the Move VM borrowed `&mut parent` but wrote no changes to
+            // the parent's data bytes (typical of `df::add(&mut pool.id, ..)`),
+            // skip emitting a StateChange and do NOT bump version. This keeps
+            // concurrent DF mutations on shared parents PWOO-compatible.
+            if let Some(inp) = input {
+                if effect.bcs_bytes == inp.move_data {
+                    continue;
+                }
+            }
+
             let owner = input
                 .map(|i| i.owner)
                 .unwrap_or(Address::ZERO);
@@ -514,6 +571,85 @@ impl SetuMoveEngine {
                     .input_objects
                     .get(id)
                     .map(|i| i.envelope_bytes.clone()),
+                new_state: None,
+            });
+        }
+
+        // ─── M3: Dynamic Field effects → StateChange ───
+        //
+        // Each DF entry lives in its own SMT slot keyed by its derived
+        // `df_oid`; the envelope's `ownership = ObjectOwner(parent)` so
+        // byte-level conflict detection at the apply layer works unchanged.
+        //
+        // The `old_version` used when rebuilding the old envelope for
+        // Mutate/Delete defaults to `base_version`. Full on-disk version
+        // precision requires TaskPreparer to carry the on-disk envelope
+        // bytes in `ResolvedDynamicField` — deferred to M4. The byte-level
+        // conflict check still functions correctly because `value_bcs` is
+        // the load-bearing field.
+
+        // DF creates
+        for (df_oid, eff) in &results.df_created {
+            let envelope = build_df_envelope(
+                *df_oid,
+                eff.parent,
+                &eff.key_type_tag,
+                &eff.key_bcs,
+                &eff.value_type_tag,
+                &eff.value_bcs,
+                new_version,
+            );
+            changes.push(MoveStateChange {
+                object_id: *df_oid,
+                change_type: MoveStateChangeType::Create,
+                old_state: None,
+                new_state: Some(envelope.to_bytes()),
+            });
+        }
+
+        // DF mutations
+        for (df_oid, eff) in &results.df_mutated {
+            let old_env = build_df_envelope(
+                *df_oid,
+                eff.parent,
+                &eff.key_type_tag,
+                &eff.key_bcs,
+                &eff.value_type_tag,
+                &eff.old_value_bcs,
+                base_version,
+            );
+            let new_env = build_df_envelope(
+                *df_oid,
+                eff.parent,
+                &eff.key_type_tag,
+                &eff.key_bcs,
+                &eff.value_type_tag,
+                &eff.new_value_bcs,
+                new_version,
+            );
+            changes.push(MoveStateChange {
+                object_id: *df_oid,
+                change_type: MoveStateChangeType::Update,
+                old_state: Some(old_env.to_bytes()),
+                new_state: Some(new_env.to_bytes()),
+            });
+        }
+
+        // DF deletions
+        for (df_oid, eff) in &results.df_deleted {
+            let old_env = build_df_envelope(
+                *df_oid,
+                eff.parent,
+                &eff.key_type_tag,
+                &eff.key_bcs,
+                &eff.value_type_tag,
+                &eff.old_value_bcs,
+                base_version,
+            );
+            changes.push(MoveStateChange {
+                object_id: *df_oid,
+                change_type: MoveStateChangeType::Delete,
+                old_state: Some(old_env.to_bytes()),
                 new_state: None,
             });
         }
@@ -877,7 +1013,7 @@ mod tests {
             emitted_events: vec![],
             df_created: IndexMap::new(),
             df_mutated: IndexMap::new(),
-            df_deleted: IndexSet::new(),
+            df_deleted: IndexMap::new(),
         };
 
         let changes = engine
@@ -904,5 +1040,337 @@ mod tests {
             ),
         }
         assert_eq!(new_env.metadata.version, 8, "version bumped by 1");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // M3: Dynamic Field state-change conversion tests
+    // ═══════════════════════════════════════════════════════════
+
+    mod m3_df_convert {
+        use super::*;
+        use crate::object_runtime::{
+            DfDeleteEffect, DfMutateEffect, ObjectMutationEffect,
+        };
+        use indexmap::{IndexMap, IndexSet};
+        use setu_types::{
+            dynamic_field::DfFieldValue,
+            object::{Address, ObjectId},
+            Ownership,
+        };
+        use std::collections::BTreeMap;
+
+        fn empty_results() -> ObjectRuntimeResults {
+            ObjectRuntimeResults {
+                input_objects: BTreeMap::new(),
+                created_ids: IndexSet::new(),
+                deleted_ids: IndexSet::new(),
+                transfers: IndexMap::new(),
+                frozen: IndexMap::new(),
+                shared: IndexMap::new(),
+                mutated: IndexMap::new(),
+                emitted_events: vec![],
+                df_created: IndexMap::new(),
+                df_mutated: IndexMap::new(),
+                df_deleted: IndexMap::new(),
+            }
+        }
+
+        fn engine() -> SetuMoveEngine {
+            SetuMoveEngine::new().expect("engine init")
+        }
+
+        /// E1: df_created → single Create StateChange; envelope decodes
+        /// with ownership = ObjectOwner(parent); DfFieldValue roundtrips.
+        #[test]
+        fn test_df_create_emits_create_statechange() {
+            let parent = ObjectId::new([0x10; 32]);
+            let df_oid = ObjectId::new([0xD1; 32]);
+            let key = vec![1u8; 8];
+            let val = vec![2u8; 8];
+
+            let mut results = empty_results();
+            results.df_created.insert(
+                df_oid,
+                crate::object_runtime::DfCreateEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: key.clone(),
+                    value_type_tag: "u64".into(),
+                    value_bcs: val.clone(),
+                },
+            );
+
+            let changes = engine()
+                .convert_results_to_state_changes(&results, 3)
+                .expect("convert ok");
+            assert_eq!(changes.len(), 1);
+            let c = &changes[0];
+            assert_eq!(c.change_type, MoveStateChangeType::Create);
+            assert_eq!(c.object_id, df_oid);
+            assert!(c.old_state.is_none());
+            let env_bytes = c.new_state.as_ref().expect("new_state set");
+            let env = setu_types::ObjectEnvelope::from_bytes(env_bytes).unwrap();
+            match env.metadata.ownership {
+                Ownership::ObjectOwner(p) => assert_eq!(p, parent),
+                other => panic!("expected ObjectOwner, got {:?}", other),
+            }
+            assert_eq!(env.metadata.version, 4);
+            let payload: DfFieldValue = bcs::from_bytes(&env.data).unwrap();
+            assert_eq!(payload.name_type_tag, "u64");
+            assert_eq!(payload.name_bcs, key);
+            assert_eq!(payload.value_type_tag, "u64");
+            assert_eq!(payload.value_bcs, val);
+        }
+
+        /// E2: df_mutated → Update StateChange with old(base_version) and
+        /// new(base_version+1) envelopes.
+        #[test]
+        fn test_df_mutate_emits_update_statechange() {
+            let parent = ObjectId::new([0x11; 32]);
+            let df_oid = ObjectId::new([0xD2; 32]);
+
+            let mut results = empty_results();
+            results.df_mutated.insert(
+                df_oid,
+                DfMutateEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![7; 8],
+                    value_type_tag: "u64".into(),
+                    old_value_bcs: vec![0xA; 8],
+                    new_value_bcs: vec![0xB; 8],
+                },
+            );
+
+            let base = 9u64;
+            let changes = engine()
+                .convert_results_to_state_changes(&results, base)
+                .expect("convert ok");
+            assert_eq!(changes.len(), 1);
+            let c = &changes[0];
+            assert_eq!(c.change_type, MoveStateChangeType::Update);
+            assert_eq!(c.object_id, df_oid);
+            let old = setu_types::ObjectEnvelope::from_bytes(
+                c.old_state.as_ref().unwrap(),
+            )
+            .unwrap();
+            let new = setu_types::ObjectEnvelope::from_bytes(
+                c.new_state.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(old.metadata.version, base);
+            assert_eq!(new.metadata.version, base + 1);
+            let old_pl: DfFieldValue = bcs::from_bytes(&old.data).unwrap();
+            let new_pl: DfFieldValue = bcs::from_bytes(&new.data).unwrap();
+            assert_eq!(old_pl.value_bcs, vec![0xA; 8]);
+            assert_eq!(new_pl.value_bcs, vec![0xB; 8]);
+        }
+
+        /// E3: df_deleted → Delete StateChange, only old_state set at
+        /// base_version; new_state is None.
+        #[test]
+        fn test_df_delete_emits_delete_statechange() {
+            let parent = ObjectId::new([0x12; 32]);
+            let df_oid = ObjectId::new([0xD3; 32]);
+
+            let mut results = empty_results();
+            results.df_deleted.insert(
+                df_oid,
+                DfDeleteEffect {
+                    parent,
+                    key_type_tag: "address".into(),
+                    key_bcs: vec![0xCD; 32],
+                    value_type_tag: "u64".into(),
+                    old_value_bcs: vec![0x99; 8],
+                },
+            );
+
+            let base = 11u64;
+            let changes = engine()
+                .convert_results_to_state_changes(&results, base)
+                .expect("convert ok");
+            assert_eq!(changes.len(), 1);
+            let c = &changes[0];
+            assert_eq!(c.change_type, MoveStateChangeType::Delete);
+            assert_eq!(c.object_id, df_oid);
+            assert!(c.new_state.is_none());
+            let old = setu_types::ObjectEnvelope::from_bytes(
+                c.old_state.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(old.metadata.version, base);
+            let pl: DfFieldValue = bcs::from_bytes(&old.data).unwrap();
+            assert_eq!(pl.value_bcs, vec![0x99; 8]);
+        }
+
+        /// E4: DF ordering — create / mutate / delete conversions run
+        /// after parent-level (mutated/transfers/…). No panics, lengths add.
+        #[test]
+        fn test_df_changes_appended_after_parent_changes() {
+            let parent = ObjectId::new([0x13; 32]);
+            let df_a = ObjectId::new([0xDA; 32]);
+            let df_b = ObjectId::new([0xDB; 32]);
+            let df_c = ObjectId::new([0xDC; 32]);
+
+            let mut results = empty_results();
+            results.df_created.insert(
+                df_a,
+                crate::object_runtime::DfCreateEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![1; 8],
+                    value_type_tag: "u64".into(),
+                    value_bcs: vec![1; 8],
+                },
+            );
+            results.df_mutated.insert(
+                df_b,
+                DfMutateEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![2; 8],
+                    value_type_tag: "u64".into(),
+                    old_value_bcs: vec![2; 8],
+                    new_value_bcs: vec![3; 8],
+                },
+            );
+            results.df_deleted.insert(
+                df_c,
+                DfDeleteEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![3; 8],
+                    value_type_tag: "u64".into(),
+                    old_value_bcs: vec![4; 8],
+                },
+            );
+
+            let changes = engine()
+                .convert_results_to_state_changes(&results, 1)
+                .expect("convert ok");
+            assert_eq!(changes.len(), 3);
+            assert_eq!(changes[0].change_type, MoveStateChangeType::Create);
+            assert_eq!(changes[1].change_type, MoveStateChangeType::Update);
+            assert_eq!(changes[2].change_type, MoveStateChangeType::Delete);
+        }
+
+        /// E5: §3.7a parent byte-preservation — if mutated[oid].bcs_bytes
+        /// equals the input's move_data, no StateChange is emitted.
+        #[test]
+        fn test_parent_bytes_preserved_skips_statechange() {
+            use move_core_types::{
+                account_address::AccountAddress, identifier::Identifier,
+                language_storage::StructTag,
+            };
+
+            let parent = ObjectId::new([0x14; 32]);
+            let owner = Address::new([0x55; 32]);
+            let tag = StructTag {
+                address: AccountAddress::ONE,
+                module: Identifier::new("m").unwrap(),
+                name: Identifier::new("T").unwrap(),
+                type_params: vec![],
+            };
+            let data = vec![0xAB, 0xCD];
+
+            let pre = setu_types::ObjectEnvelope::from_move_result(
+                parent,
+                owner,
+                4,
+                Ownership::AddressOwner(owner),
+                tag.to_string(),
+                data.clone(),
+            );
+            let input = InputObject {
+                id: parent,
+                owner,
+                ownership: Ownership::AddressOwner(owner),
+                version: 4,
+                envelope_bytes: pre.to_bytes(),
+                move_data: data.clone(),
+                type_tag: tag.clone(),
+            };
+            let mut results = empty_results();
+            results.input_objects.insert(parent, input);
+            results.mutated.insert(
+                parent,
+                ObjectMutationEffect { type_tag: tag, bcs_bytes: data },
+            );
+
+            let changes = engine()
+                .convert_results_to_state_changes(&results, 4)
+                .expect("convert ok");
+            assert!(
+                changes.is_empty(),
+                "byte-identical mutation must not emit StateChange"
+            );
+        }
+
+        /// E6: Versioning — df Create / Update / Delete all use base+1 for
+        /// new envelopes and base for old.
+        #[test]
+        fn test_df_versioning_uses_base_plus_one() {
+            let parent = ObjectId::new([0x15; 32]);
+            let df_oid = ObjectId::new([0xD5; 32]);
+
+            let mut results = empty_results();
+            results.df_created.insert(
+                df_oid,
+                crate::object_runtime::DfCreateEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![0; 8],
+                    value_type_tag: "u64".into(),
+                    value_bcs: vec![0; 8],
+                },
+            );
+
+            let base = 42u64;
+            let changes = engine()
+                .convert_results_to_state_changes(&results, base)
+                .expect("convert ok");
+            let env = setu_types::ObjectEnvelope::from_bytes(
+                changes[0].new_state.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(env.metadata.version, base + 1);
+        }
+
+        /// E7: DfFieldValue BCS payload shape — verify key/value are
+        /// stored verbatim, not re-serialized.
+        #[test]
+        fn test_df_field_value_bcs_shape() {
+            let parent = ObjectId::new([0x16; 32]);
+            let df_oid = ObjectId::new([0xD6; 32]);
+            let raw_key = vec![0xDE, 0xAD, 0xBE, 0xEF];
+            let raw_val = vec![0xCA, 0xFE];
+
+            let mut results = empty_results();
+            results.df_created.insert(
+                df_oid,
+                crate::object_runtime::DfCreateEffect {
+                    parent,
+                    key_type_tag: "vector<u8>".into(),
+                    key_bcs: raw_key.clone(),
+                    value_type_tag: "vector<u8>".into(),
+                    value_bcs: raw_val.clone(),
+                },
+            );
+
+            let changes = engine()
+                .convert_results_to_state_changes(&results, 1)
+                .expect("convert ok");
+            let env = setu_types::ObjectEnvelope::from_bytes(
+                changes[0].new_state.as_ref().unwrap(),
+            )
+            .unwrap();
+            let pl: DfFieldValue = bcs::from_bytes(&env.data).unwrap();
+            assert_eq!(pl.name_bcs, raw_key);
+            assert_eq!(pl.value_bcs, raw_val);
+            assert_eq!(
+                env.type_tag,
+                "0x1::dynamic_field::Field<vector<u8>, vector<u8>>"
+            );
+        }
     }
 }
