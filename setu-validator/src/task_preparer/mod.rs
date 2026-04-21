@@ -129,6 +129,40 @@ pub enum TaskPrepareError {
     /// Same object id appears in both `input_object_ids` and `shared_object_ids`.
     #[error("Object {object_id} appears in both input_object_ids and shared_object_ids")]
     DuplicateObjectInLists { object_id: String },
+
+    // ---- Dynamic Field (DF FDP M4) errors ----
+    /// A declared DF's `parent_object_id` was not also declared in
+    /// `input_object_ids` or `shared_object_ids`.
+    #[error("Dynamic field parent {parent} not declared in input_object_ids or shared_object_ids")]
+    DynamicFieldParentNotDeclared { parent: String },
+
+    /// Read/Mutate/Delete declared against a DF that does not exist.
+    #[error("Dynamic field not found: parent={parent}, key_type={key_type}")]
+    DynamicFieldNotFound { parent: String, key_type: String },
+
+    /// Create declared against a DF that already exists (early rejection
+    /// so the TEE doesn't waste execution time only to abort).
+    #[error("Dynamic field already exists: parent={parent}, key_type={key_type}")]
+    DynamicFieldAlreadyExists { parent: String, key_type: String },
+
+    /// The on-disk DF envelope's `ObjectOwner` does not match the declared
+    /// parent (defence-in-depth against crafted `df_oid` → foreign DF).
+    #[error("Dynamic field parent mismatch")]
+    DynamicFieldParentMismatch,
+
+    /// Mutate/Create/Delete declared on a DF whose parent is Immutable.
+    #[error("Dynamic field on Immutable parent can only be accessed read-only")]
+    DynamicFieldOnImmutableParent,
+
+    /// Declared parent is itself a DF entry (ownership = ObjectOwner).
+    /// Nested DF is out of scope for this phase.
+    #[error("Dynamic field parent must be a root object (nested DF not supported)")]
+    DynamicFieldParentNotRoot,
+
+    /// Storage returned bytes that do not decode as any known envelope
+    /// format (corrupted blob or unknown future format).
+    #[error("Failed to decode envelope: {0}")]
+    EnvelopeDecode(String),
 }
 
 /// Convert SimpleMerkleProof to MerkleProof (for TEE)

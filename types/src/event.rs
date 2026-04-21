@@ -210,6 +210,36 @@ pub struct MoveCallPayload {
     /// When true, engine.execute() auto-appends BCS(TxContext) to args.
     #[serde(default = "default_true")]
     pub needs_tx_context: bool,
+    /// Dynamic-field accesses declared by the client (DF FDP M4).
+    ///
+    /// Each entry is resolved by `TaskPreparer` against the pre-execution SMT
+    /// and becomes a `ResolvedDynamicField` in `ResolvedInputs.dynamic_fields`,
+    /// from which the VM builds the `SetuObjectRuntime.df_cache`. `#[serde(default)]`
+    /// keeps payloads written before M4 wire-compatible.
+    #[serde(default)]
+    pub dynamic_field_accesses: Vec<DynamicFieldAccess>,
+}
+
+/// Client-declared dynamic-field access (DF FDP M4, see
+/// `docs/feat/dynamic-fields/design.md` §3.3).
+///
+/// `parent_object_id` and `key_bcs_hex` are plain hex strings (optional
+/// `"oid:"` prefix on the parent is tolerated). `key_type` / `value_type`
+/// are canonical Move `TypeTag` strings (e.g. `"u64"`, `"address"`,
+/// `"0xcafe::pool::Pair"`).
+///
+/// `value_type` is `Some` and required when `mode == Create` (the DF entry
+/// does not yet exist so the type cannot be inferred from on-disk bytes);
+/// it may be `None` for Read/Mutate/Delete since the value type is recovered
+/// from the parent DF envelope at prepare time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicFieldAccess {
+    pub parent_object_id: String,
+    pub key_type: String,
+    pub key_bcs_hex: String,
+    pub mode: crate::dynamic_field::DfAccessMode,
+    #[serde(default)]
+    pub value_type: Option<String>,
 }
 
 /// Move module publish payload (paired with EventType::ContractPublish)
@@ -1010,5 +1040,57 @@ mod tests {
             "validator1".to_string(),
         );
         assert_eq!(event.get_subnet_id(), crate::subnet::SubnetId::GOVERNANCE);
+    }
+
+    // ── DF FDP M4 — MoveCallPayload.dynamic_field_accesses ──
+
+    #[test]
+    fn test_dynamic_field_access_serde_default() {
+        // T1: payloads written before M4 must still deserialize; the new
+        // `dynamic_field_accesses` field defaults to an empty Vec.
+        let json = r#"{
+            "sender": "alice",
+            "package": "0x1",
+            "module": "counter",
+            "function": "inc",
+            "type_args": [],
+            "args": [],
+            "input_object_ids": [],
+            "shared_object_ids": []
+        }"#;
+        let p: MoveCallPayload = serde_json::from_str(json).expect("legacy payload");
+        assert!(p.dynamic_field_accesses.is_empty());
+        assert!(p.needs_tx_context, "default_true applies");
+    }
+
+    #[test]
+    fn test_dynamic_field_access_roundtrip() {
+        let payload = MoveCallPayload {
+            sender: "alice".to_string(),
+            package: "0x1".to_string(),
+            module: "m".to_string(),
+            function: "f".to_string(),
+            type_args: vec![],
+            args: vec![],
+            input_object_ids: vec![],
+            shared_object_ids: vec![],
+            mutable_indices: None,
+            consumed_indices: None,
+            needs_tx_context: false,
+            dynamic_field_accesses: vec![DynamicFieldAccess {
+                parent_object_id: "oid:00".repeat(32),
+                key_type: "u64".to_string(),
+                key_bcs_hex: "2a00000000000000".to_string(),
+                mode: crate::dynamic_field::DfAccessMode::Read,
+                value_type: None,
+            }],
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        let back: MoveCallPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.dynamic_field_accesses.len(), 1);
+        assert_eq!(
+            back.dynamic_field_accesses[0].mode,
+            crate::dynamic_field::DfAccessMode::Read
+        );
     }
 }
