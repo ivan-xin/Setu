@@ -398,10 +398,17 @@ impl AnchorBuilder {
     /// 6. Returns PendingAnchorBuild for later commit
     ///
     /// The actual state modifications happen in `commit_build()` after CF is finalized.
+    ///
+    /// D1 (docs/feat/anchor-builder-fold-policy/design.md): event selection is
+    /// driven by the DAG's `pending` status-set, not by a depth range. Callers
+    /// pass `in_flight_event_ids` for the set of events already referenced by
+    /// in-flight CFs (their own `pending_builds` + `pending_cf_events`); those
+    /// are filtered out to avoid double-folding.
     pub fn prepare_build(
         &self,
         dag: &Dag,
         vlc: &VLC,
+        in_flight_event_ids: &HashSet<EventId>,
     ) -> Result<PendingAnchorBuild, AnchorBuildError> {
         // Check VLC delta threshold
         let delta = vlc.logical_time().saturating_sub(self.last_fold_vlc);
@@ -412,21 +419,25 @@ impl AnchorBuilder {
             });
         }
         
-        // Collect events from DAG
-        let from_depth = self.anchor_depth;
+        // D1: depth-independent event selection via DAG pending-set.
+        // `to_depth = dag.max_depth()` is still needed for the new-anchor-depth
+        // arithmetic (to_depth + 1) and for the anchor payload.
         let to_depth = dag.max_depth();
         
-        // Debug: log depth range
+        // Debug: log selection inputs
         tracing::debug!(
-            from_depth = from_depth,
+            from_depth = self.anchor_depth,
             to_depth = to_depth,
             dag_node_count = dag.node_count(),
             dag_pending_count = dag.get_pending_count(),
-            "prepare_build: checking depth range"
+            in_flight_count = in_flight_event_ids.len(),
+            "prepare_build: selecting pending events"
         );
         
-        let events: Vec<Event> = dag.get_events_in_range(from_depth, to_depth)
+        let events: Vec<Event> = dag
+            .get_pending_events()
             .into_iter()
+            .filter(|e| !in_flight_event_ids.contains(&e.id))
             .cloned()
             .collect();
         
@@ -526,6 +537,25 @@ impl AnchorBuilder {
         })
     }
     
+    /// Clear speculative-overlay entries owned by the events of a finalized CF.
+    ///
+    /// Invariant F-A (docs/feat/overlay-clear-on-error-path/design.md):
+    /// once a CF reaches a terminal post-consensus state (success OR any error),
+    /// every overlay entry keyed by one of its event_ids MUST be removed before
+    /// the function returns. This prevents stale speculative values from poisoning
+    /// reads after the authoritative SMT path has diverged or aborted.
+    fn clear_overlay_for_finalized(&self, events: &[Event]) {
+        let ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+        let _stats = self.shared.clear_overlay_events(&ids);
+    }
+
+    /// Same as `clear_overlay_for_finalized` but keyed directly by event-ids.
+    /// Used on the follower MissingEvents path where the received `events` slice
+    /// is incomplete — we use `cf.anchor.event_ids` (the authoritative list) instead.
+    fn clear_overlay_for_finalized_ids(&self, ids: &[String]) {
+        let _stats = self.shared.clear_overlay_events(ids);
+    }
+
     /// Commit a prepared build after CF is finalized
     ///
     /// This applies all the state changes that were prepared in `prepare_build()`.
@@ -533,6 +563,9 @@ impl AnchorBuilder {
     pub fn commit_build(&mut self, pending: PendingAnchorBuild) -> Result<StateApplySummary, AnchorBuildError> {
         // Verify snapshot consistency (detect concurrent modifications)
         if !self.verify_snapshot(&pending.pre_build_snapshot) {
+            // F-A: clear overlay on SnapshotMismatch error path.
+            let events = pending.all_events();
+            self.clear_overlay_for_finalized(&events);
             return Err(AnchorBuildError::SnapshotMismatch {
                 expected_depth: pending.pre_build_snapshot.anchor_depth,
                 actual_depth: self.anchor_depth,
@@ -543,13 +576,27 @@ impl AnchorBuilder {
         let events = pending.all_events();
         let anchor_id = self.anchor_depth + 1;
         let cf_id = pending.anchor.id.clone();
-        let state_summary = {
+        // Inner result lets us drop the write guard before running any overlay-clear
+        // side effect on the error path (avoids holding two locks at once).
+        let inner: Result<StateApplySummary, AnchorBuildError> = {
             let mut guard = self.shared.lock_write();
             let summary = guard.apply_committed_events(&events);
-            guard.commit(anchor_id)?;
-            // Publish snapshot while still holding Mutex (atomic consistency)
-            self.shared.publish_snapshot(&guard);
-            summary
+            match guard.commit(anchor_id) {
+                Ok(()) => {
+                    // Publish snapshot while still holding Mutex (atomic consistency)
+                    self.shared.publish_snapshot(&guard);
+                    Ok(summary)
+                }
+                Err(e) => Err(e.into()),
+            }
+        };
+        let state_summary = match inner {
+            Ok(s) => s,
+            Err(e) => {
+                // F-A: clear overlay on commit-propagation error path.
+                self.clear_overlay_for_finalized(&events);
+                return Err(e);
+            }
         };
 
         // R5: record per-event outcomes after apply (Leader path).
@@ -589,6 +636,10 @@ impl AnchorBuilder {
     ) -> Result<StateApplySummary, AnchorBuildError> {
         // 1. Completeness check
         if events.len() != cf.anchor.event_ids.len() {
+            // F-A: clear overlay on MissingEvents error path.
+            // Use cf.anchor.event_ids as the authoritative list since the received
+            // `events` slice is incomplete by definition on this branch.
+            self.clear_overlay_for_finalized_ids(&cf.anchor.event_ids);
             return Err(AnchorBuildError::MissingEvents {
                 expected: cf.anchor.event_ids.len(),
                 found: events.len(),
@@ -599,30 +650,70 @@ impl AnchorBuilder {
         // Without this, concurrent CF proposals can clone the same base state,
         // and the second one's verification becomes stale after the first commits.
         let anchor_id = self.anchor_depth + 1;
-        let state_summary = {
+        // Inner result lets us drop the write guard before any overlay-clear side
+        // effect runs on the error path.
+        let inner: Result<StateApplySummary, AnchorBuildError> = {
             let mut guard = self.shared.lock_write();
             
             // 2. Verify state root (compute expected vs actual)
             if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
                 // Clone from write GSM under the lock
                 let mut temp_manager = (*guard).clone();
-                temp_manager.apply_committed_events(events);
+                let verify_summary = temp_manager.apply_committed_events(events);
                 let (expected_root, _) = temp_manager.compute_global_root_bytes();
                 
                 if expected_root != merkle_roots.global_state_root {
+                    // DIAG (docs/bugs/20260422-stress-same-key-divergence.md):
+                    // Dump per-event + per-conflict detail BEFORE returning so
+                    // the first-cause investigation can compare three nodes'
+                    // views of the same CF. overlay_stats() is captured here
+                    // (still populated) — the F-A clear runs AFTER the guard
+                    // drops below.
+                    Self::log_follower_root_mismatch_diag(
+                        &cf.anchor.id,
+                        events,
+                        &verify_summary,
+                        &guard,
+                        &expected_root,
+                        &merkle_roots.global_state_root,
+                        self.shared.overlay_stats(),
+                    );
                     // Write GSM NOT mutated — F1 safety preserved
-                    return Err(AnchorBuildError::RootMismatch {
+                    Err(AnchorBuildError::RootMismatch {
                         expected: expected_root,
                         actual: merkle_roots.global_state_root,
-                    });
+                    })
+                } else {
+                    // 3. Apply state changes and commit (same lock scope)
+                    let summary = guard.apply_committed_events(events);
+                    match guard.commit(anchor_id) {
+                        Ok(()) => {
+                            self.shared.publish_snapshot(&guard);
+                            Ok(summary)
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                }
+            } else {
+                // No merkle_roots to verify — apply directly
+                let summary = guard.apply_committed_events(events);
+                match guard.commit(anchor_id) {
+                    Ok(()) => {
+                        self.shared.publish_snapshot(&guard);
+                        Ok(summary)
+                    }
+                    Err(e) => Err(e.into()),
                 }
             }
-            
-            // 3. Apply state changes and commit (same lock scope)
-            let summary = guard.apply_committed_events(events);
-            guard.commit(anchor_id)?;
-            self.shared.publish_snapshot(&guard);
-            summary
+        };
+        let state_summary = match inner {
+            Ok(s) => s,
+            Err(e) => {
+                // F-A: clear overlay on RootMismatch / commit-propagation paths.
+                // DIAG above has already captured pre-clear overlay_stats().
+                self.clear_overlay_for_finalized(events);
+                return Err(e);
+            }
         };
 
         // R5: record per-event outcomes after apply (Follower path).
@@ -636,6 +727,140 @@ impl AnchorBuilder {
         self.synchronize_finalized_anchor(&cf.anchor);
         
         Ok(state_summary)
+    }
+    
+    /// DIAG only: structured dump of a follower's RootMismatch.
+    ///
+    /// Used by `apply_follower_finalized_cf` to capture enough per-CF state
+    /// for cross-node triage of
+    /// `docs/bugs/20260422-stress-same-key-divergence.md`. Not called on the
+    /// happy path.
+    fn log_follower_root_mismatch_diag(
+        cf_id: &str,
+        events: &[Event],
+        summary: &StateApplySummary,
+        write_gsm: &GlobalStateManager,
+        expected_root: &[u8; 32],
+        actual_root: &[u8; 32],
+        overlay_stats: setu_storage::state::OverlayStats,
+    ) {
+        use std::fmt::Write as _;
+
+        let mut event_dump = String::new();
+        for (idx, ev) in events.iter().enumerate() {
+            let n_changes = ev
+                .execution_result
+                .as_ref()
+                .map(|r| r.state_changes.len())
+                .unwrap_or(0);
+            let exec_ok = ev
+                .execution_result
+                .as_ref()
+                .map(|r| r.success)
+                .unwrap_or(false);
+            let _ = write!(
+                event_dump,
+                "\n  [{idx}] id={id} type={ty:?} vlc_logical={vlc} exec_ok={exec_ok} n_changes={nc}",
+                idx = idx,
+                id = ev.id,
+                ty = ev.event_type,
+                vlc = ev.vlc_snapshot.logical_time,
+                exec_ok = exec_ok,
+                nc = n_changes,
+            );
+        }
+
+        // For each conflicted event, dump expected_old vs current_SMT bytes
+        // for the reported conflicting object.
+        let mut conflict_dump = String::new();
+        for rec in &summary.conflicted_events {
+            let Some(ev) = events.iter().find(|e| e.id == rec.event_id) else {
+                let _ = write!(
+                    conflict_dump,
+                    "\n  event_id={} object={} (event not in CF — should be impossible)",
+                    rec.event_id, rec.conflicting_object
+                );
+                continue;
+            };
+            let sc = ev
+                .execution_result
+                .as_ref()
+                .and_then(|r| {
+                    r.state_changes
+                        .iter()
+                        .find(|sc| sc.key == rec.conflicting_object)
+                });
+            let (expected_old_hex, target_subnet, new_hex) = match sc {
+                Some(sc) => {
+                    let exp = sc
+                        .old_value
+                        .as_ref()
+                        .map(|b| format!("Some[{} bytes]={}", b.len(), hex::encode(b)))
+                        .unwrap_or_else(|| "None".to_string());
+                    let newv = sc
+                        .new_value
+                        .as_ref()
+                        .map(|b| format!("Some[{} bytes]={}", b.len(), hex::encode(b)))
+                        .unwrap_or_else(|| "None".to_string());
+                    let target = sc.target_subnet.unwrap_or(ev.get_subnet_id());
+                    (exp, target, newv)
+                }
+                None => (
+                    "<state_change not found>".to_string(),
+                    ev.get_subnet_id(),
+                    "<unknown>".to_string(),
+                ),
+            };
+            // Look up current SMT value for the conflicting object
+            let current_hex = rec
+                .conflicting_object
+                .strip_prefix("oid:")
+                .and_then(|hex_str| hex::decode(hex_str).ok())
+                .and_then(|bytes| {
+                    if bytes.len() == 32 {
+                        setu_merkle::HashValue::from_slice(&bytes).ok()
+                    } else {
+                        None
+                    }
+                })
+                .map(|hv| {
+                    write_gsm
+                        .get_subnet(&target_subnet)
+                        .and_then(|smt| smt.get(&hv))
+                        .map(|v| format!("Some[{} bytes]={}", v.len(), hex::encode(v)))
+                        .unwrap_or_else(|| "None".to_string())
+                })
+                .unwrap_or_else(|| "<malformed key>".to_string());
+            let _ = write!(
+                conflict_dump,
+                "\n  event_id={} subnet={:?} object={}\n    expected_old={}\n    current_smt={}\n    proposed_new={}",
+                rec.event_id,
+                target_subnet,
+                rec.conflicting_object,
+                expected_old_hex,
+                current_hex,
+                new_hex,
+            );
+        }
+
+        tracing::error!(
+            target: "consensus::diag::follower_root_mismatch",
+            cf_id = %cf_id,
+            expected_root = %hex::encode(expected_root),
+            actual_root   = %hex::encode(actual_root),
+            n_events = events.len(),
+            n_conflicted = summary.conflicted_events.len(),
+            n_failed = summary.failed_events.len(),
+            overlay_entries = overlay_stats.entry_count,
+            overlay_unique_events = overlay_stats.unique_events,
+            overlay_oldest_age_ms = overlay_stats
+                .oldest_age
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            events = %event_dump,
+            conflicts = %conflict_dump,
+            "DIAG follower RootMismatch — see docs/bugs/20260422-stress-same-key-divergence.md"
+        );
     }
     
     /// Collect state changes from events without applying them
@@ -734,11 +959,15 @@ impl AnchorBuilder {
     /// - events.len() >= min_events_per_cf
     ///
     /// Does NOT bypass min_events_per_cf — if DAG has 0 pending events, returns NoEvents.
+    /// Does NOT bypass min_events_per_cf — if DAG has 0 pending events, returns NoEvents.
+    ///
+    /// D1: uses the same pending-status selection as `prepare_build`.
     pub fn prepare_build_heartbeat(
         &self,
         dag: &Dag,
         vlc: &VLC,
         heartbeat_interval: std::time::Duration,
+        in_flight_event_ids: &HashSet<EventId>,
     ) -> Result<PendingAnchorBuild, AnchorBuildError> {
         let delta = vlc.logical_time().saturating_sub(self.last_fold_vlc);
         if delta < 1 {
@@ -755,10 +984,11 @@ impl AnchorBuilder {
             });
         }
 
-        let from_depth = self.anchor_depth;
         let to_depth = dag.max_depth();
-        let events: Vec<Event> = dag.get_events_in_range(from_depth, to_depth)
+        let events: Vec<Event> = dag
+            .get_pending_events()
             .into_iter()
+            .filter(|e| !in_flight_event_ids.contains(&e.id))
             .cloned()
             .collect();
 
@@ -1326,5 +1556,420 @@ mod tests {
         assert_eq!(recorded[1].1.kind(), "stale_read");
         assert_eq!(recorded[2].0, ev_failed.id);
         assert_eq!(recorded[2].1.kind(), "execution_failed");
+    }
+
+    // ========================================================================
+    // F-A (docs/feat/overlay-clear-on-error-path): on every terminal path of
+    // commit_build / apply_follower_finalized_cf — success OR error — any
+    // overlay entries owned by the CF's event-ids MUST be cleared before the
+    // function returns.
+    // ========================================================================
+
+    use setu_types::{Anchor, merkle::AnchorMerkleRoots, ConsensusFrame};
+
+    fn fa_make_event(id_suffix: &str, changes: Vec<StateChange>) -> Event {
+        let mut ev = create_event_with_result(SubnetId::ROOT, changes);
+        ev.id = format!("ev-fa-{id_suffix}");
+        ev
+    }
+
+    fn fa_stage_overlay(shared: &std::sync::Arc<SharedStateManager>, event_id: &str, oid_seed: &str) {
+        let key = test_oid_key(oid_seed);
+        let change = StateChange::insert(key, vec![1, 2, 3]);
+        shared
+            .stage_overlay(event_id, SubnetId::ROOT, &[change])
+            .expect("stage should succeed for canonical oid key");
+    }
+
+    fn fa_builder_with_overlay(n_entries: usize) -> (AnchorBuilder, Vec<Event>) {
+        let builder = AnchorBuilder::new(ConsensusConfig::default());
+        let shared = builder.shared_state_manager();
+        let mut events = Vec::with_capacity(n_entries);
+        for i in 0..n_entries {
+            let key = test_oid_key(&format!("fa-coin-{i}"));
+            let change = StateChange::insert(key, vec![i as u8; 4]);
+            let ev = fa_make_event(&format!("{i}"), vec![change.clone()]);
+            fa_stage_overlay(&shared, &ev.id, &format!("fa-coin-{i}"));
+            events.push(ev);
+        }
+        assert_eq!(builder.shared_state_manager().overlay_stats().entry_count, n_entries);
+        (builder, events)
+    }
+
+    fn fa_make_cf(events: &[Event], global_state_root: [u8; 32], depth: u64) -> ConsensusFrame {
+        let event_ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+        let anchor = Anchor::with_merkle_roots(
+            event_ids,
+            VLCSnapshot::default(),
+            AnchorMerkleRoots::with_roots([0u8; 32], global_state_root, [0u8; 32]),
+            None,
+            depth,
+        );
+        ConsensusFrame::new(anchor, "v1".to_string())
+    }
+
+    /// T1: RootMismatch on follower path clears overlay.
+    #[test]
+    fn fa_apply_follower_root_mismatch_clears_overlay() {
+        let (mut builder, events) = fa_builder_with_overlay(2);
+        // Deliberately-wrong global_state_root — any non-empty SMT diff produces
+        // a different root than our all-0xFF value.
+        let cf = fa_make_cf(&events, [0xFFu8; 32], 1);
+
+        let result = builder.apply_follower_finalized_cf(&events, &cf);
+        assert!(
+            matches!(result, Err(AnchorBuildError::RootMismatch { .. })),
+            "expected RootMismatch, got {result:?}"
+        );
+        assert_eq!(
+            builder.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "overlay entries must be cleared after RootMismatch"
+        );
+    }
+
+    /// T2: MissingEvents on follower path clears overlay for ALL cf.anchor.event_ids
+    /// (not just the ones we happen to have received).
+    #[test]
+    fn fa_apply_follower_missing_events_clears_overlay() {
+        let (mut builder, events) = fa_builder_with_overlay(2);
+        // CF claims 2 events but we only forward 1 → MissingEvents.
+        // Build CF with a non-mismatching (zero) state root to isolate the
+        // MissingEvents branch from RootMismatch. merkle_roots presence doesn't
+        // matter because the length check runs first.
+        let cf = fa_make_cf(&events, [0u8; 32], 1);
+        let partial: Vec<Event> = events[..1].to_vec();
+
+        let result = builder.apply_follower_finalized_cf(&partial, &cf);
+        assert!(
+            matches!(result, Err(AnchorBuildError::MissingEvents { .. })),
+            "expected MissingEvents, got {result:?}"
+        );
+        assert_eq!(
+            builder.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "overlay entries for BOTH event-ids must be cleared via cf.anchor.event_ids"
+        );
+    }
+
+    /// T3: SnapshotMismatch on leader path clears overlay.
+    #[test]
+    fn fa_commit_build_snapshot_mismatch_clears_overlay() {
+        let (mut builder, events) = fa_builder_with_overlay(2);
+        let vlc = create_vlc("n1", 10);
+        let mut pending = builder
+            .force_prepare_build(events.clone(), &vlc, 0)
+            .expect("prepare should succeed");
+        // Corrupt the pre-build snapshot so verify_snapshot fails deterministically.
+        pending.pre_build_snapshot.anchor_depth = 99;
+
+        let result = builder.commit_build(pending);
+        assert!(
+            matches!(result, Err(AnchorBuildError::SnapshotMismatch { .. })),
+            "expected SnapshotMismatch, got {result:?}"
+        );
+        assert_eq!(
+            builder.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "overlay entries must be cleared after SnapshotMismatch"
+        );
+    }
+
+    /// T4 (regression): leader happy-path commit still clears overlay.
+    #[test]
+    fn fa_commit_build_success_still_clears_overlay() {
+        let (mut builder, events) = fa_builder_with_overlay(2);
+        let vlc = create_vlc("n1", 10);
+        let pending = builder
+            .force_prepare_build(events.clone(), &vlc, 0)
+            .expect("prepare should succeed");
+
+        let result = builder.commit_build(pending);
+        assert!(result.is_ok(), "leader commit should succeed, got {result:?}");
+        assert_eq!(
+            builder.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "success path must still clear overlay (M4 invariant)"
+        );
+    }
+
+    /// T5 (regression): follower happy-path apply still clears overlay.
+    #[test]
+    fn fa_apply_follower_success_still_clears_overlay() {
+        // Build an expected root by running force_prepare_build on a throwaway
+        // builder that shares no state with the one under test.
+        let scratch = AnchorBuilder::new(ConsensusConfig::default());
+        let events_template: Vec<Event> = (0..2)
+            .map(|i| {
+                let key = test_oid_key(&format!("fa-coin-{i}"));
+                fa_make_event(&format!("{i}"), vec![StateChange::insert(key, vec![i as u8; 4])])
+            })
+            .collect();
+        let vlc = create_vlc("n1", 10);
+        let pending = scratch
+            .force_prepare_build(events_template.clone(), &vlc, 0)
+            .expect("scratch prepare");
+        let expected_root = pending
+            .anchor
+            .merkle_roots
+            .as_ref()
+            .expect("merkle_roots present")
+            .global_state_root;
+
+        // Now set up the follower builder with overlay entries keyed by the SAME event-ids.
+        let follower = AnchorBuilder::new(ConsensusConfig::default());
+        let shared = follower.shared_state_manager();
+        for (i, ev) in events_template.iter().enumerate() {
+            fa_stage_overlay(&shared, &ev.id, &format!("fa-coin-{i}"));
+        }
+        assert_eq!(follower.shared_state_manager().overlay_stats().entry_count, 2);
+
+        let cf = fa_make_cf(&events_template, expected_root, 1);
+        let mut follower = follower;
+        let result = follower.apply_follower_finalized_cf(&events_template, &cf);
+        assert!(result.is_ok(), "follower apply should succeed, got {result:?}");
+        assert_eq!(
+            follower.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "success path must still clear overlay (M4 invariant)"
+        );
+    }
+
+    /// T6: Mixed sequence — success then error both leave overlay empty.
+    /// Guards against regressions where one helper forgets to clear.
+    #[test]
+    fn fa_clear_is_idempotent_across_success_and_error() {
+        let builder = AnchorBuilder::new(ConsensusConfig::default());
+        let shared = builder.shared_state_manager();
+
+        // Round 1: stage + SnapshotMismatch error
+        let ev_a = fa_make_event(
+            "round1-a",
+            vec![StateChange::insert(test_oid_key("r1a"), vec![1])],
+        );
+        fa_stage_overlay(&shared, &ev_a.id, "r1a");
+        assert_eq!(shared.overlay_stats().entry_count, 1);
+        let mut builder = builder;
+        let vlc = create_vlc("n1", 10);
+        let mut pending = builder
+            .force_prepare_build(vec![ev_a.clone()], &vlc, 0)
+            .expect("prepare");
+        pending.pre_build_snapshot.anchor_depth = 42;
+        assert!(builder.commit_build(pending).is_err());
+        assert_eq!(shared.overlay_stats().entry_count, 0, "after error round");
+
+        // Round 2: stage + success
+        let ev_b = fa_make_event(
+            "round2-b",
+            vec![StateChange::insert(test_oid_key("r2b"), vec![2])],
+        );
+        fa_stage_overlay(&shared, &ev_b.id, "r2b");
+        assert_eq!(shared.overlay_stats().entry_count, 1);
+        let pending_ok = builder
+            .force_prepare_build(vec![ev_b], &vlc, builder.anchor_depth)
+            .expect("prepare 2");
+        assert!(builder.commit_build(pending_ok).is_ok());
+        assert_eq!(shared.overlay_stats().entry_count, 0, "after success round");
+    }
+
+    // ========================================================================
+    // D1 (docs/feat/anchor-builder-fold-policy): pending-status selection
+    // ========================================================================
+    //
+    // These tests exercise the contract that `prepare_build` selects events
+    // from `Dag::get_pending_events()` (not a depth range), filtered by
+    // `in_flight_event_ids`. Each test uses a low VLC-delta threshold so that
+    // the delta gate does not interfere with the selection-path under test.
+
+    use crate::dag::Dag as ConsensusDag;
+
+    fn d1_config() -> ConsensusConfig {
+        ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Create a minimal transfer event with a fixed id. No parents → genesis-like.
+    fn d1_make_event(id: &str) -> Event {
+        let mut ev = Event::new(
+            EventType::Transfer,
+            vec![],
+            VLCSnapshot::default(),
+            "creator".to_string(),
+        );
+        ev.id = id.to_string();
+        ev.execution_result = Some(ExecutionResult::success());
+        ev
+    }
+
+    /// Insert an event directly into the DAG via the (`pub(crate)`)
+    /// `add_event_with_depth`, so we can force any depth independent of
+    /// parent arithmetic. This is the test-only escape hatch used to
+    /// simulate the TOCTOU race described in design.md §2.1.
+    fn d1_insert_at_depth(dag: &mut ConsensusDag, id: &str, depth: u64) {
+        // Clear parents so add_event_with_depth does not try to index children.
+        let mut ev = d1_make_event(id);
+        ev.parent_ids.clear();
+        dag.add_event_with_depth(ev, depth)
+            .expect("add_event_with_depth");
+    }
+
+    /// T4: CORE artefact scenario. Builder's `anchor_depth = 11` while
+    /// events sit at depth 3–5 (below `anchor_depth`, exactly what the
+    /// `from_depth=11 to_depth=4` log showed). Pre-D1 code returned
+    /// `InsufficientEvents`; post-D1 must fold them.
+    #[test]
+    fn d1_prepare_build_includes_stranded_events() {
+        let mut builder = AnchorBuilder::new(d1_config());
+        builder.anchor_depth = 11;
+
+        let mut dag = ConsensusDag::new();
+        d1_insert_at_depth(&mut dag, "stranded-a", 3);
+        d1_insert_at_depth(&mut dag, "stranded-b", 4);
+        d1_insert_at_depth(&mut dag, "stranded-c", 5);
+
+        let vlc = create_vlc("n1", 20);
+        let in_flight: HashSet<EventId> = HashSet::new();
+
+        let pending = builder
+            .prepare_build(&dag, &vlc, &in_flight)
+            .expect("should fold stranded events");
+        let folded_ids: HashSet<EventId> = pending.anchor.event_ids.iter().cloned().collect();
+        assert_eq!(folded_ids.len(), 3, "all 3 stranded events must be folded");
+        assert!(folded_ids.contains("stranded-a"));
+        assert!(folded_ids.contains("stranded-b"));
+        assert!(folded_ids.contains("stranded-c"));
+    }
+
+    /// T5: `in_flight_event_ids` filter excludes events already referenced
+    /// by in-flight CFs.
+    #[test]
+    fn d1_prepare_build_excludes_in_flight_cf_events() {
+        let builder = AnchorBuilder::new(d1_config());
+
+        let mut dag = ConsensusDag::new();
+        d1_insert_at_depth(&mut dag, "p1", 1);
+        d1_insert_at_depth(&mut dag, "p2", 1);
+        d1_insert_at_depth(&mut dag, "p3", 1);
+
+        let vlc = create_vlc("n1", 10);
+        let mut in_flight: HashSet<EventId> = HashSet::new();
+        in_flight.insert("p2".to_string());
+
+        let pending = builder
+            .prepare_build(&dag, &vlc, &in_flight)
+            .expect("should fold non-in-flight events");
+        let folded_ids: HashSet<EventId> = pending.anchor.event_ids.iter().cloned().collect();
+        assert_eq!(folded_ids.len(), 2);
+        assert!(folded_ids.contains("p1"));
+        assert!(folded_ids.contains("p3"));
+        assert!(!folded_ids.contains("p2"), "in-flight event must be excluded");
+    }
+
+    /// T6: Events already finalized in the DAG are skipped (they are no
+    /// longer in `dag.pending`).
+    #[test]
+    fn d1_prepare_build_excludes_finalized_events() {
+        let builder = AnchorBuilder::new(d1_config());
+
+        let mut dag = ConsensusDag::new();
+        d1_insert_at_depth(&mut dag, "f1", 1);
+        d1_insert_at_depth(&mut dag, "p1", 1);
+        dag.finalize_events(&["f1".to_string()]);
+
+        let vlc = create_vlc("n1", 10);
+        let in_flight: HashSet<EventId> = HashSet::new();
+
+        let pending = builder
+            .prepare_build(&dag, &vlc, &in_flight)
+            .expect("should fold the one remaining pending event");
+        let folded_ids: HashSet<EventId> = pending.anchor.event_ids.iter().cloned().collect();
+        assert_eq!(folded_ids.len(), 1);
+        assert!(folded_ids.contains("p1"));
+        assert!(!folded_ids.contains("f1"), "finalized event must be excluded");
+    }
+
+    /// T7: All pending events are in-flight → `InsufficientEvents`.
+    #[test]
+    fn d1_prepare_build_insufficient_when_all_in_flight() {
+        let builder = AnchorBuilder::new(d1_config());
+
+        let mut dag = ConsensusDag::new();
+        d1_insert_at_depth(&mut dag, "a", 1);
+        d1_insert_at_depth(&mut dag, "b", 1);
+
+        let vlc = create_vlc("n1", 10);
+        let mut in_flight: HashSet<EventId> = HashSet::new();
+        in_flight.insert("a".to_string());
+        in_flight.insert("b".to_string());
+
+        let err = builder
+            .prepare_build(&dag, &vlc, &in_flight)
+            .expect_err("should error when no selectable events remain");
+        assert!(
+            matches!(err, AnchorBuildError::InsufficientEvents { required: 1, found: 0 }),
+            "expected InsufficientEvents, got {err:?}"
+        );
+    }
+
+    /// T8: Empty DAG pending set → `InsufficientEvents` (min_events_per_cf=1).
+    #[test]
+    fn d1_prepare_build_insufficient_on_empty_pending() {
+        let builder = AnchorBuilder::new(d1_config());
+        let dag = ConsensusDag::new();
+        let vlc = create_vlc("n1", 10);
+        let in_flight: HashSet<EventId> = HashSet::new();
+
+        let err = builder
+            .prepare_build(&dag, &vlc, &in_flight)
+            .expect_err("empty pending set → error");
+        assert!(
+            matches!(err, AnchorBuildError::InsufficientEvents { required: 1, found: 0 }),
+            "expected InsufficientEvents, got {err:?}"
+        );
+    }
+
+    /// T9: Pending-set iteration is non-deterministic, but the resulting
+    /// `events_root` and `global_state_root` must be deterministic across
+    /// runs — the VLC-sort inside prepare_build_internal normalises the
+    /// order. Insertion sequence A then B must give the same roots as
+    /// B then A.
+    #[test]
+    fn d1_prepare_build_determinism_via_vlc_sort() {
+        let vlc = create_vlc("n1", 10);
+        let in_flight: HashSet<EventId> = HashSet::new();
+
+        let build_with_order = |order: [&str; 3]| -> ([u8; 32], [u8; 32]) {
+            let builder = AnchorBuilder::new(d1_config());
+            let mut dag = ConsensusDag::new();
+            for (i, id) in order.iter().enumerate() {
+                d1_insert_at_depth(&mut dag, id, (i + 1) as u64);
+            }
+            let pending = builder
+                .prepare_build(&dag, &vlc, &in_flight)
+                .expect("prepare_build");
+            let events_root = pending.events_root;
+            let merkle = pending.anchor.merkle_roots.expect("merkle_roots");
+            (events_root, merkle.global_state_root)
+        };
+
+        let (er1, gr1) = build_with_order(["a", "b", "c"]);
+        let (er2, gr2) = build_with_order(["c", "a", "b"]);
+        let (er3, gr3) = build_with_order(["b", "c", "a"]);
+
+        // events_root: computed from events in input order. The selection
+        // path returns them in HashSet order, which is arbitrary. If this
+        // assertion fails, prepare_build_internal needs to sort events
+        // before computing events_root (determinism gap). We leave this
+        // assertion strict so the gap becomes visible if it exists.
+        assert_eq!(er1, er2, "events_root must be stable across insertion orders");
+        assert_eq!(er2, er3, "events_root must be stable across insertion orders");
+
+        // global_state_root goes through compute_state_root_from_events
+        // which already VLC-sorts internally; it must be stable.
+        assert_eq!(gr1, gr2, "global_state_root must be stable across insertion orders");
+        assert_eq!(gr2, gr3, "global_state_root must be stable across insertion orders");
     }
 }

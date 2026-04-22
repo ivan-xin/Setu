@@ -188,8 +188,12 @@ impl ConsensusManager {
         dag: &Dag,
         vlc: &VLC,
     ) -> Option<ConsensusFrame> {
+        // D1: compute the set of event-ids already referenced by in-flight CFs
+        // (leader's pending_builds + follower's pending_cf_events). Passed to
+        // prepare_build so the pending-status selection excludes them.
+        let in_flight = self.collect_in_flight_event_ids();
         // Use AnchorBuilder.prepare_build (deferred commit mode)
-        match self.anchor_builder.prepare_build(dag, vlc) {
+        match self.anchor_builder.prepare_build(dag, vlc, &in_flight) {
             Ok(pending_build) => self.finalize_pending_build(pending_build),
             Err(AnchorBuildError::DeltaNotReached { required, current }) => {
                 tracing::debug!(required, current, "CF not created: DeltaNotReached");
@@ -233,10 +237,32 @@ impl ConsensusManager {
         vlc: &VLC,
         heartbeat_interval: std::time::Duration,
     ) -> Option<ConsensusFrame> {
-        match self.anchor_builder.prepare_build_heartbeat(dag, vlc, heartbeat_interval) {
+        let in_flight = self.collect_in_flight_event_ids();
+        match self.anchor_builder.prepare_build_heartbeat(dag, vlc, heartbeat_interval, &in_flight) {
             Ok(pending_build) => self.finalize_pending_build(pending_build),
             Err(_) => None,
         }
+    }
+
+    /// D1: event-ids already referenced by in-flight CFs, to be excluded
+    /// from the next fold. Combines `pending_builds` (leader path, Anchor
+    /// event_ids already committed to a not-yet-finalized CF) and
+    /// `pending_cf_events` (follower path, deferred events for a received
+    /// CF that hasn't finalized yet).
+    fn collect_in_flight_event_ids(&self) -> std::collections::HashSet<setu_types::EventId> {
+        let mut set: std::collections::HashSet<setu_types::EventId> =
+            std::collections::HashSet::new();
+        for build in self.pending_builds.values() {
+            for id in &build.anchor.event_ids {
+                set.insert(id.clone());
+            }
+        }
+        for events in self.pending_cf_events.values() {
+            for ev in events {
+                set.insert(ev.id.clone());
+            }
+        }
+        set
     }
 
     /// Check if a CF (pending or finalized) already exists

@@ -32,10 +32,20 @@ pub(crate) struct SpeculativeEntry {
 /// - I1：`get` 永不写 SMT（本类型也不持有 SMT 句柄，从结构上保证）
 /// - I3：每条 entry 携带 `event_id`，`clear_events` 按 event_id 批量过滤
 /// - I4：只存在于单 Validator 内存；进程重启即清空
+///
+/// # D2 (docs/feat/overlay-multi-slot/design.md)
+/// 索引值为 **每 key 一个 LIFO 栈** (`Vec<SpeculativeEntry>`)，不是单槽。
+/// - 同 key 多次 `stage()` 追加入栈，不再覆盖历史
+/// - `get()` 读栈顶（最新 push）
+/// - `clear_events()` 按 event_id 过滤每个栈，空栈移除
+///
+/// 这样修复了 stress-same-key-divergence bug 的 D2 驱动：单槽模式下，
+/// 连续写同一 key 会导致除最新之外的所有历史在 clear 时全部丢失；
+/// D2 后历史保留，最新 event 被 clear 时前一次 stage 仍可读出。
 pub struct SpeculativeOverlay {
-    /// 合成索引：(subnet, hash_key) → 最新的 SpeculativeEntry。
-    /// 同一 key 被多笔 pre-apply 时，后来的覆盖前面的（entry.event_id 随之更新）。
-    index: Mutex<HashMap<(SubnetId, HashValue), SpeculativeEntry>>,
+    /// 合成索引：(subnet, hash_key) → LIFO 栈 of SpeculativeEntry。
+    /// 按 push 顺序排列；栈顶为最新 stage 结果，`get` 读栈顶。
+    index: Mutex<HashMap<(SubnetId, HashValue), Vec<SpeculativeEntry>>>,
 }
 
 /// `clear_events` 的返回统计。
@@ -74,6 +84,10 @@ impl SpeculativeOverlay {
 
     /// 读路径：查询单个 key。
     ///
+    /// D2: 若该 key 的栈非空，返回**栈顶**（最新 stage）entry 的 value。
+    /// 空栈（clear_events 后）已从 index 移除，故此处 `get` 返回 `None`
+    /// → 读者回落 SMT snapshot。
+    ///
     /// - `Some(Some(bytes))` → overlay 预写（Insert/Update）
     /// - `Some(None)`        → overlay 预 Delete（读者应视同"键不存在"）
     /// - `None`              → overlay 未覆盖，读者回落 SMT
@@ -81,6 +95,7 @@ impl SpeculativeOverlay {
         let guard = self.index.lock().expect("overlay mutex poisoned");
         guard
             .get(&(*subnet, *oid))
+            .and_then(|stack| stack.last())
             .map(|e| e.value.clone())
     }
 
@@ -129,9 +144,13 @@ impl SpeculativeOverlay {
         }
 
         // Phase 2: atomic bulk insert
+        // D2: push onto the per-key stack instead of overwriting. Prior
+        // stages for the same key are preserved; `get` still reads the top
+        // (latest) entry, so read-your-writes behaviour is unchanged on the
+        // happy path.
         let mut guard = self.index.lock().expect("overlay mutex poisoned");
         for (k, v) in staged {
-            guard.insert(k, v);
+            guard.entry(k).or_default().push(v);
         }
         Ok(())
     }
@@ -142,33 +161,49 @@ impl SpeculativeOverlay {
     /// - applied：SMT 已吸收相同字节，清除后读路径无缝回落 SMT
     /// - stale_read：SMT 未变，清除后读路径暴露 SMT 原值 → 回滚完成
     ///
-    /// 若 entry 已被后续 event 覆盖（`entry.event_id` 不在入参列表中）→ 保留，
-    /// 由覆盖者自己的最终化负责清理。
+    /// D2: 每个 key 现在是一个栈。此方法：
+    /// 1. 遍历每个栈，保留 `event_id` 不在入参列表中的条目（`Vec::retain`
+    ///    保序）。
+    /// 2. 若某栈被完全清空，从 index 中移除该 key（防止 delete-churn 造成
+    ///    empty-Vec 泄漏）。
+    ///
+    /// 若栈中某中间层 entry 的 event_id 未被 clear，它会保留在栈中；其下
+    /// 更早的 entry 也会保留。与单槽模式的关键差异：单槽模式下
+    /// `clear_events([E_latest])` 会清掉整个槽（丢失早期未被 clear 的
+    /// event 的历史）。D2 下这些早期 entry 成为新栈顶，读路径可继续读到。
     pub fn clear_events(&self, event_ids: &[String]) -> OverlayClearStats {
         if event_ids.is_empty() {
             return OverlayClearStats::default();
         }
         let filter: HashSet<&str> = event_ids.iter().map(String::as_str).collect();
         let mut guard = self.index.lock().expect("overlay mutex poisoned");
-        let before = guard.len();
-        guard.retain(|_, entry| !filter.contains(entry.event_id.as_str()));
-        let after = guard.len();
-        OverlayClearStats {
-            cleared: before - after,
-        }
+        let mut cleared: usize = 0;
+        guard.retain(|_, stack| {
+            let before = stack.len();
+            stack.retain(|entry| !filter.contains(entry.event_id.as_str()));
+            cleared += before - stack.len();
+            !stack.is_empty()
+        });
+        OverlayClearStats { cleared }
     }
 
     /// 可观测：当前 overlay 中的条目数、最老条目的 age、去重 event 数。
+    ///
+    /// D2: `entry_count` 是**所有栈总条目数**（sum of stack lengths），
+    /// 不是 key 数量；`unique_events` 是跨所有栈的去重 event_id 数。
+    /// 在无同 key 竞争的常见场景下 entry_count 与 key 数相同（每栈深 1）。
     pub fn stats(&self) -> OverlayStats {
         let guard = self.index.lock().expect("overlay mutex poisoned");
-        let entry_count = guard.len();
+        let entry_count: usize = guard.values().map(|s| s.len()).sum();
         let oldest_age = guard
             .values()
-            .map(|e| e.staged_at)
+            .flat_map(|s| s.iter().map(|e| e.staged_at))
             .min()
             .map(|t| t.elapsed());
-        let unique_events: HashSet<&str> =
-            guard.values().map(|e| e.event_id.as_str()).collect();
+        let unique_events: HashSet<&str> = guard
+            .values()
+            .flat_map(|s| s.iter().map(|e| e.event_id.as_str()))
+            .collect();
         OverlayStats {
             entry_count,
             oldest_age,
@@ -183,9 +218,9 @@ impl SpeculativeOverlay {
 ///
 /// - `Oid(hv)` —— 合法 oid key，承载对象状态
 /// - `NonOid`  —— 非 `oid:` 前缀（`event:` / `user:` / `solver:` / `validator:` / `mod:` 等
-///                元数据 key），overlay 不管，SMT 自行处理
+///   元数据 key），overlay 不管，SMT 自行处理
 /// - `BadOid`  —— 以 `oid:` 开头但 hex 部分非法（长度不是 64 或含非 hex 字符）→
-///                G11 违规，由调用者决定是否 fail-loud
+///   G11 违规，由调用者决定是否 fail-loud
 #[derive(Debug, PartialEq, Eq)]
 enum ParsedKey {
     Oid(HashValue),
@@ -308,20 +343,29 @@ mod tests {
         assert_eq!(ov.stats().entry_count, 0);
     }
 
+    /// D2 (docs/feat/overlay-multi-slot/design.md) changes the single-slot
+    /// overwrite semantics of this test to a per-key LIFO stack. Same-key
+    /// stages now PRESERVE prior entries rather than overwriting them.
     #[test]
-    fn stage_same_key_overwrites_event_id() {
+    fn stage_same_key_preserves_prior_entries_d2() {
         let ov = SpeculativeOverlay::new();
         let (k, hv) = oid_key(0x55);
         ov.stage("E1", SubnetId::ROOT, &[StateChange::insert(k.clone(), b"v1".to_vec())])
             .unwrap();
         ov.stage("E3", SubnetId::ROOT, &[StateChange::insert(k, b"v3".to_vec())])
             .unwrap();
-        // get returns the latest
+        // get returns the top-of-stack (latest push)
         assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(b"v3".to_vec())));
-        // clearing E1 is now a no-op (entry.event_id == "E3")
+        // both entries live in the stack → entry_count reflects stack depth
+        assert_eq!(ov.stats().entry_count, 2);
+        assert_eq!(ov.stats().unique_events, 2);
+        // clearing E1 DOES remove it (pre-D2 was a no-op because E1's slot
+        // had been overwritten by E3)
         let stats = ov.clear_events(&["E1".to_string()]);
-        assert_eq!(stats.cleared, 0);
+        assert_eq!(stats.cleared, 1);
         assert_eq!(ov.stats().entry_count, 1);
+        // after clear, top is still E3
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(b"v3".to_vec())));
     }
 
     #[test]
@@ -485,5 +529,135 @@ mod tests {
         // Surviving entries are odd-indexed
         let surviving = ov.stats().unique_events;
         assert_eq!(surviving, 5);
+    }
+
+    // ========================================================================
+    // D2 (docs/feat/overlay-multi-slot): per-key LIFO stack semantics
+    // ========================================================================
+
+    /// T1: sequential stages on the same key push onto the stack without
+    /// overwriting.
+    #[test]
+    fn d2_stage_same_key_preserves_prior_entries() {
+        let ov = SpeculativeOverlay::new();
+        let (k, hv) = oid_key(0xB1);
+        for i in 1u8..=4 {
+            let ev_id = format!("E{i}");
+            let v = vec![i];
+            ov.stage(&ev_id, SubnetId::ROOT, &[StateChange::insert(k.clone(), v)])
+                .unwrap();
+        }
+        let stats = ov.stats();
+        assert_eq!(stats.entry_count, 4, "stack depth = 4");
+        assert_eq!(stats.unique_events, 4);
+        // top-of-stack = latest (E4)
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(vec![4])));
+    }
+
+    /// T2: `get` returns the value from the top of the stack regardless of
+    /// how many prior entries exist.
+    #[test]
+    fn d2_get_returns_top_of_stack() {
+        let ov = SpeculativeOverlay::new();
+        let (k, hv) = oid_key(0xB2);
+        ov.stage("E1", SubnetId::ROOT, &[StateChange::insert(k.clone(), b"v1".to_vec())])
+            .unwrap();
+        ov.stage("E2", SubnetId::ROOT, &[StateChange::insert(k.clone(), b"v2".to_vec())])
+            .unwrap();
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(b"v2".to_vec())));
+        ov.stage("E3", SubnetId::ROOT, &[StateChange::insert(k, b"v3".to_vec())])
+            .unwrap();
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(b"v3".to_vec())));
+    }
+
+    /// T3: CORE stress-same-key-divergence fix. After clearing the top
+    /// event_id, the prior stage is exposed — previously lost by the
+    /// single-slot overwrite.
+    #[test]
+    fn d2_clear_top_exposes_prior() {
+        let ov = SpeculativeOverlay::new();
+        let (k, hv) = oid_key(0xB3);
+        // Simulate the stress scenario: 9 stages for the same key.
+        for i in 1u8..=9 {
+            ov.stage(
+                &format!("E{i}"),
+                SubnetId::ROOT,
+                &[StateChange::insert(k.clone(), vec![i])],
+            )
+            .unwrap();
+        }
+        assert_eq!(ov.stats().entry_count, 9);
+        // CF finalizes only E9 (single-event CF, as in the artefact).
+        let stats = ov.clear_events(&["E9".to_string()]);
+        assert_eq!(stats.cleared, 1);
+        // Top of stack is now E8 — read returns E8's value.
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(vec![8])));
+        assert_eq!(ov.stats().entry_count, 8);
+    }
+
+    /// T4: clearing a middle event preserves relative order of survivors.
+    #[test]
+    fn d2_clear_middle_preserves_order() {
+        let ov = SpeculativeOverlay::new();
+        let (k, hv) = oid_key(0xB4);
+        ov.stage("E1", SubnetId::ROOT, &[StateChange::insert(k.clone(), vec![1])])
+            .unwrap();
+        ov.stage("E2", SubnetId::ROOT, &[StateChange::insert(k.clone(), vec![2])])
+            .unwrap();
+        ov.stage("E3", SubnetId::ROOT, &[StateChange::insert(k, vec![3])])
+            .unwrap();
+        // Clear the middle event (E2).
+        let stats = ov.clear_events(&["E2".to_string()]);
+        assert_eq!(stats.cleared, 1);
+        assert_eq!(ov.stats().entry_count, 2);
+        // Top is still E3.
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(vec![3])));
+        // After clearing E3, top becomes E1 (not E2, which was already cleared).
+        let stats = ov.clear_events(&["E3".to_string()]);
+        assert_eq!(stats.cleared, 1);
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv), Some(Some(vec![1])));
+    }
+
+    /// T5: when the last entry of a stack is cleared, the key is removed
+    /// from the index (no empty-Vec leak).
+    #[test]
+    fn d2_clear_all_removes_key() {
+        let ov = SpeculativeOverlay::new();
+        let (k, hv) = oid_key(0xB5);
+        ov.stage("E1", SubnetId::ROOT, &[StateChange::insert(k.clone(), vec![1])])
+            .unwrap();
+        ov.stage("E2", SubnetId::ROOT, &[StateChange::insert(k, vec![2])])
+            .unwrap();
+        // Clear both → stack empties → key removed.
+        let stats = ov.clear_events(&["E1".to_string(), "E2".to_string()]);
+        assert_eq!(stats.cleared, 2);
+        assert_eq!(ov.stats().entry_count, 0);
+        // Get now returns None → read falls through to SMT.
+        assert!(ov.get(&SubnetId::ROOT, &hv).is_none());
+    }
+
+    /// T6: stages on different keys produce independent stacks.
+    #[test]
+    fn d2_stage_different_keys_independent_stacks() {
+        let ov = SpeculativeOverlay::new();
+        let (k1, hv1) = oid_key(0xC1);
+        let (k2, hv2) = oid_key(0xC2);
+        ov.stage("E1", SubnetId::ROOT, &[StateChange::insert(k1.clone(), vec![10])])
+            .unwrap();
+        ov.stage("E2", SubnetId::ROOT, &[StateChange::insert(k2.clone(), vec![20])])
+            .unwrap();
+        ov.stage("E3", SubnetId::ROOT, &[StateChange::insert(k1, vec![11])])
+            .unwrap();
+        ov.stage("E4", SubnetId::ROOT, &[StateChange::insert(k2, vec![21])])
+            .unwrap();
+        // k1 stack: [E1=10, E3=11]; k2 stack: [E2=20, E4=21]
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv1), Some(Some(vec![11])));
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv2), Some(Some(vec![21])));
+        assert_eq!(ov.stats().entry_count, 4);
+        // Clear E3 only → k1 top = E1; k2 unaffected.
+        let stats = ov.clear_events(&["E3".to_string()]);
+        assert_eq!(stats.cleared, 1);
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv1), Some(Some(vec![10])));
+        assert_eq!(ov.get(&SubnetId::ROOT, &hv2), Some(Some(vec![21])));
     }
 }
