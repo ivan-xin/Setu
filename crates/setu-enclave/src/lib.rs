@@ -117,6 +117,11 @@ pub use mock::MockEnclave;
 #[cfg(feature = "nitro")]
 pub use nitro::NitroEnclave;
 
+// Re-export Move stdlib sanity helper for binary entry points to use at startup.
+// See docs/bugs/20260421-deploy-stdlib-missing.md.
+#[cfg(feature = "move-vm")]
+pub use setu_move_vm::stdlib_module_count;
+
 /// Create the default enclave based on enabled features
 #[cfg(feature = "mock")]
 pub fn create_default_enclave(solver_id: &str) -> MockEnclave {

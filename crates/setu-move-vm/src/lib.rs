@@ -23,3 +23,14 @@ pub mod resolver;
 // Re-export move-core-types so downstream crates (e.g. setu-enclave)
 // can access Move types without a direct dependency.
 pub use move_core_types;
+
+/// Number of Move stdlib modules baked into this binary at build time.
+///
+/// Returns 0 if the binary was compiled without `setu-framework/compiled/*.mv`
+/// (i.e. `STDLIB_MODULES` fell back to the empty array in `build.rs`).
+/// Used by binary entry points (e.g. `setu-solver`) for startup sanity checks
+/// to fail fast on misbuilt binaries — see
+/// `docs/bugs/20260421-deploy-stdlib-missing.md`.
+pub fn stdlib_module_count() -> usize {
+    crate::engine::STDLIB_MODULES.len()
+}

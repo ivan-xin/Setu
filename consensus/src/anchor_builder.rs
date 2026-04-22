@@ -554,7 +554,15 @@ impl AnchorBuilder {
 
         // R5: record per-event outcomes after apply (Leader path).
         self.ingest_outcomes(&cf_id, &events, &state_summary);
-        
+
+        // M4: CF finalized — clear speculative overlay entries owned by these events.
+        // Other validators may not have staged anything (no-op for them), but the
+        // validator that executed the MoveCall needs the entries removed so SMT
+        // becomes the sole source of truth.
+        let finalized_event_ids: Vec<String> =
+            events.iter().map(|e| e.id.clone()).collect();
+        let _cleared = self.shared.clear_overlay_events(&finalized_event_ids);
+
         // Update AnchorBuilder state
         self.last_anchor = Some(pending.anchor);
         self.anchor_depth = pending.new_anchor_depth;
@@ -619,6 +627,11 @@ impl AnchorBuilder {
 
         // R5: record per-event outcomes after apply (Follower path).
         self.ingest_outcomes(&cf.anchor.id, events, &state_summary);
+
+        // M4: CF finalized — clear speculative overlay entries owned by these events.
+        let finalized_event_ids: Vec<String> =
+            events.iter().map(|e| e.id.clone()).collect();
+        let _cleared = self.shared.clear_overlay_events(&finalized_event_ids);
 
         self.synchronize_finalized_anchor(&cf.anchor);
         

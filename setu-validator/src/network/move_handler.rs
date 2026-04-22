@@ -178,16 +178,46 @@ impl MoveCallHandler {
                     })
                     .unwrap_or_default();
 
-                // Apply state changes to validator state (so created objects are
-                // available for subsequent MoveCall references)
+                // Stage MoveCall state_changes into the speculative overlay so
+                // the same client can immediately read-your-writes from this
+                // validator. Pre-apply MUST NOT touch the write GSM directly:
+                // doing so diverges the SMT across validators after leader
+                // rotation (see docs/feat/follower-apply-root-mismatch/design.md,
+                // OBS-023, docs/bugs/20260422-follower-apply-root-mismatch.md).
+                //
+                // Overlay entries are cleared by anchor_builder.rs on CF finalize
+                // (both commit_build leader path and apply_follower_finalized_cf
+                // follower path); the canonical SMT is written by
+                // apply_committed_events at that same point.
                 if success {
                     if let Some(r) = result_event.execution_result.as_ref() {
                         let shared = state_provider.shared_state_manager();
-                        let mut manager = shared.lock_write();
-                        for sc in &r.state_changes {
-                            manager.apply_state_change(SubnetId::ROOT, sc);
+                        match shared.stage_overlay(
+                            &result_event.id,
+                            SubnetId::ROOT,
+                            &r.state_changes,
+                        ) {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    event_id = %result_event.id,
+                                    change_count = r.state_changes.len(),
+                                    "MoveCall result staged to speculative overlay"
+                                );
+                            }
+                            Err(e) => {
+                                // G11 violation coming out of TEE. Do NOT fall
+                                // back to apply_state_change — that would
+                                // reintroduce the cross-validator divergence
+                                // this fix targets. CF finalize will still
+                                // apply the canonical state_changes via
+                                // apply_committed_events on every validator.
+                                error!(
+                                    event_id = %result_event.id,
+                                    error = %e,
+                                    "MoveCall state_change has malformed key; overlay stage skipped"
+                                );
+                            }
                         }
-                        shared.publish_snapshot(&manager);
                     }
                 }
 
@@ -266,11 +296,10 @@ impl MoveCallHandler {
             mutable_indices: if request.mutable_indices.is_empty() { None } else { Some(request.mutable_indices.clone()) },
             consumed_indices: if request.consumed_indices.is_empty() { None } else { Some(request.consumed_indices.clone()) },
             needs_tx_context: request.needs_tx_context,
-            // DF FDP M5-Pre: forward client-declared DF accesses from the HTTP
-            // request straight into the MoveCallPayload. `MoveCallRequest.dynamic_field_accesses`
-            // is `#[serde(default)]`, so pre-M5 clients that omit the field
-            // land here as an empty Vec (behavior identical to before).
-            dynamic_field_accesses: request.dynamic_field_accesses.clone(),
+            // DF FDP M4: network path does not surface DF declarations yet.
+            // Clients speaking the RPC layer get empty DF accesses; HTTP /
+            // JSON clients can still populate via serde default.
+            dynamic_field_accesses: Vec::new(),
         })
     }
 

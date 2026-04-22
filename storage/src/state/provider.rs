@@ -219,12 +219,9 @@ impl MerkleStateProvider {
     /// Get raw storage data by string key (module bytecode lookup).
     ///
     /// Hashes the key with BLAKE3 to produce the SMT lookup HashValue,
-    /// then reads from the ROOT subnet SMT.
+    /// then reads from the ROOT subnet SMT **merged with the speculative overlay**.
     pub fn get_raw_data(&self, key: &str) -> Option<Vec<u8>> {
-        let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
-        let hash_value = setu_merkle::HashValue::from_slice(&hash).ok()?;
-        let snapshot = self.shared.load_snapshot();
-        snapshot.get_subnet(&SubnetId::ROOT)?.get(&hash_value).cloned()
+        self.shared.load_overlay_view().get_raw_data(key)
     }
 
     /// Register a subnet for an address (called when creating/updating coins)
@@ -326,14 +323,12 @@ impl MerkleStateProvider {
         }
     }
 
-    /// Get object from a specific subnet SMT
+    /// Get object from a specific subnet SMT (merged with speculative overlay).
     pub fn get_object_from_subnet(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
-        let snapshot = self.shared.load_snapshot();
-        let hash = HashValue::from_slice(object_id_bytes).ok()?;
-        snapshot.get_subnet(subnet_id)?.get(&hash).cloned()
+        self.shared.load_overlay_view().get_subnet_object(subnet_id, object_id_bytes)
     }
 
-    /// Get object from the default subnet (ROOT)
+    /// Get object from the default subnet (ROOT), merged with overlay.
     fn get_object_internal(&self, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
         self.get_object_from_subnet(object_id_bytes, &self.default_subnet)
     }
@@ -460,10 +455,9 @@ impl StateProvider for MerkleStateProvider {
     }
 
     fn get_object_from_subnet(&self, object_id: &ObjectId, subnet_id: &SubnetId) -> Option<Vec<u8>> {
-        // Delegate to the existing concrete method
-        let snapshot = self.shared.load_snapshot();
-        let hash = HashValue::from_slice(object_id.as_bytes()).ok()?;
-        snapshot.get_subnet(subnet_id)?.get(&hash).cloned()
+        self.shared
+            .load_overlay_view()
+            .get_subnet_object(subnet_id, object_id.as_bytes())
     }
 
     fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
@@ -896,5 +890,102 @@ mod tests {
 
         // Missing key should return None
         assert!(provider.get_raw("mod:0xdead::missing").is_none());
+    }
+
+    // ========================================================================
+    // M2 tests: MerkleStateProvider reads through SpeculativeOverlay
+    // ========================================================================
+
+    fn oid_key_str(b: u8) -> String {
+        format!("oid:{}", hex::encode([b; 32]))
+    }
+
+    #[test]
+    fn merkle_provider_get_object_reads_overlay() {
+        use setu_types::event::StateChange;
+
+        let shared = make_shared_with_init(|_| {}); // empty SMT
+        // Stage an overlay entry under ROOT subnet
+        shared
+            .stage_overlay(
+                "E1",
+                SubnetId::ROOT,
+                &[StateChange::insert(oid_key_str(0xA0), b"overlay_bytes".to_vec())],
+            )
+            .unwrap();
+
+        let provider = MerkleStateProvider::new(shared);
+        let data = provider.get_object(&ObjectId::new([0xA0u8; 32]));
+        assert_eq!(data, Some(b"overlay_bytes".to_vec()));
+    }
+
+    #[test]
+    fn merkle_provider_get_object_from_subnet_reads_overlay() {
+        use setu_types::event::StateChange;
+
+        let shared = make_shared_with_init(|_| {});
+        // Event on ROOT, but change targets GOVERNANCE
+        let change = StateChange::insert(oid_key_str(0xA1), b"gov_bytes".to_vec())
+            .with_target_subnet(SubnetId::GOVERNANCE);
+        shared.stage_overlay("E1", SubnetId::ROOT, &[change]).unwrap();
+
+        let provider = MerkleStateProvider::new(shared);
+        let oid = ObjectId::new([0xA1u8; 32]);
+        // GOVERNANCE lookup sees overlay; ROOT does not.
+        // Use the trait method which takes `&ObjectId`.
+        assert_eq!(
+            <MerkleStateProvider as StateProvider>::get_object_from_subnet(
+                &provider,
+                &oid,
+                &SubnetId::GOVERNANCE
+            ),
+            Some(b"gov_bytes".to_vec())
+        );
+        assert!(<MerkleStateProvider as StateProvider>::get_object_from_subnet(
+            &provider,
+            &oid,
+            &SubnetId::ROOT
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn merkle_provider_get_raw_reads_overlay() {
+        use setu_types::event::StateChange;
+
+        // For get_raw, overlay must be keyed by BLAKE3(key) under ROOT.
+        // stage_overlay takes `oid:{hex}` — so we fake a raw-mode stage here
+        // by computing the hash and inserting directly (same as provider's read side).
+        let shared = make_shared_with_init(|_| {});
+        let raw_key = "mod:0xdead::counter";
+        let hash = setu_types::hash_utils::setu_hash(raw_key.as_bytes());
+        let oid_key = format!("oid:{}", hex::encode(hash));
+        shared
+            .stage_overlay(
+                "E1",
+                SubnetId::ROOT,
+                &[StateChange::insert(oid_key, b"bytecode".to_vec())],
+            )
+            .unwrap();
+
+        let provider = MerkleStateProvider::new(shared);
+        assert_eq!(provider.get_raw(raw_key), Some(b"bytecode".to_vec()));
+    }
+
+    #[test]
+    fn merkle_provider_reads_smt_when_overlay_miss() {
+        use setu_types::event::StateChange;
+
+        let shared = make_shared_with_init(|gsm| {
+            let sc = StateChange::insert(oid_key_str(0xB0), b"smt_bytes".to_vec());
+            gsm.apply_state_change(SubnetId::ROOT, &sc);
+        });
+        {
+            let gsm = shared.lock_write();
+            shared.publish_snapshot(&gsm);
+        }
+        let provider = MerkleStateProvider::new(shared);
+        let data = provider.get_object(&ObjectId::new([0xB0u8; 32]));
+        assert_eq!(data, Some(b"smt_bytes".to_vec()));
     }
 }

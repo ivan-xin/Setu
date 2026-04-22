@@ -11,6 +11,7 @@ pub mod manager;
 pub mod provider;
 pub mod batch_snapshot;
 pub mod shared;
+pub mod speculative_overlay;
 
 pub use manager::{SubnetStateSMT, GlobalStateManager, StateApplySummary, StateApplyError, RecoverySummary, B4StoreExt, ConflictRecord};
 pub use provider::{
@@ -19,4 +20,7 @@ pub use provider::{
     init_coin, init_coins_split, get_coin_state,
 };
 pub use batch_snapshot::{BatchStateSnapshot, BatchSnapshotStats};
-pub use shared::SharedStateManager;
+pub use shared::{SharedStateManager, OverlayView};
+pub use speculative_overlay::{
+    OverlayClearStats, OverlayStats, SpeculativeOverlay, StageError,
+};
