@@ -618,6 +618,11 @@ impl Event {
         let mut event = Self::new(EventType::ContractPublish, parent_ids, vlc_snapshot, creator);
         event.payload = EventPayload::MovePublish(MovePublishPayload { modules });
         event.creator = sender;
+        // Self::new() sealed event.id against the `creator` argument. We just
+        // overwrote `event.creator` with `sender`, which invalidates the ID.
+        // Must recompute so `verify_id()` (anti-tampering check in
+        // consensus_integration::submit_event) accepts the event.
+        event.recompute_id();
         event
     }
 
@@ -856,6 +861,26 @@ mod tests {
         let event = Event::genesis("node1".to_string(), create_vlc_snapshot());
         assert!(event.is_genesis());
         assert!(!event.has_parents());
+    }
+
+    /// Regression test for docs/bugs/20260424-contract-publish-event-id-tampering.md:
+    /// `Event::contract_publish` overwrites `event.creator` after `Self::new`
+    /// seals the id. Must call `recompute_id()` or consensus rejects the event
+    /// with "Event ID verification failed - possible tampering".
+    #[test]
+    fn test_contract_publish_event_id_is_self_consistent() {
+        let event = Event::contract_publish(
+            "alice".to_string(),
+            vec![vec![0xCA, 0xFE, 0xBA, 0xBE]],
+            vec![],
+            create_vlc_snapshot(),
+            "validator-1".to_string(),
+        );
+        assert_eq!(event.creator, "alice", "creator should be overwritten to sender");
+        assert!(
+            event.verify_id(),
+            "publish event id must verify after creator overwrite (recompute_id must be called)"
+        );
     }
     
     #[test]
