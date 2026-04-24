@@ -6,6 +6,11 @@ edition = "2021"
 [features]
 default = []
 test-utils = ["setu-types/test-utils"]
+# Phase 1 diagnostic instrumentation for consensus-root-self-consistency FDP.
+# Adds a thread-local gate + probe to apply_state_change to catch write-GSM
+# writes that bypass apply_committed_events.
+# See docs/feat/consensus-root-self-consistency/design.md §3.4.
+diag-root-drift = []
 
 [dependencies]
 setu-types = { path = "../types" }

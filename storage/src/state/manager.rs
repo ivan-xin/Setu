@@ -30,6 +30,48 @@ use setu_types::envelope::{detect_and_parse, StorageFormat};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+// ============================================================================
+// DIAG (Phase 1 instrumentation for consensus-root-self-consistency FDP)
+// ============================================================================
+//
+// Thread-local gate + RAII guard. When enabled, `apply_committed_events` marks
+// the current thread as "inside an authoritative CF apply"; `apply_state_change`
+// fires a structured-error probe only when invoked *outside* that gate. This
+// catches any write-GSM mutation that bypasses the CF-apply path (H3).
+//
+// See docs/feat/consensus-root-self-consistency/design.md §3.4.
+
+#[cfg(feature = "diag-root-drift")]
+thread_local! {
+    /// `true` iff the current thread is currently executing
+    /// `GlobalStateManager::apply_committed_events`. Nested calls are not
+    /// expected in production but the RAII guard makes the API panic-safe
+    /// and refactor-safe.
+    static IN_APPLY_COMMITTED_EVENTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard that sets the TLS gate on `enter()` and clears it on `Drop`.
+/// Drop runs on normal return, `?`-early-return, and unwind — so the gate
+/// cannot leak across thread-pool reuse.
+#[cfg(feature = "diag-root-drift")]
+struct InApplyGuard;
+
+#[cfg(feature = "diag-root-drift")]
+impl InApplyGuard {
+    fn enter() -> Self {
+        IN_APPLY_COMMITTED_EVENTS.with(|g| g.set(true));
+        Self
+    }
+}
+
+#[cfg(feature = "diag-root-drift")]
+impl Drop for InApplyGuard {
+    fn drop(&mut self) {
+        IN_APPLY_COMMITTED_EVENTS.with(|g| g.set(false));
+    }
+}
+
 /// Manages Object State SMT for a single subnet
 #[derive(Clone)]
 pub struct SubnetStateSMT {
@@ -855,6 +897,24 @@ impl GlobalStateManager {
         subnet_id: SubnetId,
         change: &StateChange,
     ) -> ApplyResult {
+        // DIAG (H3 probe): fires if a write reaches this function outside the
+        // authoritative `apply_committed_events` call graph. Any hit is a
+        // candidate root-cause for `consensus-root-self-consistency` — the
+        // backtrace pinpoints the rogue caller. Zero cost when feature off.
+        #[cfg(feature = "diag-root-drift")]
+        {
+            let inside = IN_APPLY_COMMITTED_EVENTS.with(|g| g.get());
+            if !inside {
+                tracing::error!(
+                    target: "storage::diag::apply_state_change_out_of_band",
+                    key = %change.key,
+                    subnet = ?subnet_id,
+                    backtrace = ?std::backtrace::Backtrace::force_capture(),
+                    "DIAG H3: apply_state_change called outside apply_committed_events"
+                );
+            }
+        }
+
         let object_id = Self::parse_state_change_key(&change.key);
         
         match &change.new_value {
@@ -1005,6 +1065,13 @@ impl GlobalStateManager {
         &mut self,
         events: &[Event],
     ) -> StateApplySummary {
+        // DIAG: mark this thread as "inside authoritative CF apply" so that
+        // apply_state_change's out-of-band probe stays silent for every write
+        // reached through this path. Drop unsets the gate on any exit
+        // (normal, `?`, unwind).
+        #[cfg(feature = "diag-root-drift")]
+        let _diag_gate = InApplyGuard::enter();
+
         let mut summary = StateApplySummary::new();
         
         // Sort events by VLC for deterministic ordering
@@ -1192,7 +1259,13 @@ impl GlobalStateManager {
     /// parse_state_change_key("oid:abcd1234...") → Ok(HashValue([0xab, 0xcd, ...]))
     /// parse_state_change_key("coin:abcd1234...")  → Err (unknown prefix)
     /// ```
-    fn parse_state_change_key(key: &str) -> HashValue {
+    ///
+    /// **Visibility**: `pub` — γ strict same-key CF fold policy (consensus crate,
+    /// docs/feat/strict-same-key-cf-fold/) calls this to compute the canonical
+    /// `(SubnetId, HashValue)` write-key for each event's state_changes, and it
+    /// MUST use the exact same hashing logic as `apply_committed_events` so the
+    /// two layers agree on what "same key" means. Do not reduce visibility.
+    pub fn parse_state_change_key(key: &str) -> HashValue {
         if let Some(hex_str) = key.strip_prefix("oid:") {
             if let Ok(bytes) = hex::decode(hex_str) {
                 if bytes.len() == 32 {
@@ -2047,5 +2120,103 @@ mod tests {
         // No index entries should be created for mod: keys
         assert!(manager.owner_object_index.is_empty());
         assert!(manager.coin_type_index.is_empty());
+    }
+}
+
+// ============================================================================
+// DIAG tests (only compiled when feature `diag-root-drift` is enabled)
+// ============================================================================
+//
+// See docs/feat/consensus-root-self-consistency/design.md §3.4 + Phase 2
+// checklist tests #9 and #10.
+
+#[cfg(all(test, feature = "diag-root-drift"))]
+mod diag_tests {
+    use super::*;
+    use setu_types::event::StateChange;
+
+    /// Test #9: `InApplyGuard::enter()` flips the TLS flag to true; Drop flips
+    /// it back to false — even on unwind.
+    #[test]
+    fn inapply_guard_sets_and_unsets_tls() {
+        // Initial state: not inside apply.
+        assert!(
+            !IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+            "TLS must start false"
+        );
+
+        {
+            let _guard = InApplyGuard::enter();
+            assert!(
+                IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+                "TLS must be true inside guard scope"
+            );
+        } // _guard dropped here
+
+        assert!(
+            !IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+            "TLS must be false after guard drop"
+        );
+
+        // Panic-safety: even if the guarded body panics, Drop must still fire.
+        let result = std::panic::catch_unwind(|| {
+            let _guard = InApplyGuard::enter();
+            assert!(IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()));
+            panic!("simulated failure inside apply_committed_events");
+        });
+        assert!(result.is_err(), "panic must propagate through catch_unwind");
+        assert!(
+            !IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()),
+            "TLS must be false after panic unwind (Drop ran)"
+        );
+    }
+
+    /// Test #10: `apply_state_change` called from WITHIN
+    /// `apply_committed_events` (via execution result) must NOT trigger the
+    /// out-of-band probe — i.e. the gate suppresses expected CF-apply writes.
+    ///
+    /// We cannot directly observe "no tracing::error! fired" without a
+    /// subscriber, so we verify the TLS state the probe branches on instead.
+    #[test]
+    fn gate_is_true_inside_apply_committed_events_body() {
+        // Build a valid oid key: "oid:" + 64 hex chars (required by
+        // parse_state_change_key's debug_assert).
+        let key = format!("oid:{}", "a".repeat(64));
+        let mut manager = GlobalStateManager::new();
+
+        // Simulate entering the apply_committed_events body manually.
+        let _guard = InApplyGuard::enter();
+        let gate_observed = IN_APPLY_COMMITTED_EVENTS.with(|g| g.get());
+        assert!(
+            gate_observed,
+            "gate must be true — probe stays silent inside apply_committed_events"
+        );
+
+        // A normal state change under the gate still executes.
+        let sc = StateChange::insert(key, vec![1, 2, 3]);
+        let _result = manager.apply_state_change(SubnetId::ROOT, &sc);
+
+        // Gate still true (we still hold _guard).
+        assert!(IN_APPLY_COMMITTED_EVENTS.with(|g| g.get()));
+    }
+
+    /// Test #10b: `apply_state_change` called with NO surrounding guard must
+    /// observe gate=false — this is the state that triggers the probe.
+    #[test]
+    fn gate_is_false_for_out_of_band_apply_state_change() {
+        let key = format!("oid:{}", "b".repeat(64));
+
+        let gate_observed = IN_APPLY_COMMITTED_EVENTS.with(|g| g.get());
+        assert!(
+            !gate_observed,
+            "gate must be false — probe would fire for this caller"
+        );
+
+        // Calling apply_state_change here would emit the DIAG error (we don't
+        // install a tracing subscriber, so the error is dropped). We only
+        // assert the gate value — the error path has no observable return.
+        let mut manager = GlobalStateManager::new();
+        let sc = StateChange::insert(key, vec![9]);
+        let _result = manager.apply_state_change(SubnetId::ROOT, &sc);
     }
 }

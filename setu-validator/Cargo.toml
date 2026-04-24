@@ -7,6 +7,16 @@ edition.workspace = true
 name = "setu-validator"
 path = "src/main.rs"
 
+[features]
+default = []
+# Phase 1 diagnostic instrumentation for consensus-root-self-consistency FDP.
+# Pass-through to consensus + setu-storage. Enable only for stress diagnosis.
+# See docs/feat/consensus-root-self-consistency/design.md §3.6.
+diag-root-drift = [
+    "consensus/diag-root-drift",
+    "setu-storage/diag-root-drift",
+]
+
 [dependencies]
 # Internal dependencies
 setu-core = { path = "../crates/setu-core" }

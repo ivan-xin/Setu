@@ -3,6 +3,14 @@ name = "consensus"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Phase 1 diagnostic instrumentation for consensus-root-self-consistency FDP.
+# Adds DIAG probes to commit_build / apply_follower_finalized_cf /
+# compute_state_root_from_events. Default OFF — zero overhead, zero behavior change.
+# See docs/feat/consensus-root-self-consistency/design.md §3.6.
+diag-root-drift = []
+
 [dependencies]
 setu-types = { path = "../types" }
 setu-vlc = { path = "../crates/setu-vlc" }

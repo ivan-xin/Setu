@@ -26,8 +26,107 @@ use setu_types::{
     event::StateChange,
 };
 use setu_storage::{GlobalStateManager, SharedStateManager, StateApplySummary, StateApplyError, ConflictRecord};
+use setu_merkle::HashValue;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+// DIAG (docs/feat/consensus-root-self-consistency/design.md §3.2):
+// AnchorId is needed by the feature-gated `prepare_base_roots` sidecar map.
+#[cfg(feature = "diag-root-drift")]
+use setu_types::AnchorId;
+
+// ============================================================================
+// γ — Strict Same-Key CF Fold Policy
+// (docs/feat/strict-same-key-cf-fold/)
+// ============================================================================
+
+/// γ fold claimed-write-key: `(target_subnet, ObjectId)`.
+///
+/// **Invariant Inv-γ-Key-Format**: must match the exact key format used by
+/// `apply_committed_events` in `pending_writes` projection
+/// ([storage/src/state/manager.rs:1046]), i.e.
+/// `target = change.target_subnet.unwrap_or(event.get_subnet_id())` +
+/// `object_id = GlobalStateManager::parse_state_change_key(&change.key)`.
+/// If you change one side, change the other.
+type ClaimedWriteKey = (SubnetId, HashValue);
+
+/// Extract the set of SMT write-keys produced by an event.
+///
+/// Returns an empty set for:
+/// - events with `execution_result = None` (control events, pre-exec events)
+/// - events whose `execution_result.success == false` (apply_committed_events
+///   skips them, so γ must not claim their keys)
+///
+/// Within a single event, duplicate keys are deduplicated via HashSet — this
+/// allows MergeThenTransfer etc. to write the same key twice inside ONE event
+/// while γ still counts it as one slot.
+///
+/// See `docs/feat/strict-same-key-cf-fold/design.md` §3.3.
+fn collect_event_write_keys(event: &Event) -> HashSet<ClaimedWriteKey> {
+    let mut keys = HashSet::new();
+    let Some(result) = event.execution_result.as_ref() else {
+        return keys;
+    };
+    if !result.success {
+        return keys;
+    }
+    let subnet_id = event.get_subnet_id();
+    for change in &result.state_changes {
+        let target = change.target_subnet.unwrap_or(subnet_id);
+        let object_id = GlobalStateManager::parse_state_change_key(&change.key);
+        keys.insert((target, object_id));
+    }
+    keys
+}
+
+/// γ strict same-key CF fold policy.
+///
+/// Greedy scan of VLC-sorted events; an event is **kept** only if its write-key
+/// set is disjoint from the union of already-kept events' write-keys. Otherwise
+/// the event is **deferred** — it stays in the DAG pending set and will be
+/// reconsidered on the next `prepare_build` round (once previously-kept events
+/// move to `in_flight_event_ids`).
+///
+/// **Inv-γ-Sort**: events are sorted by `(vlc_snapshot.logical_time asc, id asc)`
+/// BEFORE scanning. This MUST stay identical to the sort inside
+/// `apply_committed_events` in storage/src/state/manager.rs (leader-follower
+/// consensus depends on the two layers agreeing on order).
+///
+/// **tie-break**: event_id equality would require a BLAKE3 collision; treated
+/// as impossible. See design §3.2.
+///
+/// See `docs/feat/strict-same-key-cf-fold/design.md` §3.2.
+fn apply_strict_same_key_fold_policy(
+    events: Vec<Event>,
+) -> (Vec<Event>, Vec<Event>) {
+    let mut sorted = events;
+    sorted.sort_by(|a, b| {
+        match a.vlc_snapshot.logical_time.cmp(&b.vlc_snapshot.logical_time) {
+            Ordering::Equal => a.id.cmp(&b.id),
+            other => other,
+        }
+    });
+
+    let mut claimed: HashSet<ClaimedWriteKey> = HashSet::new();
+    let mut kept: Vec<Event> = Vec::with_capacity(sorted.len());
+    let mut deferred: Vec<Event> = Vec::new();
+
+    for event in sorted {
+        let write_keys = collect_event_write_keys(&event);
+        let conflict = write_keys.iter().any(|k| claimed.contains(k));
+        if conflict {
+            deferred.push(event);
+        } else {
+            for k in write_keys {
+                claimed.insert(k);
+            }
+            kept.push(event);
+        }
+    }
+
+    (kept, deferred)
+}
 
 // ============================================================================
 // Types for Deferred Commit Mode
@@ -210,6 +309,15 @@ pub struct AnchorBuilder {
     /// R5 · Optional outcome sink for apply-phase observability.
     /// Default None; `set_outcomes_sink` wires production sinks (e.g. DashMapOutcomeSink).
     outcomes_sink: Option<Arc<dyn OutcomeSink>>,
+
+    /// DIAG-only sidecar: captures the write-GSM `global_state_root` observed
+    /// at `prepare_build_internal` time, keyed by the anchor id that is
+    /// about to be shipped. `commit_build` looks it up and compares to the
+    /// write-GSM root observed after re-acquiring the lock; divergence signals
+    /// H2 (base-state drift between prepare and commit).
+    /// See docs/feat/consensus-root-self-consistency/design.md §3.2.
+    #[cfg(feature = "diag-root-drift")]
+    prepare_base_roots: parking_lot::Mutex<HashMap<AnchorId, [u8; 32]>>,
 }
 
 impl AnchorBuilder {
@@ -225,6 +333,8 @@ impl AnchorBuilder {
             total_anchor_count: 0,
             last_fold_instant: None,
             outcomes_sink: None,
+            #[cfg(feature = "diag-root-drift")]
+            prepare_base_roots: parking_lot::Mutex::new(HashMap::new()),
         }
     }
     
@@ -242,6 +352,8 @@ impl AnchorBuilder {
             total_anchor_count: 0,
             last_fold_instant: None,
             outcomes_sink: None,
+            #[cfg(feature = "diag-root-drift")]
+            prepare_base_roots: parking_lot::Mutex::new(HashMap::new()),
         }
     }
     
@@ -440,7 +552,24 @@ impl AnchorBuilder {
             .filter(|e| !in_flight_event_ids.contains(&e.id))
             .cloned()
             .collect();
-        
+
+        // γ strict same-key CF fold: eliminate cross-event same-key writes in
+        // one CF (docs/feat/strict-same-key-cf-fold/ §3.4).
+        let (mut events, deferred_same_key) = apply_strict_same_key_fold_policy(events);
+        let deferred_capacity = if events.len() > self.config.max_events_per_cf {
+            events.split_off(self.config.max_events_per_cf)
+        } else {
+            Vec::new()
+        };
+        if !deferred_same_key.is_empty() || !deferred_capacity.is_empty() {
+            tracing::info!(
+                kept = events.len(),
+                deferred_same_key = deferred_same_key.len(),
+                deferred_capacity = deferred_capacity.len(),
+                "γ fold: deferred events to next CF"
+            );
+        }
+
         // Check minimum events
         if events.len() < self.config.min_events_per_cf {
             return Err(AnchorBuildError::InsufficientEvents {
@@ -457,6 +586,14 @@ impl AnchorBuilder {
     }
     
     /// Force prepare build from specific events (bypasses checks)
+    ///
+    /// WARNING: bypasses γ strict-same-key fold policy (docs/feat/strict-same-key-cf-fold/).
+    /// This is safe for leader/follower symmetry (both run identical
+    /// `apply_committed_events` on the input event set) but opts out of γ's
+    /// defense-in-depth benefit. Only acceptable for unit tests where the
+    /// caller constructs a small, controlled event set. `max_events_per_cf`
+    /// trim is still applied to keep `event_ids` / `events_root` / `state_root`
+    /// in lockstep (§2.0).
     pub fn force_prepare_build(
         &self,
         events: Vec<Event>,
@@ -465,6 +602,10 @@ impl AnchorBuilder {
     ) -> Result<PendingAnchorBuild, AnchorBuildError> {
         if events.is_empty() {
             return Err(AnchorBuildError::NoEvents);
+        }
+        let mut events = events;
+        if events.len() > self.config.max_events_per_cf {
+            events.truncate(self.config.max_events_per_cf);
         }
         self.prepare_build_internal(events, vlc, depth)
     }
@@ -491,8 +632,13 @@ impl AnchorBuilder {
         
         // Compute state root using same deterministic logic as Follower:
         // VLC-sorted, conflict-detected, cloned from write GSM
+        #[cfg(feature = "diag-root-drift")]
+        let mut prepare_base: [u8; 32] = [0u8; 32];
         let (global_state_root, subnet_roots) = 
-            self.compute_state_root_from_events(&events);
+            self.compute_state_root_from_events(
+                &events,
+                #[cfg(feature = "diag-root-drift")] &mut prepare_base,
+            );
         
         // Compute new anchor chain root (what it will be after commit)
         let anchor_chain_root = self.last_anchor_chain_root;
@@ -505,10 +651,12 @@ impl AnchorBuilder {
             subnet_roots,
         };
         
-        // Collect event IDs (with limit)
+        // Collect event IDs. γ + trim has already capped `events.len()` to
+        // `max_events_per_cf` at the `prepare_build` layer (design §2.0), so
+        // do NOT re-trim here — `events_root` and `state_root` above were
+        // computed on this exact `events` slice and must match the event_ids.
         let event_ids: Vec<EventId> = events
             .iter()
-            .take(self.config.max_events_per_cf)
             .map(|e| e.id.clone())
             .collect();
         
@@ -520,7 +668,14 @@ impl AnchorBuilder {
             self.last_anchor.as_ref().map(|a| a.id.clone()),
             to_depth,
         );
-        
+
+        // DIAG (H2): record the prepare-time base root for later commit-time
+        // comparison. See §3.2 of the FDP design.
+        #[cfg(feature = "diag-root-drift")]
+        self.prepare_base_roots
+            .lock()
+            .insert(anchor.id.clone(), prepare_base);
+
         // Compute what the new chain root will be
         let anchor_hash = anchor.compute_hash();
         let new_anchor_chain_root = Self::chain_hash(&self.last_anchor_chain_root, &anchor_hash);
@@ -576,13 +731,69 @@ impl AnchorBuilder {
         let events = pending.all_events();
         let anchor_id = self.anchor_depth + 1;
         let cf_id = pending.anchor.id.clone();
+
+        // DIAG (H2): look up the prepare-time base root recorded by
+        // `prepare_build_internal`. We remove it unconditionally so the
+        // sidecar does not leak entries across failed commits.
+        #[cfg(feature = "diag-root-drift")]
+        let prepare_base = self.prepare_base_roots.lock().remove(&cf_id);
+
         // Inner result lets us drop the write guard before running any overlay-clear
         // side effect on the error path (avoids holding two locks at once).
         let inner: Result<StateApplySummary, AnchorBuildError> = {
             let mut guard = self.shared.lock_write();
+
+            // DIAG H2: compare prepare-time base vs commit-time base (under the
+            // same lock that apply will run under). Divergence signals that a
+            // non-CF writer mutated the write GSM between prepare and commit.
+            #[cfg(feature = "diag-root-drift")]
+            if let Some(prep) = prepare_base {
+                let (commit_base, _) = (*guard).compute_global_root_bytes();
+                if commit_base != prep {
+                    tracing::error!(
+                        target: "consensus::diag::leader_base_drift",
+                        cf_id = %cf_id,
+                        prepare_base = %hex::encode(prep),
+                        commit_base  = %hex::encode(commit_base),
+                        n_events = events.len(),
+                        "DIAG H2: leader base state changed between prepare-clone and commit-lock"
+                    );
+                }
+            }
+
             let summary = guard.apply_committed_events(&events);
             match guard.commit(anchor_id) {
                 Ok(()) => {
+                    // DIAG H1: after the real apply+commit, the write GSM's
+                    // actual root must match what was declared in the anchor
+                    // shipped to followers. Any divergence here is a direct
+                    // root cause of follower RootMismatch.
+                    #[cfg(feature = "diag-root-drift")]
+                    match pending.anchor.merkle_roots.as_ref() {
+                        Some(roots) => {
+                            let (actual_root, _) = (*guard).compute_global_root_bytes();
+                            if actual_root != roots.global_state_root {
+                                tracing::error!(
+                                    target: "consensus::diag::leader_root_self_mismatch",
+                                    cf_id = %cf_id,
+                                    declared_root = %hex::encode(roots.global_state_root),
+                                    actual_root   = %hex::encode(actual_root),
+                                    n_events = events.len(),
+                                    legacy_anchor = false,
+                                    "DIAG H1: leader declared state_root != actual state_root after real apply"
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::debug!(
+                                target: "consensus::diag::leader_root_self_mismatch",
+                                cf_id = %cf_id,
+                                legacy_anchor = true,
+                                "DIAG H1: skipped (legacy anchor has no merkle_roots)"
+                            );
+                        }
+                    }
+
                     // Publish snapshot while still holding Mutex (atomic consistency)
                     self.shared.publish_snapshot(&guard);
                     Ok(summary)
@@ -686,6 +897,28 @@ impl AnchorBuilder {
                 } else {
                     // 3. Apply state changes and commit (same lock scope)
                     let summary = guard.apply_committed_events(events);
+
+                    // DIAG H5 (R2-ISSUE-8): the verify-clone root matched the
+                    // declared root, but the second apply runs on the real
+                    // guard which may have been mutated by a non-CF writer
+                    // between steps 1 and 3. Recompute the real root and
+                    // alarm if it drifted.
+                    #[cfg(feature = "diag-root-drift")]
+                    {
+                        let (post_apply_root, _) = (*guard).compute_global_root_bytes();
+                        if post_apply_root != merkle_roots.global_state_root {
+                            tracing::error!(
+                                target: "consensus::diag::follower_post_apply_root_drift",
+                                cf_id = %cf.anchor.id,
+                                verify_root = %hex::encode(expected_root),
+                                commit_root = %hex::encode(post_apply_root),
+                                declared    = %hex::encode(merkle_roots.global_state_root),
+                                n_events = events.len(),
+                                "DIAG H5: follower verify_root != commit_root (post-real-apply drift from verify clone)"
+                            );
+                        }
+                    }
+
                     match guard.commit(anchor_id) {
                         Ok(()) => {
                             self.shared.publish_snapshot(&guard);
@@ -895,13 +1128,24 @@ impl AnchorBuilder {
     ///
     /// The write lock is held only for the duration of the clone, not during
     /// the actual computation.
+    ///
+    /// DIAG (`diag-root-drift`): the optional `out_prepare_base` out-parameter
+    /// captures the write-GSM `global_state_root` *inside* the same lock that
+    /// clones the manager, so `commit_build` can compare this pre-apply base
+    /// against the post-lock base and detect H2 drift.
     fn compute_state_root_from_events(
         &self,
         events: &[Event],
+        #[cfg(feature = "diag-root-drift")] out_prepare_base: &mut [u8; 32],
     ) -> ([u8; 32], HashMap<SubnetId, [u8; 32]>) {
         // Clone from write GSM (same base state as Follower verification)
         let mut temp_manager = {
             let guard = self.shared.lock_write();
+            #[cfg(feature = "diag-root-drift")]
+            {
+                let (base, _) = (*guard).compute_global_root_bytes();
+                *out_prepare_base = base;
+            }
             (*guard).clone()
         };
         // Mutex released — computation is on a detached clone
@@ -991,6 +1235,23 @@ impl AnchorBuilder {
             .filter(|e| !in_flight_event_ids.contains(&e.id))
             .cloned()
             .collect();
+
+        // γ + trim (mirror of `prepare_build`; design §3.4c)
+        let (mut events, deferred_same_key) = apply_strict_same_key_fold_policy(events);
+        let deferred_capacity = if events.len() > self.config.max_events_per_cf {
+            events.split_off(self.config.max_events_per_cf)
+        } else {
+            Vec::new()
+        };
+        if !deferred_same_key.is_empty() || !deferred_capacity.is_empty() {
+            tracing::info!(
+                kept = events.len(),
+                deferred_same_key = deferred_same_key.len(),
+                deferred_capacity = deferred_capacity.len(),
+                path = "heartbeat",
+                "γ fold: deferred events"
+            );
+        }
 
         if events.len() < self.config.min_events_per_cf {
             return Err(AnchorBuildError::InsufficientEvents {
@@ -1971,5 +2232,386 @@ mod tests {
         // which already VLC-sorts internally; it must be stable.
         assert_eq!(gr1, gr2, "global_state_root must be stable across insertion orders");
         assert_eq!(gr2, gr3, "global_state_root must be stable across insertion orders");
+    }
+
+    // ------------------------------------------------------------------
+    // γ — Strict Same-Key CF Fold Policy
+    // docs/feat/strict-same-key-cf-fold/
+    // Tests #1–#16 from design.md §5 / test matrix.
+    // ------------------------------------------------------------------
+
+    fn gamma_config(max_events: usize) -> ConsensusConfig {
+        ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: max_events,
+            ..Default::default()
+        }
+    }
+
+    /// Build a success-result event with a fixed id, a specific logical_time,
+    /// and a set of state-change keys targeting `subnet`.
+    fn gamma_make_event(
+        id: &str,
+        subnet: SubnetId,
+        logical_time: u64,
+        keys: &[&str],
+    ) -> Event {
+        let mut ev = Event::new(
+            EventType::Transfer,
+            vec![],
+            VLCSnapshot::default(),
+            "creator".to_string(),
+        );
+        ev.id = id.to_string();
+        ev.vlc_snapshot.logical_time = logical_time;
+        ev = ev.with_subnet(subnet);
+        let state_changes: Vec<StateChange> = keys
+            .iter()
+            .map(|k| StateChange {
+                key: test_oid_key(k),
+                old_value: None,
+                new_value: Some(vec![1u8; 8]),
+                target_subnet: None,
+            })
+            .collect();
+        ev.execution_result = Some(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes,
+        });
+        ev
+    }
+
+    // --- #1 ---
+    #[test]
+    fn gamma_empty_events_returns_empty() {
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![]);
+        assert!(kept.is_empty());
+        assert!(deferred.is_empty());
+    }
+
+    // --- #2 ---
+    #[test]
+    fn gamma_disjoint_keys_all_kept() {
+        let events = vec![
+            gamma_make_event("e1", SubnetId::ROOT, 1, &["A"]),
+            gamma_make_event("e2", SubnetId::ROOT, 2, &["B"]),
+            gamma_make_event("e3", SubnetId::ROOT, 3, &["C"]),
+        ];
+        let (kept, deferred) = apply_strict_same_key_fold_policy(events);
+        assert_eq!(kept.len(), 3);
+        assert!(deferred.is_empty());
+    }
+
+    // --- #3 ---
+    #[test]
+    fn gamma_same_key_two_events_lower_vlc_wins() {
+        let e1 = gamma_make_event("e1", SubnetId::ROOT, 1, &["A"]);
+        let e2 = gamma_make_event("e2", SubnetId::ROOT, 2, &["A"]);
+        // Feed out of order to force γ's internal sort to matter.
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![e2.clone(), e1.clone()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "e1");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].id, "e2");
+    }
+
+    // --- #4 ---
+    #[test]
+    fn gamma_same_key_equal_vlc_lower_event_id_wins() {
+        let e_big = gamma_make_event("zzz", SubnetId::ROOT, 5, &["A"]);
+        let e_small = gamma_make_event("aaa", SubnetId::ROOT, 5, &["A"]);
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![e_big, e_small]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "aaa");
+        assert_eq!(deferred[0].id, "zzz");
+    }
+
+    // --- #5 MergeThenTransfer: single event, same key twice ---
+    #[test]
+    fn gamma_merge_then_transfer_single_event_kept() {
+        let mut ev = gamma_make_event("e1", SubnetId::ROOT, 1, &["A"]);
+        // add a SECOND state_change writing the same key (different new_value).
+        let dup = StateChange {
+            key: test_oid_key("A"),
+            old_value: Some(vec![1u8; 8]),
+            new_value: Some(vec![2u8; 8]),
+            target_subnet: None,
+        };
+        ev.execution_result.as_mut().unwrap().state_changes.push(dup);
+
+        let keys = collect_event_write_keys(&ev);
+        assert_eq!(keys.len(), 1, "duplicate same-key state_changes must dedupe");
+
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![ev]);
+        assert_eq!(kept.len(), 1);
+        assert!(deferred.is_empty());
+    }
+
+    // --- #6 failed execution_result does not claim keys ---
+    #[test]
+    fn gamma_failed_execution_result_not_blocking() {
+        let mut e1 = gamma_make_event("e1", SubnetId::ROOT, 1, &["A"]);
+        e1.execution_result.as_mut().unwrap().success = false;
+        let e2 = gamma_make_event("e2", SubnetId::ROOT, 2, &["A"]);
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![e1, e2]);
+        assert_eq!(kept.len(), 2);
+        assert!(deferred.is_empty());
+    }
+
+    // --- #7 no execution_result ---
+    #[test]
+    fn gamma_no_execution_result_not_blocking() {
+        let mut e1 = gamma_make_event("e1", SubnetId::ROOT, 1, &["A"]);
+        e1.execution_result = None;
+        let e2 = gamma_make_event("e2", SubnetId::ROOT, 2, &["A"]);
+        let (kept, _deferred) = apply_strict_same_key_fold_policy(vec![e1, e2]);
+        assert_eq!(kept.len(), 2, "events with no execution_result claim no keys");
+    }
+
+    // --- #8 cross-subnet target: same ObjectId in different subnets ---
+    #[test]
+    fn gamma_cross_subnet_target_subnet_respected() {
+        let subnet_a = SubnetId::ROOT;
+        let subnet_b = SubnetId::new_app_simple(7);
+        // Both write key "A", but into different subnets → disjoint ClaimedWriteKey.
+        let e1 = gamma_make_event("e1", subnet_a, 1, &["A"]);
+        let e2 = gamma_make_event("e2", subnet_b, 2, &["A"]);
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![e1, e2]);
+        assert_eq!(kept.len(), 2);
+        assert!(deferred.is_empty());
+    }
+
+    // --- #9 chain deferral of three same-key events ---
+    #[test]
+    fn gamma_chain_deferral_three_same_key_events() {
+        let events = vec![
+            gamma_make_event("e1", SubnetId::ROOT, 1, &["A"]),
+            gamma_make_event("e2", SubnetId::ROOT, 2, &["A"]),
+            gamma_make_event("e3", SubnetId::ROOT, 3, &["A"]),
+        ];
+        let (kept, deferred) = apply_strict_same_key_fold_policy(events);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "e1");
+        let deferred_ids: HashSet<_> = deferred.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(deferred_ids, ["e2".to_string(), "e3".to_string()].into_iter().collect());
+    }
+
+    // --- #10 multi-key write blocks on any intersect ---
+    #[test]
+    fn gamma_multi_key_write_blocks_any_intersect() {
+        let e1 = gamma_make_event("e1", SubnetId::ROOT, 1, &["A", "B"]);
+        let e2 = gamma_make_event("e2", SubnetId::ROOT, 2, &["B", "C"]);
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![e1, e2]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "e1");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].id, "e2");
+    }
+
+    // --- #11 governance target_subnet unification ---
+    // Both events target GOVERNANCE writing the same key → second deferred.
+    #[test]
+    fn gamma_governance_target_subnet_unification() {
+        // E1: subnet=ROOT, explicit target_subnet=GOVERNANCE for its state_change
+        let mut e1 = Event::new(
+            EventType::Governance,
+            vec![],
+            VLCSnapshot::default(),
+            "creator".to_string(),
+        );
+        e1.id = "e1".to_string();
+        e1.vlc_snapshot.logical_time = 1;
+        e1 = e1.with_subnet(SubnetId::ROOT);
+        e1.execution_result = Some(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange {
+                key: test_oid_key("G"),
+                old_value: None,
+                new_value: Some(vec![1u8; 8]),
+                target_subnet: Some(SubnetId::GOVERNANCE),
+            }],
+        });
+
+        // E2: subnet=GOVERNANCE, no explicit target → defaults to event subnet
+        let e2 = gamma_make_event("e2", SubnetId::GOVERNANCE, 2, &["G"]);
+
+        let (kept, deferred) = apply_strict_same_key_fold_policy(vec![e1, e2]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "e1");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].id, "e2");
+    }
+
+    // --- #12 Inv-γ-Sort: permutation invariant ---
+    #[test]
+    fn gamma_sort_stability_permutation_invariant() {
+        let make_input = || {
+            vec![
+                gamma_make_event("e3", SubnetId::ROOT, 3, &["A"]),
+                gamma_make_event("e1", SubnetId::ROOT, 1, &["B"]),
+                gamma_make_event("e2", SubnetId::ROOT, 2, &["A"]),
+                gamma_make_event("e4", SubnetId::ROOT, 4, &["C"]),
+            ]
+        };
+        let (kept_a, def_a) = apply_strict_same_key_fold_policy(make_input());
+        let mut perm = make_input();
+        perm.reverse();
+        let (kept_b, def_b) = apply_strict_same_key_fold_policy(perm);
+        let ids_a: Vec<_> = kept_a.iter().map(|e| e.id.clone()).collect();
+        let ids_b: Vec<_> = kept_b.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids_a, ids_b, "kept order must be permutation-invariant");
+        let def_ids_a: Vec<_> = def_a.iter().map(|e| e.id.clone()).collect();
+        let def_ids_b: Vec<_> = def_b.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(def_ids_a, def_ids_b, "deferred order must be permutation-invariant");
+    }
+
+    // --- #13 prepare_build defers same-key events across rounds ---
+    #[test]
+    fn gamma_prepare_build_defers_same_key() {
+        use crate::dag::Dag as ConsensusDag;
+        let builder = AnchorBuilder::new(gamma_config(100));
+        let mut dag = ConsensusDag::new();
+        for i in 0..3 {
+            let mut ev = gamma_make_event(&format!("e{}", i + 1), SubnetId::ROOT, (i + 1) as u64, &["HOT"]);
+            ev.parent_ids.clear();
+            dag.add_event_with_depth(ev, (i + 1) as u64)
+                .expect("add_event_with_depth");
+        }
+        let initial_pending = dag.get_pending_count();
+        assert_eq!(initial_pending, 3);
+
+        let mut vlc = VLC::new("node1".to_string());
+        for _ in 0..10 { vlc.tick(); }
+
+        // Round 1: γ keeps exactly 1 event
+        let empty_in_flight: HashSet<EventId> = HashSet::new();
+        let pending1 = builder
+            .prepare_build(&dag, &vlc, &empty_in_flight)
+            .expect("round 1 prepare_build");
+        assert_eq!(pending1.anchor.event_ids.len(), 1, "γ must keep exactly 1 same-key event");
+        // DAG pending is NOT mutated by γ — still 3
+        assert_eq!(dag.get_pending_count(), initial_pending, "γ must not mutate DAG pending");
+
+        // Round 2: same-DAG call without in_flight mask → same event kept again (deterministic)
+        let pending2 = builder
+            .prepare_build(&dag, &vlc, &empty_in_flight)
+            .expect("round 2 prepare_build");
+        assert_eq!(pending2.anchor.event_ids, pending1.anchor.event_ids);
+
+        // Round 3: mask out the Round-1 event → γ must now pick a different one
+        let mut mask: HashSet<EventId> = HashSet::new();
+        for id in &pending1.anchor.event_ids {
+            mask.insert(id.clone());
+        }
+        let pending3 = builder
+            .prepare_build(&dag, &vlc, &mask)
+            .expect("round 3 prepare_build");
+        assert_eq!(pending3.anchor.event_ids.len(), 1);
+        assert_ne!(pending3.anchor.event_ids[0], pending1.anchor.event_ids[0]);
+    }
+
+    // --- #14 max_events_per_cf respected by prepare_build (R4-1 bug fix) ---
+    // Core assertion: when candidate set > max_events_per_cf, anchor.event_ids
+    // length must equal max_events_per_cf AND events_root/state_root must be
+    // consistent with that same trimmed slice (no more pre-existing trim bug).
+    #[test]
+    fn gamma_prepare_build_respects_max_events_per_cf() {
+        use crate::dag::Dag as ConsensusDag;
+        let builder = AnchorBuilder::new(gamma_config(3));
+        let mut dag = ConsensusDag::new();
+        // 5 disjoint-key events — none will be γ-deferred, only capacity-trimmed.
+        for i in 0..5 {
+            let mut ev = gamma_make_event(
+                &format!("e{}", i + 1),
+                SubnetId::ROOT,
+                (i + 1) as u64,
+                &[&format!("K{}", i)],
+            );
+            ev.parent_ids.clear();
+            dag.add_event_with_depth(ev, (i + 1) as u64)
+                .expect("add_event_with_depth");
+        }
+
+        let mut vlc = VLC::new("node1".to_string());
+        for _ in 0..10 { vlc.tick(); }
+
+        let empty_in_flight: HashSet<EventId> = HashSet::new();
+        let pending = builder
+            .prepare_build(&dag, &vlc, &empty_in_flight)
+            .expect("prepare_build");
+
+        assert_eq!(
+            pending.anchor.event_ids.len(),
+            3,
+            "anchor.event_ids must be trimmed to max_events_per_cf",
+        );
+
+        // Recompute events_root from the event_ids in anchor; must match.
+        // This is the assertion that fails under the pre-existing trim bug:
+        // old code computed events_root on 5 events but only listed 3 event_ids.
+        let kept_events: Vec<Event> = {
+            let mut out = Vec::new();
+            for id in &pending.anchor.event_ids {
+                let ev = dag.get_event(id).expect("event in dag").clone();
+                out.push(ev);
+            }
+            out
+        };
+        let recomputed = compute_events_root(&kept_events);
+        assert_eq!(
+            *recomputed.as_bytes(),
+            pending.events_root,
+            "events_root must be computed on exactly the anchor.event_ids slice (pre-existing trim bug regression guard)",
+        );
+    }
+
+    // --- #15 heartbeat path applies γ + trim ---
+    #[test]
+    fn gamma_heartbeat_path_applies_filter() {
+        use crate::dag::Dag as ConsensusDag;
+        let builder = AnchorBuilder::new(gamma_config(100));
+        let mut dag = ConsensusDag::new();
+        for i in 0..2 {
+            let mut ev = gamma_make_event(&format!("hb{}", i + 1), SubnetId::ROOT, (i + 1) as u64, &["HK"]);
+            ev.parent_ids.clear();
+            dag.add_event_with_depth(ev, (i + 1) as u64)
+                .expect("add_event_with_depth");
+        }
+
+        let mut vlc = VLC::new("node1".to_string());
+        for _ in 0..5 { vlc.tick(); }
+
+        let empty_in_flight: HashSet<EventId> = HashSet::new();
+        // Fresh builder → elapsed_since_last_fold == Duration::MAX; any heartbeat_interval satisfied.
+        let pending = builder
+            .prepare_build_heartbeat(
+                &dag,
+                &vlc,
+                std::time::Duration::from_millis(1),
+                &empty_in_flight,
+            )
+            .expect("heartbeat prepare");
+        assert_eq!(pending.anchor.event_ids.len(), 1, "heartbeat γ keeps 1 of 2 same-key events");
+    }
+
+    // --- #16 force_prepare_build bypasses γ (still trims) ---
+    #[test]
+    fn gamma_force_prepare_build_bypasses_policy() {
+        let builder = AnchorBuilder::new(gamma_config(10));
+        let e1 = gamma_make_event("f1", SubnetId::ROOT, 1, &["SAME"]);
+        let e2 = gamma_make_event("f2", SubnetId::ROOT, 2, &["SAME"]);
+        let mut vlc = VLC::new("node1".to_string());
+        for _ in 0..3 { vlc.tick(); }
+        let pending = builder
+            .force_prepare_build(vec![e1, e2], &vlc, 1)
+            .expect("force_prepare_build");
+        assert_eq!(
+            pending.anchor.event_ids.len(),
+            2,
+            "force_prepare_build must bypass γ and keep both same-key events",
+        );
     }
 }
