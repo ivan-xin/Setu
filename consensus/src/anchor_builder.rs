@@ -761,6 +761,12 @@ impl AnchorBuilder {
                 }
             }
 
+            // Phase 3 H4 probes (design.md §5): record pre-apply base root,
+            // CF event-list fingerprint, and per-event post-apply deltas so we
+            // can pair leader vs follower evidence by cf_id.
+            #[cfg(feature = "diag-root-drift")]
+            Self::diag_h4_probes(&cf_id, "leader", &guard, &events);
+
             let summary = guard.apply_committed_events(&events);
             match guard.commit(anchor_id) {
                 Ok(()) => {
@@ -865,7 +871,13 @@ impl AnchorBuilder {
         // effect runs on the error path.
         let inner: Result<StateApplySummary, AnchorBuildError> = {
             let mut guard = self.shared.lock_write();
-            
+
+            // Phase 3 H4 probes (design.md §5): mirror leader-side probes on
+            // the follower so `same_key_divergence.sh` can pair pre_apply_root,
+            // events_fp, and event_apply_delta by cf_id across roles.
+            #[cfg(feature = "diag-root-drift")]
+            Self::diag_h4_probes(&cf.anchor.id, "follower", &guard, events);
+
             // 2. Verify state root (compute expected vs actual)
             if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
                 // Clone from write GSM under the lock
@@ -962,6 +974,84 @@ impl AnchorBuilder {
         Ok(state_summary)
     }
     
+    /// DIAG only: Phase 3 H4 instrumentation. Emits three probes per CF on
+    /// both leader and follower so that `tests/stress/same_key_divergence.sh`
+    /// can pair evidence across roles by `cf_id`:
+    ///
+    /// - `consensus::diag::pre_apply_base_root` — GSM root under the real
+    ///   write-lock, immediately before apply. If leader and follower disagree
+    ///   on this value for the same cf_id, divergence predates this CF.
+    /// - `consensus::diag::cf_event_fingerprint` — blake3 of the concatenated
+    ///   event-ids in input order. If this differs across roles, consensus
+    ///   delivery is non-deterministic (G1 violation).
+    /// - `consensus::diag::event_apply_delta` — post-apply root on a sandbox
+    ///   clone after every single event (in the same VLC-sorted order that
+    ///   `apply_committed_events` will use). Identifies the first event at
+    ///   which the two roles' roots diverge.
+    ///
+    /// Feature-gated on `diag-root-drift`; zero cost in production builds.
+    /// See docs/feat/consensus-root-self-consistency/design.md \u00a75.
+    #[cfg(feature = "diag-root-drift")]
+    fn diag_h4_probes(
+        cf_id: &str,
+        role: &'static str,
+        guard: &GlobalStateManager,
+        events: &[Event],
+    ) {
+        // P1 — pre-apply base root
+        let (pre_root, _) = guard.compute_global_root_bytes();
+        tracing::info!(
+            target: "consensus::diag::pre_apply_base_root",
+            cf_id = %cf_id,
+            role = %role,
+            pre_apply_root = %hex::encode(pre_root),
+            n_events = events.len(),
+            "DIAG P1: pre-apply base root"
+        );
+
+        // P2 — CF event-list fingerprint (blake3 over concatenated event-ids)
+        let mut hasher = blake3::Hasher::new();
+        for ev in events {
+            hasher.update(ev.id.as_bytes());
+            hasher.update(b"|");
+        }
+        let events_fp = hasher.finalize();
+        tracing::info!(
+            target: "consensus::diag::cf_event_fingerprint",
+            cf_id = %cf_id,
+            role = %role,
+            events_fp = %hex::encode(events_fp.as_bytes()),
+            n_events = events.len(),
+            "DIAG P2: CF event-list fingerprint"
+        );
+
+        // P3 — per-event post-apply deltas on a sandbox clone. Replicates the
+        // VLC-then-id sort done by `apply_committed_events` so the logged
+        // sequence matches production order exactly.
+        let mut sorted: Vec<&Event> = events.iter().collect();
+        sorted.sort_by(|a, b| {
+            match a.vlc_snapshot.logical_time.cmp(&b.vlc_snapshot.logical_time) {
+                std::cmp::Ordering::Equal => a.id.cmp(&b.id),
+                other => other,
+            }
+        });
+        let mut sandbox = guard.clone();
+        for (idx, ev) in sorted.iter().enumerate() {
+            let _ = sandbox.apply_committed_events(std::slice::from_ref(*ev));
+            let (r, _) = sandbox.compute_global_root_bytes();
+            tracing::debug!(
+                target: "consensus::diag::event_apply_delta",
+                cf_id = %cf_id,
+                role = %role,
+                event_idx = idx,
+                event_id = %ev.id,
+                event_type = ?ev.event_type,
+                post_event_root = %hex::encode(r),
+                "DIAG P3: per-event apply delta"
+            );
+        }
+    }
+
     /// DIAG only: structured dump of a follower's RootMismatch.
     ///
     /// Used by `apply_follower_finalized_cf` to capture enough per-CF state
