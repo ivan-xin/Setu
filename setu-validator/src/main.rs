@@ -521,7 +521,26 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } // end else (fresh genesis)
-    
+
+    // Phase 4 startup_root probe (consensus-root-self-consistency design.md §6.1):
+    // one-shot log of the post-genesis (or post-recovery) global state root so
+    // we can detect cross-node divergence BEFORE any DAG-BFT CF fires. This is
+    // the single check that distinguishes genesis non-determinism from
+    // pre-stress CF asymmetry. Feature-gated; zero cost when disabled.
+    #[cfg(feature = "diag-root-drift")]
+    {
+        let gsm = shared_state_manager.lock_write();
+        let (startup_root, subnet_roots) = (*gsm).compute_global_root_bytes();
+        tracing::info!(
+            target: "consensus::diag::startup_root",
+            node_id = %config.node_config.node_id,
+            source = if gsm_recovered { "recovered" } else { "genesis" },
+            startup_root = %hex::encode(startup_root),
+            subnet_count = subnet_roots.len(),
+            "DIAG P4: startup_root captured post-boot"
+        );
+    }
+
     // ========================================
     // Phase 2: P2P Network Startup
     // ========================================

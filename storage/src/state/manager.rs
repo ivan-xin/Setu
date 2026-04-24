@@ -1072,6 +1072,26 @@ impl GlobalStateManager {
         #[cfg(feature = "diag-root-drift")]
         let _diag_gate = InApplyGuard::enter();
 
+        // Phase 4 audit probe (design.md §6.1 item 2): fire on *every* call
+        // site of apply_committed_events — including Genesis/System paths,
+        // verify-clones, and reconstruction — so no caller escapes Phase 3
+        // coverage. Feature-gated to zero cost when disabled.
+        #[cfg(feature = "diag-root-drift")]
+        let _p4_pre_root = {
+            let (pre, _) = self.compute_global_root_bytes();
+            let first_id: &str = events.first().map(|e| e.id.as_str()).unwrap_or("");
+            let last_id: &str = events.last().map(|e| e.id.as_str()).unwrap_or("");
+            tracing::info!(
+                target: "storage::diag::apply_committed_events_audit",
+                pre_apply_root = %hex::encode(pre),
+                n_events = events.len(),
+                first_event_id = %first_id,
+                last_event_id = %last_id,
+                "DIAG P4: apply_committed_events entry"
+            );
+            pre
+        };
+
         let mut summary = StateApplySummary::new();
         
         // Sort events by VLC for deterministic ordering
@@ -1211,7 +1231,24 @@ impl GlobalStateManager {
                 );
             }
         }
-        
+
+        // Phase 4 audit probe (design.md §6.1 item 2): exit half. Log the
+        // post-apply root so pre/post pairs can be compared across every
+        // call site, not just DAG-BFT leader/follower paths.
+        #[cfg(feature = "diag-root-drift")]
+        {
+            let (post, _) = self.compute_global_root_bytes();
+            tracing::info!(
+                target: "storage::diag::apply_committed_events_audit",
+                pre_apply_root = %hex::encode(_p4_pre_root),
+                post_apply_root = %hex::encode(post),
+                n_events = events.len(),
+                n_conflicted = summary.conflicted_events.len(),
+                n_failed = summary.failed_events.len(),
+                "DIAG P4: apply_committed_events exit"
+            );
+        }
+
         summary
     }
     
