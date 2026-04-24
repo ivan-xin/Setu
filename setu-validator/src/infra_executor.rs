@@ -25,16 +25,16 @@
 //! Token operations (initial minting, airdrops) use the same RuntimeExecutor
 //! logic as TEE to maintain consistency.
 
-use setu_runtime::{RuntimeExecutor, ExecutionContext, ExecutionOutput, InMemoryStateStore};
-use setu_storage::{SharedStateManager, MerkleStateProvider};
+use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore};
+use setu_storage::MerkleStateProvider;
 use setu_types::{
-    Address, SubnetId,
+    Address,
     registration::{SubnetRegistration, UserRegistration},
-    event::{Event, EventPayload, ExecutionResult, StateChange as EventStateChange},
+    event::{Event, ExecutionResult, StateChange as EventStateChange},
 };
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::info;
 
 /// Infrastructure event executor for Validator
 ///
@@ -112,10 +112,10 @@ impl InfraExecutor {
             self.validator_id.clone(),
         );
 
-        // Apply state changes to the actual state provider first
-        self.apply_state_changes(&output)?;
-
-        // Set execution result — use canonical "oid:{hex}" key format
+        // Phase 5 (consensus-root-self-consistency): state changes are NOT
+        // applied to the write-GSM here. The canonical write path is
+        // `apply_committed_events` invoked from CF finalize. Eager-apply on
+        // the ingress validator caused cross-node SMT divergence (OBS-026).
         let state_changes: Vec<EventStateChange> = output.state_changes.iter()
             .map(|sc| sc.to_event_state_change())
             .collect();
@@ -191,10 +191,7 @@ impl InfraExecutor {
             self.validator_id.clone(),
         );
 
-        // Apply state changes first
-        self.apply_state_changes(&output)?;
-
-        // Use canonical "oid:{hex}" key format
+        // Phase 5: no eager apply — see execute_subnet_register note (OBS-026).
         let state_changes: Vec<EventStateChange> = output.state_changes.iter()
             .map(|sc| sc.to_event_state_change())
             .collect();
@@ -268,15 +265,15 @@ impl InfraExecutor {
             ));
         }
 
-        // 7. Eagerly apply state changes to MerkleStateProvider
-        {
-            let shared = self.state_provider.shared_state_manager();
-            let mut manager = shared.lock_write();
-            for sc in &state_changes {
-                manager.apply_state_change(SubnetId::ROOT, sc);
-            }
-            shared.publish_snapshot(&manager);
-        }
+        // Phase 5 (consensus-root-self-consistency / OBS-026): NO eager apply.
+        // The previous step 7 wrote directly to the ingress validator's
+        // write-GSM, causing cross-node SMT divergence because non-ingress
+        // validators only saw the write at CF finalize time. The canonical
+        // write path is `apply_committed_events` at CF finalize — same path
+        // used by follower validators. The ADR-4 duplicate-publish pre-check
+        // above (step 4) now only rejects against *confirmed* (CF-finalized)
+        // state; within-CF / concurrent duplicate publishes are caught by
+        // the conflict resolver at apply time.
 
         // 8. Build Event
         let mut event = Event::contract_publish(
@@ -304,27 +301,17 @@ impl InfraExecutor {
         Ok(event)
     }
 
-    /// Apply state changes to the MerkleStateProvider
-    ///
-    /// Routes through `apply_state_change()` which handles both SMT updates
-    /// AND coin index updates (coin_type_index, owner_coin_index).
-    fn apply_state_changes(&self, output: &ExecutionOutput) -> Result<(), String> {
-        // Get write access to the state manager
-        let shared = self.state_provider.shared_state_manager();
-        let mut manager = shared.lock_write();
-
-        for sc in &output.state_changes {
-            // Convert to event-layer StateChange with canonical "oid:{hex}" key format
-            // and route through apply_state_change for proper SMT + index updates
-            let event_sc = sc.to_event_state_change();
-            manager.apply_state_change(SubnetId::ROOT, &event_sc);
-        }
-        
-        // Publish snapshot so read path sees the infra changes immediately
-        shared.publish_snapshot(&manager);
-
-        Ok(())
-    }
+    // Phase 5 (2026-04-24, consensus-root-self-consistency / OBS-026):
+    // The `apply_state_changes` helper was removed. It was the shared
+    // ingress-only eager-apply that caused cross-node SMT divergence:
+    // only the ingress validator saw the state, followers only observed it
+    // at CF finalize → base-state mismatch → `RootMismatch` → follower
+    // "syncing metadata only" path permanently encoded the split. All six
+    // infra executors (subnet_register, user_register, contract_publish,
+    // profile_update, subnet_join, subnet_leave) now rely exclusively on
+    // the canonical CF-apply path via `apply_committed_events`. Clients
+    // needing read-your-writes for infra objects must wait for CF
+    // confirmation (GET /api/v1/events/{id}) before querying state.
 
     // ========== Phase 3: Profile & Subnet Membership ==========
 
@@ -371,8 +358,7 @@ impl InfraExecutor {
             setu_types::event::EventType::System, vec![], vlc_snapshot, self.validator_id.clone(),
         );
 
-        self.apply_state_changes(&output)?;
-
+        // Phase 5: no eager apply — see execute_subnet_register note (OBS-026).
         let state_changes: Vec<EventStateChange> = output.state_changes.iter()
             .map(|sc| sc.to_event_state_change())
             .collect();
@@ -426,8 +412,7 @@ impl InfraExecutor {
             setu_types::event::EventType::System, vec![], vlc_snapshot, self.validator_id.clone(),
         );
 
-        self.apply_state_changes(&output)?;
-
+        // Phase 5: no eager apply — see execute_subnet_register note (OBS-026).
         let state_changes: Vec<EventStateChange> = output.state_changes.iter()
             .map(|sc| sc.to_event_state_change())
             .collect();
@@ -481,8 +466,7 @@ impl InfraExecutor {
             setu_types::event::EventType::System, vec![], vlc_snapshot, self.validator_id.clone(),
         );
 
-        self.apply_state_changes(&output)?;
-
+        // Phase 5: no eager apply — see execute_subnet_register note (OBS-026).
         let state_changes: Vec<EventStateChange> = output.state_changes.iter()
             .map(|sc| sc.to_event_state_change())
             .collect();
@@ -500,7 +484,8 @@ impl InfraExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_storage::GlobalStateManager;
+    use setu_storage::{GlobalStateManager, SharedStateManager};
+    use setu_types::SubnetId;
 
     #[test]
     fn test_subnet_register() {
@@ -679,19 +664,34 @@ mod tests {
 
     #[test]
     fn test_execute_contract_publish_adr4_duplicate() {
+        // Phase 5 update (OBS-026): execute_contract_publish no longer eagerly
+        // applies state. The ADR-4 duplicate-publish pre-check only fires
+        // against *CF-finalized* state. To exercise it, we manually inject
+        // the module key into the write-GSM to simulate a finalized prior CF,
+        // then attempt a second publish and assert the ADR-4 error.
         let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
         let provider = Arc::new(MerkleStateProvider::new(Arc::clone(&shared)));
-        let executor = InfraExecutor::new("validator-1".to_string(), provider);
+        let executor = InfraExecutor::new("validator-1".to_string(), Arc::clone(&provider));
 
         let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead")
             .expect("valid addr");
         let module_bytes = make_module_bytes(addr, "counter");
 
-        // First publish succeeds
+        // First publish succeeds (returns an event; no state written yet)
         let result1 = executor.execute_contract_publish("alice", &[module_bytes.clone()], test_vlc());
         assert!(result1.is_ok());
 
-        // Second publish of same module fails (ADR-4)
+        // Simulate the first CF finalizing: write the module key directly.
+        // In production this is done by `apply_committed_events` on every node.
+        {
+            let mut gsm = shared.lock_write();
+            let module_key = format!("mod:{}::{}", addr.to_hex_literal(), "counter");
+            let sc = EventStateChange::insert(module_key, module_bytes.clone());
+            gsm.apply_state_change(SubnetId::ROOT, &sc);
+            shared.publish_snapshot(&gsm);
+        }
+
+        // Second publish of same module now fails (ADR-4) against confirmed state
         let result2 = executor.execute_contract_publish("alice", &[module_bytes], test_vlc());
         assert!(result2.is_err());
         assert!(result2.unwrap_err().contains("ADR-4"));
