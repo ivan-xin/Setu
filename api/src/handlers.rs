@@ -86,8 +86,12 @@ pub trait ValidatorService: Send + Sync {
     /// Submit a Move module publish
     fn submit_move_publish(&self, request: MovePublishRequest) -> impl std::future::Future<Output = MovePublishResponse> + Send;
 
-    /// Query a Move object by object ID (hex)
-    fn get_move_object(&self, object_id: &str) -> GetMoveObjectResponse;
+    /// Query a Move object by object ID (hex).
+    ///
+    /// When `finalized` is true, bypass the speculative overlay and read the
+    /// committed SMT only. Required for cross-validator state comparisons
+    /// (see docs/bugs/20260424-state-get-overlay-leak-cross-node.md).
+    fn get_move_object(&self, object_id: &str, finalized: bool) -> GetMoveObjectResponse;
 
     /// Query module ABI (function list)
     fn get_module_abi(&self, address: &str, name: &str) -> GetModuleAbiResponse;
@@ -356,12 +360,22 @@ pub async fn http_submit_move_publish<S: ValidatorService>(
     Json(service.submit_move_publish(request).await)
 }
 
+/// Query parameters for Move object lookup.
+#[derive(Debug, Deserialize, Default)]
+pub struct GetMoveObjectQuery {
+    /// If true, read committed SMT only (bypass speculative overlay).
+    /// Default false preserves read-your-writes semantics for clients on the
+    /// same node that submitted a write.
+    pub finalized: Option<bool>,
+}
+
 /// Query a Move object by object ID (hex)
 pub async fn http_get_move_object<S: ValidatorService>(
     State(service): State<Arc<S>>,
     axum::extract::Path(object_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<GetMoveObjectQuery>,
 ) -> Json<GetMoveObjectResponse> {
-    Json(service.get_move_object(&object_id))
+    Json(service.get_move_object(&object_id, q.finalized.unwrap_or(false)))
 }
 
 /// Query a module's ABI (function list)

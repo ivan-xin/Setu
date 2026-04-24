@@ -758,8 +758,13 @@ impl ValidatorNetworkService {
         response
     }
 
-    /// Query a Move object by its hex object ID
-    pub fn get_move_object(&self, object_id_hex: &str) -> setu_api::GetMoveObjectResponse {
+    /// Query a Move object by its hex object ID.
+    ///
+    /// When `finalized` is true, read the committed SMT only (bypass the
+    /// speculative overlay). This is required for cross-validator state
+    /// comparisons because the overlay is only populated on the node that
+    /// staged the write. See docs/bugs/20260424-state-get-overlay-leak-cross-node.md.
+    pub fn get_move_object(&self, object_id_hex: &str, finalized: bool) -> setu_api::GetMoveObjectResponse {
         let stripped = object_id_hex.strip_prefix("0x").unwrap_or(object_id_hex);
         let key = format!("oid:{}", stripped);
 
@@ -778,7 +783,12 @@ impl ValidatorNetworkService {
                 };
             }
         };
-        let data = match self.task_preparer.state_provider().get_object(&object_id) {
+        let provider = self.task_preparer.state_provider();
+        let data = match if finalized {
+            provider.get_object_finalized(&object_id)
+        } else {
+            provider.get_object(&object_id)
+        } {
             Some(d) => d,
             None => {
                 return setu_api::GetMoveObjectResponse {
@@ -1299,8 +1309,8 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
         self.submit_move_publish(request).await
     }
 
-    fn get_move_object(&self, object_id: &str) -> setu_api::GetMoveObjectResponse {
-        self.get_move_object(object_id)
+    fn get_move_object(&self, object_id: &str, finalized: bool) -> setu_api::GetMoveObjectResponse {
+        self.get_move_object(object_id, finalized)
     }
 
     fn get_module_abi(&self, address: &str, name: &str) -> setu_api::GetModuleAbiResponse {

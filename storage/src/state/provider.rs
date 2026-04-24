@@ -110,6 +110,15 @@ pub trait StateProvider: Send + Sync {
     /// Get object data by ID
     fn get_object(&self, object_id: &ObjectId) -> Option<Vec<u8>>;
 
+    /// Get object data by ID, bypassing any speculative overlay.
+    ///
+    /// Returns committed SMT bytes only. Implementations that do not maintain a
+    /// speculative overlay may delegate to `get_object`. Required for cross-node
+    /// state comparisons; see docs/bugs/20260424-state-get-overlay-leak-cross-node.md.
+    fn get_object_finalized(&self, object_id: &ObjectId) -> Option<Vec<u8>> {
+        self.get_object(object_id)
+    }
+
     /// Get current global state root
     fn get_state_root(&self) -> [u8; 32];
 
@@ -328,9 +337,26 @@ impl MerkleStateProvider {
         self.shared.load_overlay_view().get_subnet_object(subnet_id, object_id_bytes)
     }
 
+    /// Get object from a specific subnet SMT, bypassing the speculative overlay.
+    ///
+    /// Use this for queries that must only return committed state (e.g., to
+    /// compare state across validators). The overlay-merged read is not
+    /// cross-validator consistent until every pending CF has finalized; see
+    /// docs/bugs/20260424-state-get-overlay-leak-cross-node.md.
+    pub fn get_object_from_subnet_finalized(&self, object_id_bytes: &[u8; 32], subnet_id: &SubnetId) -> Option<Vec<u8>> {
+        let snapshot = self.shared.load_snapshot();
+        let hv = HashValue::from_slice(object_id_bytes).ok()?;
+        snapshot.get_subnet(subnet_id)?.get(&hv).cloned()
+    }
+
     /// Get object from the default subnet (ROOT), merged with overlay.
     fn get_object_internal(&self, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
         self.get_object_from_subnet(object_id_bytes, &self.default_subnet)
+    }
+
+    /// Get object from the default subnet (ROOT), SMT-only (overlay bypassed).
+    fn get_object_internal_finalized(&self, object_id_bytes: &[u8; 32]) -> Option<Vec<u8>> {
+        self.get_object_from_subnet_finalized(object_id_bytes, &self.default_subnet)
     }
 
     /// Get Merkle proof from a specific subnet SMT
@@ -427,6 +453,10 @@ impl StateProvider for MerkleStateProvider {
 
     fn get_object(&self, object_id: &ObjectId) -> Option<Vec<u8>> {
         self.get_object_internal(object_id.as_bytes())
+    }
+
+    fn get_object_finalized(&self, object_id: &ObjectId) -> Option<Vec<u8>> {
+        self.get_object_internal_finalized(object_id.as_bytes())
     }
 
     fn get_state_root(&self) -> [u8; 32] {
@@ -917,6 +947,30 @@ mod tests {
         let provider = MerkleStateProvider::new(shared);
         let data = provider.get_object(&ObjectId::new([0xA0u8; 32]));
         assert_eq!(data, Some(b"overlay_bytes".to_vec()));
+    }
+
+    /// Regression test for OBS-028 / docs/bugs/20260424-state-get-overlay-leak-cross-node.md:
+    /// `get_object_finalized` must bypass the speculative overlay so cross-node
+    /// state comparisons see only committed SMT bytes.
+    #[test]
+    fn merkle_provider_get_object_finalized_bypasses_overlay() {
+        use setu_types::event::StateChange;
+
+        let shared = make_shared_with_init(|_| {}); // empty SMT
+        shared
+            .stage_overlay(
+                "E1",
+                SubnetId::ROOT,
+                &[StateChange::insert(oid_key_str(0xB0), b"overlay_only".to_vec())],
+            )
+            .unwrap();
+
+        let provider = MerkleStateProvider::new(shared);
+        let oid = ObjectId::new([0xB0u8; 32]);
+        // Overlay-merged read sees the staged bytes...
+        assert_eq!(provider.get_object(&oid), Some(b"overlay_only".to_vec()));
+        // ...but the finalized read must NOT (SMT is empty until CF finalizes).
+        assert_eq!(provider.get_object_finalized(&oid), None);
     }
 
     #[test]
