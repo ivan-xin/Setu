@@ -418,7 +418,17 @@ impl SetuMoveEngine {
         base_version: u64,
     ) -> Result<Vec<MoveStateChange>, RuntimeError> {
         let mut changes = vec![];
-        let new_version = base_version + 1;
+        // Per-object monotonic version: prefer `input.version + 1` (so each
+        // mutation strictly bumps the on-disk version), fall back to
+        // `base_version + 1` for newly-created objects with no preloaded
+        // input. See docs/feat/fix-envelope-version-not-bumped-on-mut/design.md.
+        let next_version_for = |id: &ObjectId| -> u64 {
+            results
+                .input_objects
+                .get(id)
+                .map(|inp| inp.version + 1)
+                .unwrap_or(base_version + 1)
+        };
 
         // Transfers (creates + updates). Skip objects that were shared or
         // frozen in the same TX — share/freeze are terminal ownership transitions.
@@ -427,6 +437,7 @@ impl SetuMoveEngine {
                 continue;
             }
             let new_owner = move_addr_to_setu(&effect.new_owner);
+            let new_version = next_version_for(id);
             let envelope = ObjectEnvelope::from_move_result(
                 *id,
                 new_owner,
@@ -486,6 +497,7 @@ impl SetuMoveEngine {
                 .map(|i| i.ownership)
                 .unwrap_or(Ownership::AddressOwner(Address::ZERO));
 
+            let new_version = next_version_for(id);
             let envelope = ObjectEnvelope::from_move_result(
                 *id,
                 owner,
@@ -510,6 +522,7 @@ impl SetuMoveEngine {
                 .map(|i| i.owner)
                 .unwrap_or(Address::ZERO);
 
+            let new_version = next_version_for(id);
             let envelope = ObjectEnvelope::from_move_result(
                 *id,
                 owner,
@@ -537,6 +550,7 @@ impl SetuMoveEngine {
             // traceability; the `ownership` enum is the source of truth.
             let owner = input.map(|i| i.owner).unwrap_or(Address::ZERO);
 
+            let new_version = next_version_for(id);
             let envelope = ObjectEnvelope::from_move_result(
                 *id,
                 owner,
@@ -613,7 +627,8 @@ impl SetuMoveEngine {
             "df_created ∩ df_deleted must be empty; natives mode-check invariant violated"
         );
 
-        // DF creates
+        // DF creates — first envelope written, version starts at base_version + 1
+        // (which is `1` in production where current_version is hardcoded to 0).
         for (df_oid, eff) in &results.df_created {
             let envelope = build_df_envelope(
                 *df_oid,
@@ -622,7 +637,7 @@ impl SetuMoveEngine {
                 &eff.key_bcs,
                 &eff.value_type_tag,
                 &eff.value_bcs,
-                new_version,
+                base_version + 1,
             );
             changes.push(MoveStateChange {
                 object_id: *df_oid,
@@ -638,6 +653,18 @@ impl SetuMoveEngine {
             // so `old_state` matches the current SMT byte-for-byte. Rebuilding
             // with `base_version` would produce a different envelope version
             // than what is on disk and trigger a false stale_read at CF apply.
+            //
+            // Per-object version bump (fix-envelope-version-not-bumped-on-mut):
+            // when on_disk_envelope is present, parse its version and use
+            // `prior_version + 1`. Otherwise fall back to `base_version + 1`.
+            let prior_version = eff
+                .on_disk_envelope
+                .as_ref()
+                .and_then(|b| ObjectEnvelope::from_bytes(b))
+                .map(|env| env.metadata.version)
+                .unwrap_or(base_version);
+            let new_version = prior_version + 1;
+
             let old_state_bytes = match &eff.on_disk_envelope {
                 Some(b) => b.clone(),
                 None => build_df_envelope(
@@ -647,7 +674,7 @@ impl SetuMoveEngine {
                     &eff.key_bcs,
                     &eff.value_type_tag,
                     &eff.old_value_bcs,
-                    base_version,
+                    prior_version,
                 )
                 .to_bytes(),
             };
@@ -1077,6 +1104,214 @@ mod tests {
             ),
         }
         assert_eq!(new_env.metadata.version, 8, "version bumped by 1");
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // fix-envelope-version-not-bumped-on-mut: per-object version
+    // must be `input.version + 1`, not a single TX-wide constant.
+    // ───────────────────────────────────────────────────────────
+
+    /// U1: mutated effect with input.version=42 → new envelope version 43,
+    /// regardless of the `base_version` argument (which is the TX-wide
+    /// fallback used only when no input is preloaded).
+    #[test]
+    fn test_mutated_bumps_from_input_version_not_base() {
+        use crate::object_runtime::ObjectMutationEffect;
+        use indexmap::{IndexMap, IndexSet};
+        use setu_types::{
+            object::{Address, ObjectId},
+            Ownership,
+        };
+        use std::collections::BTreeMap;
+        use std::str::FromStr;
+
+        let engine = SetuMoveEngine::new().expect("engine init");
+        let id = ObjectId::new([0xAB; 32]);
+        let owner = Address::new([0x33; 32]);
+        let tag = move_core_types::language_storage::StructTag::from_str(
+            "0x1::widget::Widget",
+        )
+        .unwrap();
+
+        let pre_envelope = ObjectEnvelope::from_move_result(
+            id,
+            owner,
+            42, // pre-mutation version
+            Ownership::AddressOwner(owner),
+            tag.to_string(),
+            vec![],
+        );
+        let input = InputObject {
+            id,
+            owner,
+            ownership: Ownership::AddressOwner(owner),
+            version: 42,
+            envelope_bytes: pre_envelope.to_bytes(),
+            move_data: vec![],
+            type_tag: tag.clone(),
+        };
+        let mut input_objects = BTreeMap::new();
+        input_objects.insert(id, input);
+        let mut mutated = IndexMap::new();
+        mutated.insert(
+            id,
+            ObjectMutationEffect {
+                type_tag: tag,
+                bcs_bytes: vec![0xCA, 0xFE],
+            },
+        );
+        let results = ObjectRuntimeResults {
+            input_objects,
+            created_ids: IndexSet::new(),
+            deleted_ids: IndexSet::new(),
+            transfers: IndexMap::new(),
+            frozen: IndexMap::new(),
+            shared: IndexMap::new(),
+            mutated,
+            emitted_events: vec![],
+            df_created: IndexMap::new(),
+            df_mutated: IndexMap::new(),
+            df_deleted: IndexMap::new(),
+        };
+
+        // Pass an unrelated `base_version` to prove input.version is the
+        // source of truth, not base_version.
+        let changes = engine
+            .convert_results_to_state_changes(&results, 0)
+            .expect("convert ok");
+        assert_eq!(changes.len(), 1);
+        let new_env = ObjectEnvelope::from_bytes(
+            changes[0].new_state.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_env.metadata.version, 43,
+            "per-object version: 42 + 1 = 43"
+        );
+    }
+
+    /// U2: mutation with NO input_objects entry falls back to
+    /// `base_version + 1` (defense-in-depth path; not exercised by the
+    /// Move VM in practice but covered for safety).
+    #[test]
+    fn test_mutated_no_input_falls_back_to_base() {
+        use crate::object_runtime::ObjectMutationEffect;
+        use indexmap::{IndexMap, IndexSet};
+        use std::collections::BTreeMap;
+        use std::str::FromStr;
+
+        let engine = SetuMoveEngine::new().expect("engine init");
+        let id = ObjectId::new([0xCD; 32]);
+        let tag = move_core_types::language_storage::StructTag::from_str(
+            "0x1::widget::Widget",
+        )
+        .unwrap();
+
+        let mut mutated = IndexMap::new();
+        mutated.insert(
+            id,
+            ObjectMutationEffect {
+                type_tag: tag,
+                bcs_bytes: vec![0xFE],
+            },
+        );
+        let results = ObjectRuntimeResults {
+            input_objects: BTreeMap::new(), // empty: no preloaded input
+            created_ids: IndexSet::new(),
+            deleted_ids: IndexSet::new(),
+            transfers: IndexMap::new(),
+            frozen: IndexMap::new(),
+            shared: IndexMap::new(),
+            mutated,
+            emitted_events: vec![],
+            df_created: IndexMap::new(),
+            df_mutated: IndexMap::new(),
+            df_deleted: IndexMap::new(),
+        };
+
+        let changes = engine
+            .convert_results_to_state_changes(&results, 17)
+            .expect("convert ok");
+        assert_eq!(changes.len(), 1);
+        let new_env = ObjectEnvelope::from_bytes(
+            changes[0].new_state.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_env.metadata.version, 18,
+            "fallback when no input: base_version + 1 = 17 + 1"
+        );
+    }
+
+    /// U3: df_mutated with `on_disk_envelope` set (version=10) → new
+    /// envelope version 11, ignoring `base_version`. This exercises the
+    /// parse-and-bump branch of the DF mutate path.
+    #[test]
+    fn test_df_mutate_bumps_from_on_disk_envelope_version() {
+        use crate::object_runtime::DfMutateEffect;
+        use indexmap::{IndexMap, IndexSet};
+        use setu_types::{object::ObjectId, Ownership};
+        use std::collections::BTreeMap;
+
+        let engine = SetuMoveEngine::new().expect("engine init");
+        let parent = ObjectId::new([0xAA; 32]);
+        let df_oid = ObjectId::new([0xBB; 32]);
+
+        // Build the on-disk envelope with version=10.
+        let prior_env = build_df_envelope(
+            df_oid,
+            parent,
+            "u64",
+            &[1u8; 8],
+            "u64",
+            &[0xAA; 8],
+            10,
+        );
+        let mut df_mutated = IndexMap::new();
+        df_mutated.insert(
+            df_oid,
+            DfMutateEffect {
+                parent,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![1u8; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![0xAA; 8],
+                new_value_bcs: vec![0xBB; 8],
+                on_disk_envelope: Some(prior_env.to_bytes()),
+            },
+        );
+        let results = ObjectRuntimeResults {
+            input_objects: BTreeMap::new(),
+            created_ids: IndexSet::new(),
+            deleted_ids: IndexSet::new(),
+            transfers: IndexMap::new(),
+            frozen: IndexMap::new(),
+            shared: IndexMap::new(),
+            mutated: IndexMap::new(),
+            emitted_events: vec![],
+            df_created: IndexMap::new(),
+            df_mutated,
+            df_deleted: IndexMap::new(),
+        };
+
+        // Use base=0 to prove on_disk_envelope.version is the source.
+        let changes = engine
+            .convert_results_to_state_changes(&results, 0)
+            .expect("convert ok");
+        assert_eq!(changes.len(), 1);
+        let new_env = ObjectEnvelope::from_bytes(
+            changes[0].new_state.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_env.metadata.version, 11,
+            "DF mutate version: prior(10) + 1 = 11"
+        );
+        // Parent linkage preserved.
+        match new_env.metadata.ownership {
+            Ownership::ObjectOwner(p) => assert_eq!(p, parent),
+            other => panic!("expected ObjectOwner, got {:?}", other),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
