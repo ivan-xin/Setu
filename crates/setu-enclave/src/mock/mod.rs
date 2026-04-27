@@ -928,8 +928,13 @@ impl MockEnclave {
                 let shared_id_set: std::collections::HashSet<setu_types::ObjectId> =
                     payload.shared_object_ids.iter().copied().collect();
 
-                let input_objects: Vec<InputObject> = resolved_inputs.input_objects.iter()
-                    .map(|ro| {
+                // Slices are tiny (typically n ≤ 4); `.contains` on a slice
+                // is cheaper than building a HashSet here.
+                let mutable_idx_slice = payload.mutable_indices.as_deref().unwrap_or(&[]);
+                let consumed_idx_slice = payload.consumed_indices.as_deref().unwrap_or(&[]);
+
+                let input_objects: Vec<InputObject> = resolved_inputs.input_objects.iter().enumerate()
+                    .map(|(idx, ro)| {
                         let env = local_runtime.state().get_envelope(&ro.object_id)
                             .map_err(|e| format!("Failed to get envelope for {}: {}", ro.object_id, e))?
                             .ok_or_else(|| format!("Object {} not found in store", ro.object_id))?;
@@ -944,7 +949,22 @@ impl MockEnclave {
                                     ));
                                 }
                             }
-                            setu_types::Ownership::Immutable => { /* anyone can read */ }
+                            setu_types::Ownership::Immutable => {
+                                // Defense-in-depth mirror of TaskPreparer
+                                // (see docs/feat/fix-immutable-mutable-ref-not-blocked).
+                                if mutable_idx_slice.contains(&idx) {
+                                    return Err(format!(
+                                        "Object {} is Immutable, rejected for &mut binding at index {}",
+                                        ro.object_id, idx
+                                    ));
+                                }
+                                if consumed_idx_slice.contains(&idx) {
+                                    return Err(format!(
+                                        "Object {} is Immutable, rejected for by-value consumption at index {}",
+                                        ro.object_id, idx
+                                    ));
+                                }
+                            }
                             setu_types::Ownership::ObjectOwner(_) => {
                                 // Owned by another object (e.g. a dynamic
                                 // field entry). Sender authorization is

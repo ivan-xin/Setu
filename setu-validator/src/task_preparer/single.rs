@@ -929,7 +929,11 @@ impl TaskPreparer {
         let mut read_set = Vec::new();
         let mut resolved_objects = Vec::new();
 
-        for object_id in &call.input_object_ids {
+        // Slices are tiny (typically n ≤ 4), `.contains` is fine without HashSet.
+        let mutable_idx_slice = call.mutable_indices.as_deref().unwrap_or(&[]);
+        let consumed_idx_slice = call.consumed_indices.as_deref().unwrap_or(&[]);
+
+        for (idx, object_id) in call.input_object_ids.iter().enumerate() {
             let data = self.state_provider.get_object(object_id)
                 .ok_or_else(|| TaskPrepareError::ObjectNotFound(
                     hex::encode(object_id.as_bytes()),
@@ -950,7 +954,23 @@ impl TaskPreparer {
                                 });
                             }
                         }
-                        setu_types::Ownership::Immutable => { /* anyone can read */ }
+                        setu_types::Ownership::Immutable => {
+                            // Frozen objects: read-only by anyone, but must
+                            // not be bound to `&mut T` or consumed by-value.
+                            // See docs/feat/fix-immutable-mutable-ref-not-blocked.
+                            if mutable_idx_slice.contains(&idx) {
+                                return Err(TaskPrepareError::ImmutableObjectCannotBeMutated {
+                                    object_id: hex::encode(object_id.as_bytes()),
+                                    index: idx,
+                                });
+                            }
+                            if consumed_idx_slice.contains(&idx) {
+                                return Err(TaskPrepareError::ImmutableObjectCannotBeConsumed {
+                                    object_id: hex::encode(object_id.as_bytes()),
+                                    index: idx,
+                                });
+                            }
+                        }
                         setu_types::Ownership::ObjectOwner(_) => {
                             // Owned by another object (e.g. a dynamic field
                             // entry). Sender authorization is proxied through
@@ -1852,6 +1872,150 @@ mod tests {
 
         let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
         assert!(result.is_ok(), "Any sender should be able to read immutable object: {:?}", result.err());
+    }
+
+    // ========== Immutable mutate/consume rejection tests
+    // (docs/feat/fix-immutable-mutable-ref-not-blocked) ==========
+
+    /// Helper for the Immutable-rejection suite: build a preparer whose only
+    /// owned object at `obj_id` is `Immutable`, with a stored module under
+    /// the standard test address `0xdead::counter`.
+    fn make_immutable_preparer(obj_id: ObjectId) -> (TaskPreparer, String) {
+        let alice = setu_types::Address::normalize("alice");
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::Immutable,
+            Some((&module_key, &bytecode)),
+        );
+        (preparer, addr.to_hex_literal())
+    }
+
+    #[test]
+    fn test_immutable_in_mutable_indices_rejected() {
+        let obj_id = ObjectId::new([0x61; 32]);
+        let (preparer, pkg) = make_immutable_preparer(obj_id);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![obj_id];
+        call.mutable_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        match result {
+            Err(TaskPrepareError::ImmutableObjectCannotBeMutated { index, .. }) => {
+                assert_eq!(index, 0, "should report the offending index");
+            }
+            other => panic!("expected ImmutableObjectCannotBeMutated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_immutable_in_consumed_indices_rejected() {
+        let obj_id = ObjectId::new([0x62; 32]);
+        let (preparer, pkg) = make_immutable_preparer(obj_id);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![obj_id];
+        call.consumed_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        match result {
+            Err(TaskPrepareError::ImmutableObjectCannotBeConsumed { index, .. }) => {
+                assert_eq!(index, 0);
+            }
+            other => panic!("expected ImmutableObjectCannotBeConsumed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_immutable_read_only_accepted() {
+        // Frozen object passed in input_object_ids but NOT marked mutable
+        // or consumed: still the long-standing "anyone can read" path.
+        let obj_id = ObjectId::new([0x63; 32]);
+        let (preparer, pkg) = make_immutable_preparer(obj_id);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![obj_id];
+        // mutable_indices and consumed_indices remain None.
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(result.is_ok(),
+            "Read-only Immutable should pass, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_address_owner_mutable_still_accepted_regression() {
+        // Regression: AddressOwner in mutable_indices is the normal PWOO
+        // happy path and must continue to work.
+        let alice = setu_types::Address::normalize("alice");
+        let obj_id = ObjectId::new([0x64; 32]);
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+        let preparer = make_preparer_with_owned_object(
+            obj_id, alice,
+            setu_types::Ownership::AddressOwner(alice),
+            Some((&module_key, &bytecode)),
+        );
+
+        let event = test_event();
+        let mut call = test_move_call_payload(&addr.to_hex_literal(), "counter", "increment");
+        call.sender = alice.to_string().strip_prefix("0x").unwrap_or("alice").to_string();
+        call.input_object_ids = vec![obj_id];
+        call.mutable_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(result.is_ok(),
+            "AddressOwner+mutable_indices is the PWOO happy path, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_immutable_index_error_carries_oid() {
+        let obj_id = ObjectId::new([0x65; 32]);
+        let (preparer, pkg) = make_immutable_preparer(obj_id);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![obj_id];
+        call.mutable_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        match result {
+            Err(TaskPrepareError::ImmutableObjectCannotBeMutated { object_id, index }) => {
+                assert_eq!(index, 0);
+                assert_eq!(object_id, hex::encode(obj_id.as_bytes()),
+                    "error must echo the offending object id in hex");
+            }
+            other => panic!("expected ImmutableObjectCannotBeMutated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_immutable_index_consumed_takes_priority_over_read() {
+        // If an Immutable object appears in BOTH mutable_indices AND
+        // consumed_indices, the loop checks mutable first and we should
+        // surface ImmutableObjectCannotBeMutated. (Consistency anchor: the
+        // first violation found is the one reported.)
+        let obj_id = ObjectId::new([0x66; 32]);
+        let (preparer, pkg) = make_immutable_preparer(obj_id);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![obj_id];
+        call.mutable_indices = Some(vec![0]);
+        call.consumed_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result, Err(TaskPrepareError::ImmutableObjectCannotBeMutated { .. })),
+            "mutable_indices is checked first, got {:?}", result);
     }
 
     #[test]

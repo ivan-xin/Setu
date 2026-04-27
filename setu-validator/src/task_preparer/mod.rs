@@ -115,6 +115,19 @@ pub enum TaskPrepareError {
     #[error("Object {object_id} not owned by sender {sender}")]
     NotOwnedBySender { object_id: String, sender: String },
 
+    /// Caller declared an `Immutable` object at `index` of `input_object_ids`
+    /// but the same index appears in `mutable_indices`. Frozen objects
+    /// must not be bound to `&mut T` Move parameters.
+    /// See `docs/feat/fix-immutable-mutable-ref-not-blocked/design.md` §2.
+    #[error("Object {object_id} is Immutable and cannot be passed as &mut at index {index}")]
+    ImmutableObjectCannotBeMutated { object_id: String, index: usize },
+
+    /// Caller declared an `Immutable` object at `index` of `input_object_ids`
+    /// but the same index appears in `consumed_indices`. Frozen objects
+    /// must not be consumed by-value.
+    #[error("Object {object_id} is Immutable and cannot be consumed by-value at index {index}")]
+    ImmutableObjectCannotBeConsumed { object_id: String, index: usize },
+
     // ---- PWOO (Phase-1 Writable Owned Objects) errors ----
     /// Caller passed a shared object through `input_object_ids`. Shared objects
     /// must be declared via `shared_object_ids` so the preparer can mark them
