@@ -971,13 +971,18 @@ impl TaskPreparer {
                                 });
                             }
                         }
-                        setu_types::Ownership::ObjectOwner(_) => {
-                            // Owned by another object (e.g. a dynamic field
-                            // entry). Sender authorization is proxied through
-                            // the parent object — which must itself appear in
-                            // input_object_ids / shared_object_ids and be
-                            // authorized there. See docs/feat/dynamic-fields/
-                            // design.md §3.8.
+                        setu_types::Ownership::ObjectOwner(parent) => {
+                            // DF entries (the only producer of ObjectOwner today)
+                            // must be accessed via `dynamic_field_accesses[]`,
+                            // never through raw `input_object_ids[]`. Allowing
+                            // the raw path would bypass parent authorisation
+                            // and the DF subsystem's invariants (FDP §3.4 / §3.8).
+                            // See docs/feat/fix-objectowner-mutable-ref-not-blocked.
+                            return Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs {
+                                object_id: hex::encode(object_id.as_bytes()),
+                                parent_object_id: hex::encode(parent.as_bytes()),
+                                index: idx,
+                            });
                         }
                         setu_types::Ownership::Shared { .. } => {
                             // PWOO: shared objects must be declared in the
@@ -2016,6 +2021,114 @@ mod tests {
         let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
         assert!(matches!(result, Err(TaskPrepareError::ImmutableObjectCannotBeMutated { .. })),
             "mutable_indices is checked first, got {:?}", result);
+    }
+
+    // ========== ObjectOwner raw-input rejection tests
+    // (docs/feat/fix-objectowner-mutable-ref-not-blocked) ==========
+
+    /// Helper: build a preparer whose only owned object at `df_oid` carries
+    /// `Ownership::ObjectOwner(parent)`, simulating a DF entry. The standard
+    /// test module is stored under `0xdead::counter`.
+    fn make_objectowner_preparer(
+        df_oid: ObjectId,
+        parent: ObjectId,
+    ) -> (TaskPreparer, String) {
+        let alice = setu_types::Address::normalize("alice");
+        let addr = move_core_types::account_address::AccountAddress::from_hex_literal("0xdead").unwrap();
+        let bytecode = make_module_bytes(
+            move_binary_format::file_format::AddressIdentifierIndex(0),
+            addr,
+            "counter",
+        );
+        let module_key = format!("mod:{}::counter", addr.to_hex_literal());
+        let preparer = make_preparer_with_owned_object(
+            df_oid, alice,
+            setu_types::Ownership::ObjectOwner(parent),
+            Some((&module_key, &bytecode)),
+        );
+        (preparer, addr.to_hex_literal())
+    }
+
+    #[test]
+    fn test_objectowner_in_input_rejected_read_only() {
+        // Even read-only access (no mutable_indices, no consumed_indices,
+        // no dynamic_field_accesses) must be rejected: DF entries are
+        // addressable only through `dynamic_field_accesses[]`.
+        let df_oid = ObjectId::new([0x71; 32]);
+        let parent = ObjectId::new([0xa0; 32]);
+        let (preparer, pkg) = make_objectowner_preparer(df_oid, parent);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![df_oid];
+        // no mutable_indices, no consumed_indices, no dynamic_field_accesses
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        match result {
+            Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs { index, .. }) => {
+                assert_eq!(index, 0, "should report the offending index");
+            }
+            other => panic!("expected ObjectOwnerNotAllowedInInputs, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_objectowner_in_input_with_mutable_rejected() {
+        // The new gate runs in the ownership match arm, so it fires before
+        // any mutable/consumed cross-check. The error is the same.
+        let df_oid = ObjectId::new([0x72; 32]);
+        let parent = ObjectId::new([0xa1; 32]);
+        let (preparer, pkg) = make_objectowner_preparer(df_oid, parent);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![df_oid];
+        call.mutable_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result,
+            Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs { index: 0, .. })),
+            "expected ObjectOwnerNotAllowedInInputs, got {:?}", result);
+    }
+
+    #[test]
+    fn test_objectowner_in_input_with_consumed_rejected() {
+        let df_oid = ObjectId::new([0x73; 32]);
+        let parent = ObjectId::new([0xa2; 32]);
+        let (preparer, pkg) = make_objectowner_preparer(df_oid, parent);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![df_oid];
+        call.consumed_indices = Some(vec![0]);
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        assert!(matches!(result,
+            Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs { index: 0, .. })),
+            "expected ObjectOwnerNotAllowedInInputs, got {:?}", result);
+    }
+
+    #[test]
+    fn test_objectowner_error_carries_parent_oid() {
+        // Verify the error variant carries object_id + parent_object_id +
+        // index, all hex-encoded.
+        let df_oid = ObjectId::new([0x74; 32]);
+        let parent = ObjectId::new([0xa3; 32]);
+        let (preparer, pkg) = make_objectowner_preparer(df_oid, parent);
+        let event = test_event();
+        let mut call = test_move_call_payload(&pkg, "counter", "increment");
+        call.input_object_ids = vec![df_oid];
+
+        let result = preparer.prepare_move_call_task(&event, &call, SubnetId::ROOT);
+        match result {
+            Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs {
+                object_id, parent_object_id, index,
+            }) => {
+                assert_eq!(object_id, hex::encode(df_oid.as_bytes()),
+                    "object_id must echo df_oid hex");
+                assert_eq!(parent_object_id, hex::encode(parent.as_bytes()),
+                    "parent_object_id must echo parent hex");
+                assert_eq!(index, 0);
+            }
+            other => panic!("expected ObjectOwnerNotAllowedInInputs, got {:?}", other),
+        }
     }
 
     #[test]

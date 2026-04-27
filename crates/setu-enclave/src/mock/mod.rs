@@ -965,12 +965,17 @@ impl MockEnclave {
                                     ));
                                 }
                             }
-                            setu_types::Ownership::ObjectOwner(_) => {
-                                // Owned by another object (e.g. a dynamic
-                                // field entry). Sender authorization is
-                                // proxied through the parent object — which
-                                // must itself be authorized above. See
-                                // docs/feat/dynamic-fields/design.md §3.8.
+                            setu_types::Ownership::ObjectOwner(parent) => {
+                                // Defense-in-depth mirror of TaskPreparer
+                                // (see docs/feat/fix-objectowner-mutable-ref-not-blocked).
+                                // DF entries must flow through
+                                // dynamic_field_accesses[], never raw input.
+                                return Err(format!(
+                                    "Object {} is ObjectOwner(parent={}), rejected from raw \
+                                     input_object_ids at index {} — DF entries must use \
+                                     dynamic_field_accesses",
+                                    ro.object_id, parent, idx
+                                ));
                             }
                             setu_types::Ownership::Shared { .. } => {
                                 if !shared_id_set.contains(&ro.object_id) {
