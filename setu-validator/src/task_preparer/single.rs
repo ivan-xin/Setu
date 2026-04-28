@@ -2545,8 +2545,11 @@ mod tests {
             assert_eq!(rdf.mode, mode);
             assert_eq!(rdf.df_object_id, df_oid);
             let got_value = rdf.value_bytes.as_ref().expect("value_bytes set");
-            let on_disk: DfFieldValue = bcs::from_bytes(got_value).unwrap();
-            assert_eq!(on_disk.value_bcs, payload.value_bcs);
+            // Production decodes the on-disk `DfFieldValue` wrapper and stores
+            // its INNER `value_bcs` here (see L1158–1170). So `got_value`
+            // already IS the inner BCS payload (e.g. raw u64 LE bytes for V=u64),
+            // not a serialized `DfFieldValue`. Compare directly.
+            assert_eq!(got_value, &payload.value_bcs);
             assert_eq!(rdf.value_type_tag, "u64", "value_type_tag read from disk");
         }
 

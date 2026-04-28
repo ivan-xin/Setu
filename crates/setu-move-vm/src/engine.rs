@@ -614,17 +614,26 @@ impl SetuMoveEngine {
         //     `df_mutated` instead.
         // Since `DfAccessMode` is single-valued per preloaded cache entry,
         // no oid can satisfy both insertion guards in the same tx.
-        //
-        // `df_mutated ∩ df_deleted` is NOT currently enforced empty — the
-        // `remove → add → remove` sequence can produce such overlap. That
-        // is tracked separately in
-        // `docs/bugs/20260421-df-mutate-delete-same-oid.md`.
         debug_assert!(
             results
                 .df_created
                 .keys()
                 .all(|k| !results.df_deleted.contains_key(k)),
             "df_created ∩ df_deleted must be empty; natives mode-check invariant violated"
+        );
+        // Invariant: `df_mutated ∩ df_deleted ≡ ∅`.
+        //
+        // Enforced by `SetuObjectRuntime::record_df_delete` — when an
+        // earlier mutate effect exists for the same oid, the delete
+        // record collapses the pair (the mutate never persisted) and
+        // rewrites `old_value_bcs` to the pre-tx value. See
+        // fix-df-mutate-delete-same-oid (2026-04-27).
+        debug_assert!(
+            results
+                .df_mutated
+                .keys()
+                .all(|k| !results.df_deleted.contains_key(k)),
+            "df_mutated ∩ df_deleted must be empty after record_df_delete fold"
         );
 
         // DF creates — first envelope written, version starts at base_version + 1
@@ -1528,6 +1537,43 @@ mod tests {
             assert_eq!(changes[0].change_type, MoveStateChangeType::Create);
             assert_eq!(changes[1].change_type, MoveStateChangeType::Update);
             assert_eq!(changes[2].change_type, MoveStateChangeType::Delete);
+        }
+
+        /// fix-df-mutate-delete-same-oid: defense-in-depth `debug_assert!`
+        /// in `convert_results_to_state_changes` fires if any caller bypasses
+        /// `record_df_delete` and constructs `ObjectRuntimeResults` with
+        /// overlapping df_mutated and df_deleted maps. (Real call sites
+        /// always go through `record_df_delete`, so this is a fail-safe.)
+        #[test]
+        #[should_panic(expected = "df_mutated ∩ df_deleted must be empty")]
+        fn test_df_mutated_and_deleted_overlap_panics_in_debug() {
+            let parent = ObjectId::new([0x14; 32]);
+            let df_oid = ObjectId::new([0xDF; 32]);
+            let mut results = empty_results();
+            results.df_mutated.insert(
+                df_oid,
+                DfMutateEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![1; 8],
+                    value_type_tag: "u64".into(),
+                    old_value_bcs: vec![0xA; 8],
+                    new_value_bcs: vec![0xB; 8],
+                    on_disk_envelope: None,
+                },
+            );
+            results.df_deleted.insert(
+                df_oid,
+                DfDeleteEffect {
+                    parent,
+                    key_type_tag: "u64".into(),
+                    key_bcs: vec![1; 8],
+                    value_type_tag: "u64".into(),
+                    old_value_bcs: vec![0xA; 8],
+                    on_disk_envelope: None,
+                },
+            );
+            let _ = engine().convert_results_to_state_changes(&results, 0);
         }
 
         /// E5: §3.7a parent byte-preservation — if mutated[oid].bcs_bytes
