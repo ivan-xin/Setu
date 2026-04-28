@@ -411,7 +411,25 @@ impl SetuObjectRuntime {
     }
 
     /// Record a DF delete (from `dynamic_field::remove_internal`).
-    pub(crate) fn record_df_delete(&mut self, df_oid: ObjectId, effect: DfDeleteEffect) {
+    ///
+    /// Fold rule (fix-df-mutate-delete-same-oid, 2026-04-27):
+    /// if `df_mutated[df_oid]` is already populated, the mutate never
+    /// persisted to the SMT — collapse the pair into a single Delete using
+    /// the PRE-TX `old_value_bcs` from the prior mutate. This handles two
+    /// real same-tx sequences:
+    ///
+    /// 1. `remove → add → remove` (the second remove sees the in-memory
+    ///    post-add value but the SMT still holds the pre-tx value).
+    /// 2. `borrow_mut → remove`   (borrow_mut leaves a placeholder mutate
+    ///    effect; the subsequent remove must collapse it).
+    ///
+    /// `effect.on_disk_envelope` is preserved as-is — it equals
+    /// `prior.on_disk_envelope` because `df_cache_get_mut` only touches
+    /// `value_bytes`, never `envelope_bytes`, during mutate-replace.
+    pub(crate) fn record_df_delete(&mut self, df_oid: ObjectId, mut effect: DfDeleteEffect) {
+        if let Some(prior) = self.df_mutated.swap_remove(&df_oid) {
+            effect.old_value_bcs = prior.old_value_bcs;
+        }
         self.df_deleted.insert(df_oid, effect);
     }
 
@@ -798,6 +816,88 @@ mod tests {
         rt.record_df_delete(df, mk());
         let r = rt.into_results();
         assert_eq!(r.df_deleted.len(), 1);
+    }
+
+    /// U-fold-1 (fix-df-mutate-delete-same-oid): `record_df_delete` collapses
+    /// any prior `df_mutated` entry into the new Delete and rewrites the
+    /// Delete's `old_value_bcs` to the pre-tx value carried by the mutate.
+    /// This covers two real same-tx sequences:
+    ///   A. `remove → add(v) → remove`  (mutate effect was {old=v0, new=v})
+    ///   B. `borrow_mut → remove`       (mutate effect was {old=v0, new=v0})
+    /// Both collapse to a single Delete with `old_value_bcs = v0`.
+    #[test]
+    fn test_record_df_delete_folds_prior_mutate() {
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let df = ObjectId::new([0xDD; 32]);
+        let p = ObjectId::new([0x42; 32]);
+        let env_v0 = vec![0xE0; 24];
+
+        // Sequence A: prior mutate has new ≠ old; the post-fold Delete must
+        // carry the pre-tx old, NOT the post-mutate new.
+        rt.record_df_mutate(
+            df,
+            DfMutateEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![1; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![0xA; 8], // v0 (pre-tx)
+                new_value_bcs: vec![0xB; 8], // v (post-replace)
+                on_disk_envelope: Some(env_v0.clone()),
+            },
+        );
+        rt.record_df_delete(
+            df,
+            DfDeleteEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![1; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![0xB; 8], // post-mutate v (WRONG without fold)
+                on_disk_envelope: Some(env_v0.clone()),
+            },
+        );
+
+        let r = rt.into_results();
+        assert!(
+            !r.df_mutated.contains_key(&df),
+            "fold MUST drop df_mutated[oid]"
+        );
+        let d = r.df_deleted.get(&df).expect("df_deleted[oid] kept");
+        assert_eq!(
+            d.old_value_bcs,
+            vec![0xA; 8],
+            "old_value_bcs MUST be rewritten to pre-tx v0"
+        );
+        assert_eq!(
+            d.on_disk_envelope.as_deref(),
+            Some(&env_v0[..]),
+            "on_disk_envelope preserved (cache.envelope_bytes invariant)"
+        );
+    }
+
+    /// U-fold-2: `record_df_delete` is a no-op fold when no prior mutate
+    /// exists (i.e. plain remove).
+    #[test]
+    fn test_record_df_delete_no_prior_mutate_is_passthrough() {
+        let mut rt = SetuObjectRuntime::new(vec![], vec![], test_tx_hash(), test_address(), 0);
+        let df = ObjectId::new([0xDE; 32]);
+        let p = ObjectId::new([0x43; 32]);
+        rt.record_df_delete(
+            df,
+            DfDeleteEffect {
+                parent: p,
+                key_type_tag: "u64".into(),
+                key_bcs: vec![5; 8],
+                value_type_tag: "u64".into(),
+                old_value_bcs: vec![0xC; 8],
+                on_disk_envelope: None,
+            },
+        );
+        let r = rt.into_results();
+        assert!(r.df_mutated.is_empty());
+        let d = r.df_deleted.get(&df).expect("kept");
+        assert_eq!(d.old_value_bcs, vec![0xC; 8], "passthrough — unchanged");
     }
 
     #[test]

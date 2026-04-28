@@ -1134,9 +1134,15 @@ impl TaskPreparer {
                 &key_bytes,
             );
 
+            // Per-mode resolution (fix-df-exists-absent-rejected, 2026-04-27):
+            //   - Mutate / Delete: presence required (need on-disk envelope
+            //     bytes for the StateChange `old_value`).
+            //   - Read           : presence OPTIONAL — `exists_` must work
+            //     for absent keys, and `borrow` cleanly aborts at the VM
+            //     native via `E_DF_DOES_NOT_EXIST` when `value_bytes=None`.
+            //   - Create         : entry must NOT exist.
             let (value_bytes, value_type_tag_resolved, envelope_bytes) = match df.mode {
-                setu_types::dynamic_field::DfAccessMode::Read
-                | setu_types::dynamic_field::DfAccessMode::Mutate
+                setu_types::dynamic_field::DfAccessMode::Mutate
                 | setu_types::dynamic_field::DfAccessMode::Delete => {
                     let df_env = load_envelope(&*self.state_provider, &df_oid)?
                         .ok_or_else(|| TaskPrepareError::DynamicFieldNotFound {
@@ -1165,6 +1171,45 @@ impl TaskPreparer {
                         hex::encode(df_oid.as_bytes()), e,
                     )))?;
                     (Some(on_disk.value_bcs), on_disk.value_type_tag, Some(envelope_bytes))
+                }
+                setu_types::dynamic_field::DfAccessMode::Read => {
+                    let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                    match load_envelope(&*self.state_provider, &df_oid)? {
+                        Some(df_env) => {
+                            ensure_df_ownership(&df_env, parent_oid)?;
+                            let envelope_bytes = df_env.to_bytes();
+                            read_set.push(ReadSetEntry::new(key, envelope_bytes.clone()));
+                            let on_disk = bcs::from_bytes::<
+                                setu_types::dynamic_field::DfFieldValue,
+                            >(&df_env.data)
+                            .map_err(|e| TaskPrepareError::InvalidInput(format!(
+                                "malformed DfFieldValue at df_oid={}: {}",
+                                hex::encode(df_oid.as_bytes()), e,
+                            )))?;
+                            (
+                                Some(on_disk.value_bcs),
+                                on_disk.value_type_tag,
+                                Some(envelope_bytes),
+                            )
+                        }
+                        None => {
+                            // Absent-Read sentinel: shape is identical to
+                            // Create's pre-tx state — empty read-set bytes,
+                            // value_bytes=None, envelope_bytes=None. The VM
+                            // cache's `value_bytes.is_some()` predicate then
+                            // drives both natives correctly:
+                            //   * exists_internal → false
+                            //   * borrow_internal → E_DF_DOES_NOT_EXIST
+                            // PWOO conflict detection: empty bytes mean "I
+                            // observed this slot as absent"; any concurrent
+                            // CF that creates the same df_oid will produce a
+                            // post-state with non-empty envelope bytes →
+                            // conflict, txn rejected (same semantics as the
+                            // existing Create flow).
+                            read_set.push(ReadSetEntry::new(key, Vec::new()));
+                            (None, df.value_type.clone().unwrap_or_default(), None)
+                        }
+                    }
                 }
                 setu_types::dynamic_field::DfAccessMode::Create => {
                     if load_envelope(&*self.state_provider, &df_oid)?.is_some() {
@@ -2638,11 +2683,67 @@ mod tests {
             assert!(matches!(err, TaskPrepareError::DynamicFieldAlreadyExists { .. }));
         }
 
-        /// V7: Read mode but df_oid not in state.
+        /// V7: Read mode tolerates absent df_oid (fix-df-exists-absent-rejected).
+        ///
+        /// Pre-fix: TaskPreparer aborted with `DynamicFieldNotFound`, blocking
+        /// the VM `exists_internal` native from returning `false`. Post-fix:
+        /// Read mode emits a sentinel `ResolvedDynamicField` with
+        /// `value_bytes=None`, `envelope_bytes=None`, falling back to the
+        /// client-declared value_type (or empty string).
         #[test]
-        fn test_df_not_found_on_read() {
+        fn test_df_read_absent_returns_sentinel() {
             let alice = setu_types::Address::normalize("alice");
             let parent_id = ObjectId::new([0x74; 32]);
+            let key_bcs = vec![4u8; 8];
+            let df_oid = derive_df_oid(&parent_id, "u64", &key_bcs);
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                None, // <-- absent
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode(&key_bcs),
+                mode: DfAccessMode::Read,
+                value_type: Some("u64".into()),
+            }];
+
+            let task = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .expect("Read on absent must succeed");
+            assert_eq!(task.resolved_inputs.dynamic_fields.len(), 1);
+            let rdf = &task.resolved_inputs.dynamic_fields[0];
+            assert_eq!(rdf.df_object_id, df_oid);
+            assert_eq!(rdf.mode, DfAccessMode::Read);
+            assert!(
+                rdf.value_bytes.is_none(),
+                "absent-Read MUST yield value_bytes=None"
+            );
+            assert!(
+                rdf.envelope_bytes.is_none(),
+                "absent-Read MUST yield envelope_bytes=None"
+            );
+            assert_eq!(
+                rdf.value_type_tag, "u64",
+                "client-declared value_type echoed verbatim"
+            );
+        }
+
+        /// V7b: Mutate on absent df_oid is STILL rejected
+        /// (fix-df-exists-absent-rejected design constraint: only Read is
+        /// relaxed; Mutate / Delete keep their presence guards).
+        #[test]
+        fn test_df_mutate_absent_still_rejected() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x76; 32]);
             let (mkey, mbytes, maddr) = module_setup();
             let preparer = make_preparer_with_df(
                 parent_id,
@@ -2658,9 +2759,40 @@ mod tests {
             call.dynamic_field_accesses = vec![DynamicFieldAccess {
                 parent_object_id: hex::encode(parent_id.as_bytes()),
                 key_type: "u64".to_string(),
-                key_bcs_hex: hex::encode([4u8; 8]),
-                mode: DfAccessMode::Read,
-                value_type: None,
+                key_bcs_hex: hex::encode([7u8; 8]),
+                mode: DfAccessMode::Mutate,
+                value_type: Some("u64".into()),
+            }];
+
+            let err = preparer
+                .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
+                .unwrap_err();
+            assert!(matches!(err, TaskPrepareError::DynamicFieldNotFound { .. }));
+        }
+
+        /// V7c: Delete on absent df_oid is STILL rejected (symmetric to V7b).
+        #[test]
+        fn test_df_delete_absent_still_rejected() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0x77; 32]);
+            let (mkey, mbytes, maddr) = module_setup();
+            let preparer = make_preparer_with_df(
+                parent_id,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+                (&mkey, &mbytes),
+            );
+
+            let mut call =
+                test_move_call_payload(&maddr.to_hex_literal(), "counter", "inc");
+            call.sender = hex::encode(alice.as_bytes());
+            call.input_object_ids = vec![parent_id];
+            call.dynamic_field_accesses = vec![DynamicFieldAccess {
+                parent_object_id: hex::encode(parent_id.as_bytes()),
+                key_type: "u64".to_string(),
+                key_bcs_hex: hex::encode([8u8; 8]),
+                mode: DfAccessMode::Delete,
+                value_type: Some("u64".into()),
             }];
 
             let err = preparer
