@@ -28,7 +28,7 @@ arc-swap = "1"   # Lock-free atomic pointer swap for read-write separation
 # RocksDB dependencies
 rocksdb = "0.22"
 bincode = "2.0.0-rc.3"  # Use bincode 2.0 for Encode/Decode traits
-bcs = "0.1"
+bcs.workspace = true
 anyhow = "1.0"
 
 [dev-dependencies]

@@ -17,6 +17,7 @@ pub mod engine;
 pub mod gas;
 pub mod hybrid;
 pub mod natives;
+pub mod natives_b3;
 pub mod object_runtime;
 pub mod resolver;
 

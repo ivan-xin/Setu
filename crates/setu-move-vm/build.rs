@@ -43,6 +43,11 @@ fn main() {
         "clock",
         "access_control",
         "dynamic_field",
+        // B3 (Phase 6) — bcs / address / hash / crypto natives
+        "bcs",
+        "address",
+        "hash",
+        "crypto",
     ];
 
     let mut code = String::from(

@@ -82,6 +82,17 @@ pub fn setu_native_functions() -> NativeFunctionTable {
                 native_df_borrow_mut_internal,
             ),
             ("dynamic_field", "exists_internal", native_df_exists_internal),
+            // ── B3 (Phase 6) natives — bcs / address / hash / crypto ──
+            ("bcs", "to_bytes_internal", crate::natives_b3::native_bcs_to_bytes),
+            ("bcs", "from_bytes_internal", crate::natives_b3::native_bcs_from_bytes),
+            ("address", "from_bytes_internal", crate::natives_b3::native_address_from_bytes),
+            ("address", "to_bytes_internal", crate::natives_b3::native_address_to_bytes),
+            ("hash", "sha2_256_internal", crate::natives_b3::native_hash_sha2_256),
+            ("hash", "sha3_256_internal", crate::natives_b3::native_hash_sha3_256),
+            ("hash", "blake3_internal", crate::natives_b3::native_hash_blake3),
+            ("hash", "keccak256_internal", crate::natives_b3::native_hash_keccak256),
+            ("crypto", "ed25519_verify_internal", crate::natives_b3::native_ed25519_verify),
+            ("crypto", "ecdsa_k1_verify_internal", crate::natives_b3::native_ecdsa_k1_verify),
         ],
     )
 }
@@ -909,7 +920,8 @@ mod tests {
     #[test]
     fn test_make_table_count() {
         let table = setu_native_functions();
-        assert_eq!(table.len(), 14);
+        // 14 base natives + 10 B3 natives (bcs/address/hash/crypto)
+        assert_eq!(table.len(), 24);
     }
 
     #[test]
