@@ -27,6 +27,8 @@ module examples::dex_pool {
     use setu::dynamic_field as df;
     use setu::transfer;
     use setu::tx_context::TxContext;
+    use setu::bcs;
+    use setu::hash;
 
     // ── Abort codes ──────────────────────────────────────────────────────
     const E_PAIR_EXISTS:  u64 = 1;
@@ -113,5 +115,15 @@ module examples::dex_pool {
     ) {
         let pair = Pair { token_a, token_b };
         let _liq = df::remove<Pair, Liquidity>(&mut pool.id, pair);
+    }
+
+    // ── B3 acceptance: bcs + hash usage ─────────────────────────────────
+
+    /// Deterministic identifier for a pair, derived as
+    /// `sha2_256(bcs::to_bytes(Pair))`. Two validators executing this on
+    /// the same `(token_a, token_b)` MUST produce byte-identical output.
+    public fun pair_digest(token_a: address, token_b: address): vector<u8> {
+        let pair = Pair { token_a, token_b };
+        hash::sha2_256(bcs::to_bytes(&pair))
     }
 }
