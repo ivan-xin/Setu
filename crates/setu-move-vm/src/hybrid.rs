@@ -292,6 +292,14 @@ impl<S: StateStore + ObjectStore> HybridExecutor<S> {
                     "MovePublish is a ROOT event, not routed through HybridExecutor".into(),
                 ))
             }
+
+            // B6a: PTB wire format only — no execution path until B6b lands.
+            // See docs/feat/move-vm-phase9-ptb-wire/design.md §3 row 8.
+            OperationType::ProgrammableTransaction(_) => {
+                Err(RuntimeError::InvalidTransaction(
+                    "PTB_NOT_YET_EXECUTABLE: Programmable Transaction execution is deferred to B6b".into(),
+                ))
+            }
         }
     }
 }
@@ -458,6 +466,42 @@ mod tests {
 
         let result = hybrid.execute(&event, &resolved, &ctx);
         assert!(result.is_err());
+    }
+
+    /// I3 (Phase 2 matrix): solver-side dispatch must early-reject PTBs in
+    /// B6a. The match arm in `HybridExecutor::execute` is the actual solver
+    /// dispatch site — `setu-solver/src/http_server.rs` only forwards.
+    #[test]
+    fn i3_hybrid_ptb_rejected_with_marker() {
+        use setu_runtime::InMemoryObjectStore;
+        use setu_types::ptb::ProgrammableTransaction;
+        use setu_types::task::ResolvedInputs;
+
+        let store = InMemoryObjectStore::new();
+        let mut hybrid = HybridExecutor::new(store);
+        let event = setu_types::Event::new(
+            setu_types::EventType::ContractCall,
+            vec![],
+            setu_types::VLCSnapshot::default(),
+            "test".to_string(),
+        );
+        let mut resolved = ResolvedInputs::new();
+        resolved.operation = OperationType::ProgrammableTransaction(ProgrammableTransaction {
+            inputs: vec![],
+            commands: vec![],
+            dynamic_field_accesses: vec![],
+        });
+        let ctx = ExecutionContext::new("test".into(), 0, false, [0; 32]);
+
+        let err = hybrid
+            .execute(&event, &resolved, &ctx)
+            .expect_err("PTB must be early-rejected in B6a");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("PTB_NOT_YET_EXECUTABLE"),
+            "Expected error to carry PTB_NOT_YET_EXECUTABLE marker, got: {}",
+            msg
+        );
     }
 
     #[test]

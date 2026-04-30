@@ -86,6 +86,15 @@ pub trait ValidatorService: Send + Sync {
     /// Submit a Move module publish
     fn submit_move_publish(&self, request: MovePublishRequest) -> impl std::future::Future<Output = MovePublishResponse> + Send;
 
+    /// Submit a Programmable Transaction Block (PTB).
+    ///
+    /// **B6a**: returns HTTP 501 with `code = PTB_NOT_YET_EXECUTABLE` for
+    /// well-formed PTBs; malformed PTBs surface as 4xx via `Err`.
+    fn submit_move_ptb(
+        &self,
+        request: MovePtbRequest,
+    ) -> impl std::future::Future<Output = Result<MovePtbResponse, MovePtbResponse>> + Send;
+
     /// Query a Move object by object ID (hex).
     ///
     /// When `finalized` is true, bypass the speculative overlay and read the
@@ -358,6 +367,24 @@ pub async fn http_submit_move_publish<S: ValidatorService>(
     Json(request): Json<MovePublishRequest>,
 ) -> Json<MovePublishResponse> {
     Json(service.submit_move_publish(request).await)
+}
+
+/// Submit a Programmable Transaction Block (PTB).
+///
+/// Two terminal HTTP states (B6a):
+/// - **400 Bad Request** when PTB validation fails (see `Err` arm of
+///   `ValidatorService::submit_move_ptb`).
+/// - **501 Not Implemented** for well-formed PTBs, with body
+///   `{ code: "PTB_NOT_YET_EXECUTABLE", ... }`. Once B6b lands the executor,
+///   this branch flips to 200/4xx based on execution outcome.
+pub async fn http_submit_move_ptb<S: ValidatorService>(
+    State(service): State<Arc<S>>,
+    Json(request): Json<MovePtbRequest>,
+) -> (axum::http::StatusCode, Json<MovePtbResponse>) {
+    match service.submit_move_ptb(request).await {
+        Ok(resp) => (axum::http::StatusCode::NOT_IMPLEMENTED, Json(resp)),
+        Err(resp) => (axum::http::StatusCode::BAD_REQUEST, Json(resp)),
+    }
 }
 
 /// Query parameters for Move object lookup.

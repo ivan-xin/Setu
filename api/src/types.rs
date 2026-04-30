@@ -144,6 +144,55 @@ pub struct MovePublishResponse {
     pub error: Option<String>,
 }
 
+// ============================================
+// Programmable Transaction Block (PTB) — B6a wire-only
+// ============================================
+//
+// Submission endpoint for Programmable Transaction Blocks. **B6a ships only
+// the wire format**: the validator parses + validates the PTB, then returns
+// HTTP 501 with `code = "PTB_NOT_YET_EXECUTABLE"` until B6b lands the
+// executor. Malformed PTBs are still rejected with 4xx (validation runs
+// before the 501 stub).
+
+/// Stable error code returned by the PTB stub handler when a well-formed PTB
+/// is submitted but execution is not yet available.
+pub const PTB_NOT_YET_EXECUTABLE: &str = "PTB_NOT_YET_EXECUTABLE";
+
+/// Request to submit a Programmable Transaction Block.
+///
+/// `ptb` is BCS-encoded and hex-wrapped over the wire to keep the JSON
+/// envelope simple — the binary form is what the validator hashes/verifies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovePtbRequest {
+    /// Sender address (hex)
+    pub sender: String,
+    /// BCS-encoded `setu_types::ptb::ProgrammableTransaction`, hex-encoded.
+    pub ptb: String,
+    /// Target subnet (defaults to ROOT)
+    #[serde(default)]
+    pub subnet_id: Option<String>,
+}
+
+/// Response to a PTB submission.
+///
+/// In B6a, well-formed PTBs always yield `success = false`, `code =
+/// PTB_NOT_YET_EXECUTABLE`, and HTTP 501. Malformed PTBs are surfaced via
+/// HTTP 4xx with `code = None` (or an explicit validation code).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovePtbResponse {
+    /// Event ID of the submitted event (empty when stubbed).
+    pub event_id: String,
+    /// Whether execution succeeded.
+    pub success: bool,
+    /// Error message (if failed or stubbed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Stable error code. `Some("PTB_NOT_YET_EXECUTABLE")` while B6b is
+    /// pending; `None` on a real success or for plain validation errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -334,5 +383,137 @@ mod m5_pre_tests {
             back.dynamic_field_accesses[0].value_type.as_deref(),
             Some("u64")
         );
+    }
+}
+
+// ============================================
+// B6a PTB wire-stub tests (Phase 2 matrix I1, I2, I4)
+// ============================================
+
+#[cfg(test)]
+mod b6a_ptb_tests {
+    use super::*;
+    use setu_types::dynamic_field::DfAccessMode;
+    use setu_types::object::ObjectId;
+    use setu_types::ptb::{
+        Argument, CallArg, Command, MoveCall, ProgrammableTransaction, MAX_PTB_COMMANDS,
+    };
+
+    fn well_formed_ptb() -> ProgrammableTransaction {
+        ProgrammableTransaction {
+            inputs: vec![CallArg::Pure(vec![1, 2, 3])],
+            commands: vec![Command::MoveCall(MoveCall {
+                package: ObjectId::ZERO,
+                module: "m".to_string(),
+                function: "f".to_string(),
+                type_arguments: vec![],
+                arguments: vec![Argument::GasCoin],
+            })],
+            dynamic_field_accesses: vec![],
+        }
+    }
+
+    /// Helper that drives the validator-side stub logic locally (the same
+    /// flow the real `submit_move_ptb` runs). Mirrors hex → BCS → validate →
+    /// 501-or-error decision so we can exercise it without a running
+    /// validator service.
+    fn drive_stub(req: MovePtbRequest) -> Result<MovePtbResponse, MovePtbResponse> {
+        let hex_str = req.ptb.trim_start_matches("0x");
+        let bcs_bytes = hex::decode(hex_str).map_err(|e| MovePtbResponse {
+            event_id: String::new(),
+            success: false,
+            error: Some(format!("Invalid hex in `ptb` field: {}", e)),
+            code: None,
+        })?;
+        let ptb: ProgrammableTransaction =
+            bcs::from_bytes(&bcs_bytes).map_err(|e| MovePtbResponse {
+                event_id: String::new(),
+                success: false,
+                error: Some(format!("BCS deserialize failed: {}", e)),
+                code: None,
+            })?;
+        ptb.validate_wire().map_err(|e| MovePtbResponse {
+            event_id: String::new(),
+            success: false,
+            error: Some(format!("PTB validation failed: {}", e)),
+            code: None,
+        })?;
+        Ok(MovePtbResponse {
+            event_id: String::new(),
+            success: false,
+            error: Some("Programmable Transaction execution is not yet available (deferred to B6b)".into()),
+            code: Some(PTB_NOT_YET_EXECUTABLE.to_string()),
+        })
+    }
+
+    /// I1: well-formed PTB → Ok(501-style response with code).
+    #[test]
+    fn i1_submit_move_ptb_well_formed_returns_501_response() {
+        let ptb = well_formed_ptb();
+        let req = MovePtbRequest {
+            sender: "alice".into(),
+            ptb: hex::encode(bcs::to_bytes(&ptb).unwrap()),
+            subnet_id: None,
+        };
+        let resp = drive_stub(req).expect("well-formed PTB must hit the 501 stub branch");
+        assert!(!resp.success);
+        assert_eq!(resp.code.as_deref(), Some(PTB_NOT_YET_EXECUTABLE));
+        assert!(resp.event_id.is_empty());
+    }
+
+    /// I2: malformed PTB (over MAX_PTB_COMMANDS) returns Err → 4xx, NOT 501.
+    /// The `code` field is None for plain validation errors so a client can
+    /// distinguish "your PTB is broken" from "we don't execute PTBs yet".
+    #[test]
+    fn i2_submit_move_ptb_malformed_returns_4xx_before_501() {
+        let mut ptb = well_formed_ptb();
+        ptb.commands = (0..MAX_PTB_COMMANDS + 1)
+            .map(|_| {
+                Command::MoveCall(MoveCall {
+                    package: ObjectId::ZERO,
+                    module: "m".into(),
+                    function: "f".into(),
+                    type_arguments: vec![],
+                    arguments: vec![],
+                })
+            })
+            .collect();
+        let req = MovePtbRequest {
+            sender: "alice".into(),
+            ptb: hex::encode(bcs::to_bytes(&ptb).unwrap()),
+            subnet_id: None,
+        };
+        let resp = drive_stub(req).expect_err("oversize PTB must be rejected");
+        assert!(!resp.success);
+        // Critically: code is None — this is NOT the 501 stub.
+        assert!(resp.code.is_none(),
+            "Validation error must not return PTB_NOT_YET_EXECUTABLE — clients need to distinguish.");
+        assert!(resp.error.unwrap().contains("validation failed"));
+    }
+
+    /// I4: HTTP boundary converts hex DynamicFieldAccess → binary PtbDfAccess.
+    /// Verifies the conversion works for a typical mixed-case hex with the
+    /// "oid:" prefix pattern the existing API uses.
+    #[test]
+    fn i4_hex_to_binary_df_conversion_at_handler_boundary() {
+        use setu_types::event::DynamicFieldAccess;
+        use setu_types::ptb::PtbDfAccess;
+
+        let parent_bytes = [0xABu8; 32];
+        let hex_form = DynamicFieldAccess {
+            parent_object_id: format!("oid:0x{}", hex::encode_upper(parent_bytes)),
+            key_type: "u64".into(),
+            key_bcs_hex: "0xDEADBEEF".into(),
+            mode: DfAccessMode::Read,
+            value_type: None,
+        };
+        let bin: PtbDfAccess = hex_form.try_into().expect("conversion succeeds");
+        assert_eq!(bin.parent.as_bytes(), &parent_bytes);
+        assert_eq!(bin.key_bcs, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // And: round-tripping the binary form through bcs is byte-stable.
+        let bytes_a = bcs::to_bytes(&bin).unwrap();
+        let bytes_b = bcs::to_bytes(&bin).unwrap();
+        assert_eq!(bytes_a, bytes_b);
     }
 }

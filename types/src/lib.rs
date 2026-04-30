@@ -13,6 +13,7 @@ pub mod task;            // Task types for Validator → Solver communication
 pub mod envelope;        // ObjectEnvelope — unified storage for Move objects and legacy coins
 pub mod execution_outcome; // R5: on-chain apply verdict (Applied/ExecutionFailed/StaleRead)
 pub mod dynamic_field;   // Dynamic Fields — DfFieldValue, DfAccessMode, derive_df_oid (DF FDP M1)
+pub mod ptb;             // Programmable Transaction Block (PTB) — wire format only (B6a)
 
 // ========== Object Model ==========
 pub mod coin;           // Coin object (transferable asset)

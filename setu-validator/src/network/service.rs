@@ -537,6 +537,8 @@ impl ValidatorNetworkService {
             // Phase 4: Move VM endpoints
             .route("/api/v1/move/call", post(setu_api::http_submit_move_call::<ValidatorNetworkService>))
             .route("/api/v1/move/publish", post(setu_api::http_submit_move_publish::<ValidatorNetworkService>))
+            // Phase 9 / B6a: Programmable Transaction Block (wire-only stub).
+            .route("/api/v1/move/ptb", post(setu_api::http_submit_move_ptb::<ValidatorNetworkService>))
             // Phase 5b: Move object/module query endpoints
             .route("/api/v1/move/objects/:object_id", get(setu_api::http_get_move_object::<ValidatorNetworkService>))
             .route("/api/v1/move/modules/:address/:name", get(setu_api::http_get_module_abi::<ValidatorNetworkService>))
@@ -756,6 +758,65 @@ impl ValidatorNetworkService {
         }
 
         response
+    }
+
+    /// Submit a Programmable Transaction Block (PTB).
+    ///
+    /// **B6a**: validation runs (4xx on malformed); well-formed PTBs return
+    /// 501 with `code = PTB_NOT_YET_EXECUTABLE`. B6b will replace the 501
+    /// branch with real execution. See
+    /// `docs/feat/move-vm-phase9-ptb-wire/design.md`.
+    pub async fn submit_move_ptb(
+        &self,
+        request: setu_api::MovePtbRequest,
+    ) -> Result<setu_api::MovePtbResponse, setu_api::MovePtbResponse> {
+        // 1. Hex-decode the BCS-encoded PTB.
+        let hex_str = request.ptb.trim_start_matches("0x");
+        let bcs_bytes = match hex::decode(hex_str) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(format!("Invalid hex in `ptb` field: {}", e)),
+                    code: None,
+                });
+            }
+        };
+
+        // 2. BCS-deserialize.
+        let ptb: setu_types::ptb::ProgrammableTransaction = match bcs::from_bytes(&bcs_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(format!("BCS deserialize failed: {}", e)),
+                    code: None,
+                });
+            }
+        };
+
+        // 3. Wire-level validation (DoS bounds, forward-ref, type-tag, etc.).
+        if let Err(e) = ptb.validate_wire() {
+            return Err(setu_api::MovePtbResponse {
+                event_id: String::new(),
+                success: false,
+                error: Some(format!("PTB validation failed: {}", e)),
+                code: None,
+            });
+        }
+
+        // 4. B6a stub — execution is deferred to B6b.
+        Ok(setu_api::MovePtbResponse {
+            event_id: String::new(),
+            success: false,
+            error: Some(
+                "Programmable Transaction execution is not yet available (deferred to B6b)"
+                    .to_string(),
+            ),
+            code: Some(setu_api::PTB_NOT_YET_EXECUTABLE.to_string()),
+        })
     }
 
     /// Query a Move object by its hex object ID.
@@ -1307,6 +1368,13 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     async fn submit_move_publish(&self, request: setu_api::MovePublishRequest) -> setu_api::MovePublishResponse {
         self.submit_move_publish(request).await
+    }
+
+    async fn submit_move_ptb(
+        &self,
+        request: setu_api::MovePtbRequest,
+    ) -> Result<setu_api::MovePtbResponse, setu_api::MovePtbResponse> {
+        self.submit_move_ptb(request).await
     }
 
     fn get_move_object(&self, object_id: &str, finalized: bool) -> setu_api::GetMoveObjectResponse {

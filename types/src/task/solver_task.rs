@@ -238,6 +238,7 @@ impl ResolvedInputs {
             }
             OperationType::MoveCall { .. } => None,
             OperationType::MovePublish { .. } => None,
+            OperationType::ProgrammableTransaction(_) => None,
         }
     }
 }
@@ -313,6 +314,17 @@ pub enum OperationType {
         /// Module bytecode list
         modules: Vec<Vec<u8>>,
     },
+
+    /// Programmable Transaction Block (PTB).
+    ///
+    /// **B6a**: this variant carries the wire-format payload only. Validator
+    /// + solver dispatch paths early-reject with `PTB_NOT_YET_EXECUTABLE`
+    /// until B6b lands. See `docs/feat/move-vm-phase9-ptb-wire/design.md`.
+    ///
+    /// New tail variant — appended for BCS-additive forward compatibility.
+    /// Existing serialized `OperationType` values (Transfer/MergeCoins/...)
+    /// remain byte-identical.
+    ProgrammableTransaction(crate::ptb::ProgrammableTransaction),
 }
 
 /// Resolved dynamic field access (DF FDP v1.3 — consumed by Enclave/VM via
