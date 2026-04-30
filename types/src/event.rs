@@ -249,6 +249,25 @@ pub struct MovePublishPayload {
     pub modules: Vec<Vec<u8>>,
 }
 
+/// Programmable Transaction Block payload (paired with EventType::ContractCall).
+///
+/// PTB is the "many commands, one atomic effect" Move execution mode.
+/// Compared to [`MoveCallPayload`], all input-object metadata (ID, version,
+/// digest, mutable flag) lives inside `ptb.inputs[].ObjectArg` — there is no
+/// parallel `input_object_ids` / `mutable_indices` / `consumed_indices` list.
+///
+/// EventType reuse: PTB rides on `EventType::ContractCall` (not a new
+/// EventType variant). See `docs/feat/move-vm-phase9-ptb-event-wire/design.md`
+/// §4 for the rationale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovePtbPayload {
+    /// Transaction sender (hex address). Validator MUST verify equality
+    /// against the Event signer's derived address (mirror of MoveCallPayload).
+    pub sender: String,
+    /// Programmable transaction body. Its BCS encoding is what consensus hashes.
+    pub ptb: crate::ptb::ProgrammableTransaction,
+}
+
 // ========== Event Payload ==========
 
 /// Event payload - contains the actual data for different event types
@@ -319,6 +338,12 @@ pub enum EventPayload {
     MoveCall(MoveCallPayload),
     /// Move module publish (paired with EventType::ContractPublish)
     MovePublish(MovePublishPayload),
+    /// Programmable transaction block (paired with EventType::ContractCall).
+    ///
+    /// **BCS discriminant order is load-bearing.** This MUST stay the tail
+    /// variant of `EventPayload`; appending future variants is fine, mid-enum
+    /// insertion silently invalidates every PTB event already in storage.
+    MovePtb(MovePtbPayload),
 }
 
 impl Default for EventPayload {
@@ -607,6 +632,21 @@ impl Event {
         event
     }
 
+    /// Create a Move PTB event (reuses `EventType::ContractCall`).
+    ///
+    /// EventType reuse: PTB shares the ContractCall umbrella with MoveCall.
+    /// See `docs/feat/move-vm-phase9-ptb-event-wire/design.md` §4.
+    pub fn move_ptb(
+        payload: MovePtbPayload,
+        parent_ids: Vec<EventId>,
+        vlc_snapshot: VLCSnapshot,
+        creator: String,
+    ) -> Self {
+        let mut event = Self::new(EventType::ContractCall, parent_ids, vlc_snapshot, creator);
+        event.payload = EventPayload::MovePtb(payload);
+        event
+    }
+
     /// Create a contract publish event (Move module deployment)
     pub fn contract_publish(
         sender: String,
@@ -820,6 +860,31 @@ impl Event {
             }
             EventPayload::MovePublish(_) => {
                 vec![]
+            }
+            EventPayload::MovePtb(payload) => {
+                // Resources: every Object input + every (package, module, function)
+                // touched by Command::MoveCall in the PTB.
+                let mut resources: Vec<String> = Vec::new();
+                for arg in &payload.ptb.inputs {
+                    if let crate::ptb::CallArg::Object(obj) = arg {
+                        let id = match obj {
+                            crate::ptb::ObjectArg::ImmOrOwnedObject(id, _, _) => id,
+                            crate::ptb::ObjectArg::SharedObject { id, .. } => id,
+                        };
+                        resources.push(format!("oid:{}", hex::encode(id.as_bytes())));
+                    }
+                }
+                for cmd in &payload.ptb.commands {
+                    if let crate::ptb::Command::MoveCall(mc) = cmd {
+                        resources.push(format!(
+                            "contract:{}::{}::{}",
+                            hex::encode(mc.package.as_bytes()),
+                            mc.module,
+                            mc.function,
+                        ));
+                    }
+                }
+                resources
             }
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
@@ -1116,6 +1181,83 @@ mod tests {
         assert_eq!(
             back.dynamic_field_accesses[0].mode,
             crate::dynamic_field::DfAccessMode::Read
+        );
+    }
+
+    // ===== PTB event-wire tests (B6b 收尾 / FDP move-vm-phase9-ptb-event-wire) =====
+
+    /// U1 — `MovePtbPayload` survives BCS round-trip without field loss.
+    #[test]
+    fn move_ptb_payload_round_trips_bcs() {
+        use crate::ptb::{CallArg, Command, ProgrammableTransaction};
+
+        let payload = MovePtbPayload {
+            sender: "0xabcd".to_string(),
+            ptb: ProgrammableTransaction {
+                inputs: vec![CallArg::Pure(vec![1, 2, 3])],
+                commands: vec![Command::TransferObjects(
+                    vec![],
+                    crate::ptb::Argument::Input(0),
+                )],
+                dynamic_field_accesses: vec![],
+            },
+        };
+        let bytes = bcs::to_bytes(&payload).expect("bcs encode");
+        let back: MovePtbPayload = bcs::from_bytes(&bytes).expect("bcs decode");
+        assert_eq!(back.sender, payload.sender);
+        assert_eq!(back.ptb.inputs.len(), 1);
+        assert_eq!(back.ptb.commands.len(), 1);
+    }
+
+    /// U2 — `Event::move_ptb` constructor sets `EventType::ContractCall` and
+    /// stores the payload under `EventPayload::MovePtb`.
+    #[test]
+    fn event_move_ptb_constructor_sets_contract_call_type() {
+        use crate::ptb::ProgrammableTransaction;
+
+        let payload = MovePtbPayload {
+            sender: "0xabcd".to_string(),
+            ptb: ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            },
+        };
+        let event = Event::move_ptb(
+            payload,
+            vec![],
+            VLCSnapshot::default(),
+            "validator-1".to_string(),
+        );
+        assert_eq!(event.event_type, EventType::ContractCall);
+        assert!(matches!(event.payload, EventPayload::MovePtb(_)));
+    }
+
+    /// U3 — `EventPayload::MovePtb` is the **tail** variant (BCS discriminant
+    /// stability). Adding mid-enum variants in the future would silently break
+    /// every PTB event already in storage.
+    #[test]
+    fn event_payload_move_ptb_is_tail_variant() {
+        // Encode each existing variant; MovePtb's discriminant index must be
+        // strictly greater than every other one we know about.
+        let move_publish = EventPayload::MovePublish(MovePublishPayload { modules: vec![] });
+        let move_ptb = EventPayload::MovePtb(MovePtbPayload {
+            sender: String::new(),
+            ptb: crate::ptb::ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            },
+        });
+        let publish_bytes = bcs::to_bytes(&move_publish).unwrap();
+        let ptb_bytes = bcs::to_bytes(&move_ptb).unwrap();
+        // BCS encodes enum discriminants as ULEB128. For variant counts < 128
+        // this is one byte; MovePtb must be > MovePublish.
+        assert!(
+            ptb_bytes[0] > publish_bytes[0],
+            "MovePtb must be appended after MovePublish (ptb={} publish={})",
+            ptb_bytes[0],
+            publish_bytes[0]
         );
     }
 }

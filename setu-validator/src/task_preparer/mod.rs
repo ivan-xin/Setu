@@ -192,6 +192,26 @@ pub enum TaskPrepareError {
     /// format (corrupted blob or unknown future format).
     #[error("Failed to decode envelope: {0}")]
     EnvelopeDecode(String),
+
+    // ---- PTB event-wire errors (FDP move-vm-phase9-ptb-event-wire) ----
+    /// PTB `ObjectArg::SharedObject` rejected — Phase-1 only supports
+    /// owned/immutable inputs in PTB. See design.md §7 D5.
+    #[error("Shared object {object_id} not yet supported in PTB (Phase-1 limitation)")]
+    SharedObjectsNotYetSupported { object_id: String },
+
+    /// PTB stale-read defense: client-supplied version does not match the
+    /// on-chain envelope version. See design.md §7 D4.
+    #[error("Object {object_id} version mismatch: expected {expected}, actual {actual}")]
+    StaleObjectVersion {
+        object_id: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// PTB stale-read defense: blake3(envelope_bytes) does not match the
+    /// client-supplied digest. See design.md §7 D4.
+    #[error("Object {object_id} digest mismatch")]
+    ObjectDigestMismatch { object_id: String },
 }
 
 /// Convert SimpleMerkleProof to MerkleProof (for TEE)

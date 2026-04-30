@@ -8,8 +8,9 @@ use crate::RouterManager;
 use crate::TaskPreparer;
 use super::tee_executor::TeeExecutor;
 use setu_api::{MoveCallRequest, MoveCallResponse, MovePublishRequest, MovePublishResponse};
-use setu_types::event::{Event, MoveCallPayload, VLCSnapshot};
+use setu_types::event::{Event, MoveCallPayload, MovePtbPayload, VLCSnapshot};
 use setu_types::object::ObjectId;
+use setu_types::ptb::ProgrammableTransaction;
 use setu_types::SubnetId;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -384,6 +385,160 @@ impl MovePublishHandler {
                     success: false,
                     error: Some(e),
                 }, None)
+            }
+        }
+    }
+}
+
+/// PTB handler — unit struct matching MoveCallHandler pattern.
+///
+/// Wires the HTTP entry `/api/v1/move/ptb` end-to-end:
+///   request → MovePtbPayload → Event::move_ptb (EventType::ContractCall)
+///         → TaskPreparer.prepare_move_ptb_task
+///         → RouterManager.route_any
+///         → TeeExecutor.execute_solver_inline_batch
+///         → stage_overlay (RYW)
+///         → spawn_post_execution (consensus)
+///
+/// EventType reuse (not a new variant): see
+/// `docs/feat/move-vm-phase9-ptb-event-wire/design.md` §4.
+pub struct MovePtbHandler;
+
+impl MovePtbHandler {
+    /// Process a PTB submission. The caller (service.rs) is responsible for
+    /// hex-decoding the BCS-wrapped PTB and running `validate_wire()` first;
+    /// this method receives a fully-deserialised `ProgrammableTransaction`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_move_ptb(
+        validator_id: &str,
+        task_preparer: &TaskPreparer,
+        router_manager: &RouterManager,
+        tee_executor: &TeeExecutor,
+        state_provider: &Arc<setu_storage::MerkleStateProvider>,
+        vlc_time: u64,
+        sender: String,
+        ptb: ProgrammableTransaction,
+        subnet_id_hint: Option<String>,
+    ) -> setu_api::MovePtbResponse {
+        // 1. Resolve sender to canonical hex address.
+        let sender_hex = MoveCallHandler::resolve_address(&sender);
+        let payload = MovePtbPayload { sender: sender_hex, ptb };
+
+        // 2. Build VLCSnapshot.
+        let vlc_snapshot = VLCSnapshot {
+            vector_clock: setu_vlc::VectorClock::new(),
+            logical_time: vlc_time,
+            physical_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+
+        // 3. Create the Event (ContractCall + MovePtb payload).
+        let event = Event::move_ptb(
+            payload.clone(),
+            vec![],
+            vlc_snapshot,
+            validator_id.to_string(),
+        );
+
+        // 4. Subnet routing — D6: PTB only runs on ROOT in Phase 1.
+        let subnet_id = match subnet_id_hint.as_deref() {
+            Some(s) if s != "ROOT" => {
+                warn!(subnet = %s, "Custom subnet not supported for PTB, using ROOT");
+                SubnetId::ROOT
+            }
+            _ => SubnetId::ROOT,
+        };
+
+        // 5. Prepare SolverTask.
+        let solver_task = match task_preparer.prepare_move_ptb_task(&event, &payload, subnet_id) {
+            Ok(t) => t,
+            Err(e) => {
+                error!(error = %e, "PTB task preparation failed");
+                return setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(format!("Task preparation failed: {}", e)),
+                    code: None,
+                };
+            }
+        };
+
+        // 6. Route to a solver.
+        let solver_id = match router_manager.route_any() {
+            Ok(id) => id,
+            Err(e) => {
+                error!(error = %e, "No solver available for PTB");
+                return setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(format!("No solver available: {}", e)),
+                    code: None,
+                };
+            }
+        };
+
+        // 7. Execute via TeeExecutor.
+        let call_id = format!("move-ptb-{}", vlc_time);
+        match tee_executor.execute_solver_inline_batch(
+            &call_id, &solver_id, solver_task, vec![],
+        ).await {
+            Ok((result_event, execution_time_us, events_processed)) => {
+                let event_id = result_event.id.clone();
+                let exec_result = result_event.execution_result.as_ref();
+                let success = exec_result.map(|r| r.success).unwrap_or(false);
+                let error = if success {
+                    None
+                } else {
+                    exec_result.and_then(|r| r.message.clone())
+                };
+
+                // Stage to speculative overlay so the client can immediately
+                // read-your-writes from this validator. CF finalize will
+                // apply the canonical state via apply_committed_events.
+                if success {
+                    if let Some(r) = result_event.execution_result.as_ref() {
+                        let shared = state_provider.shared_state_manager();
+                        if let Err(e) = shared.stage_overlay(
+                            &result_event.id,
+                            SubnetId::ROOT,
+                            &r.state_changes,
+                        ) {
+                            error!(
+                                event_id = %result_event.id,
+                                error = %e,
+                                "PTB state_change has malformed key; overlay stage skipped"
+                            );
+                        }
+                    }
+                }
+
+                tee_executor.spawn_post_execution(
+                    call_id, result_event, execution_time_us, events_processed,
+                );
+
+                info!(
+                    event_id = %event_id,
+                    solver_id = %solver_id,
+                    "PTB executed"
+                );
+
+                setu_api::MovePtbResponse {
+                    event_id,
+                    success,
+                    error,
+                    code: None,
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "PTB TEE execution failed");
+                setu_api::MovePtbResponse {
+                    event_id: String::new(),
+                    success: false,
+                    error: Some(format!("Execution failed: {}", e)),
+                    code: None,
+                }
             }
         }
     }

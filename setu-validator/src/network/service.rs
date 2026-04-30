@@ -762,10 +762,9 @@ impl ValidatorNetworkService {
 
     /// Submit a Programmable Transaction Block (PTB).
     ///
-    /// **B6a**: validation runs (4xx on malformed); well-formed PTBs return
-    /// 501 with `code = PTB_NOT_YET_EXECUTABLE`. B6b will replace the 501
-    /// branch with real execution. See
-    /// `docs/feat/move-vm-phase9-ptb-wire/design.md`.
+    /// Decodes + wire-validates the BCS-encoded PTB, then delegates to
+    /// `MovePtbHandler` for prepare → solver routing → TEE execution.
+    /// See `docs/feat/move-vm-phase9-ptb-event-wire/design.md`.
     pub async fn submit_move_ptb(
         &self,
         request: setu_api::MovePtbRequest,
@@ -807,16 +806,27 @@ impl ValidatorNetworkService {
             });
         }
 
-        // 4. B6a stub — execution is deferred to B6b.
-        Ok(setu_api::MovePtbResponse {
-            event_id: String::new(),
-            success: false,
-            error: Some(
-                "Programmable Transaction execution is not yet available (deferred to B6b)"
-                    .to_string(),
-            ),
-            code: Some(setu_api::PTB_NOT_YET_EXECUTABLE.to_string()),
-        })
+        // 4. Delegate to MovePtbHandler (FDP move-vm-phase9-ptb-event-wire).
+        let vlc_time = self.vlc_counter.fetch_add(1, Ordering::SeqCst);
+        let state_provider = Arc::clone(self.batch_task_preparer.merkle_state_provider());
+        let response = move_handler::MovePtbHandler::submit_move_ptb(
+            &self.validator_id,
+            &self.task_preparer,
+            &self.router_manager,
+            &self.tee_executor,
+            &state_provider,
+            vlc_time,
+            request.sender.clone(),
+            ptb,
+            request.subnet_id.clone(),
+        )
+        .await;
+
+        if response.success {
+            Ok(response)
+        } else {
+            Err(response)
+        }
     }
 
     /// Query a Move object by its hex object ID.

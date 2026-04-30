@@ -317,9 +317,12 @@ pub enum OperationType {
 
     /// Programmable Transaction Block (PTB).
     ///
-    /// **B6a**: this variant carries the wire-format payload only. Validator
-    /// + solver dispatch paths early-reject with `PTB_NOT_YET_EXECUTABLE`
-    /// until B6b lands. See `docs/feat/move-vm-phase9-ptb-wire/design.md`.
+    /// Carries a fully-validated [`ProgrammableTransaction`](crate::ptb::ProgrammableTransaction)
+    /// from the wire down to the executor. The dispatch chain is:
+    ///   service.rs `submit_move_ptb` → `MovePtbHandler` →
+    ///   `TaskPreparer::prepare_move_ptb_task` → `HybridExecutor` →
+    ///   `engine.execute_ptb`. See
+    ///   `docs/feat/move-vm-phase9-ptb-event-wire/design.md`.
     ///
     /// New tail variant — appended for BCS-additive forward compatibility.
     /// Existing serialized `OperationType` values (Transfer/MergeCoins/...)

@@ -1087,154 +1087,37 @@ impl TaskPreparer {
             .collect();
 
         let mut resolved_dfs: Vec<setu_types::task::ResolvedDynamicField> = Vec::new();
+        // Convert hex-string DF accesses (MoveCall wire form) → internal binary
+        // form, then delegate to the shared resolver. The hex-decode of
+        // `parent_object_id` (which tolerates the optional `"oid:"` prefix) and
+        // of `key_bcs_hex` happens here; downstream all forms agree on bytes.
+        let mut internal_dfs: Vec<DfAccessInternal> =
+            Vec::with_capacity(call.dynamic_field_accesses.len());
         for df in &call.dynamic_field_accesses {
-            let parent_oid = parse_oid_with_optional_prefix(&df.parent_object_id)?;
-
-            if !declared_parents.contains(&parent_oid) {
-                return Err(TaskPrepareError::DynamicFieldParentNotDeclared {
-                    parent: df.parent_object_id.clone(),
-                });
-            }
-
-            // Parent ownership / authorisation (§3.4).
-            let parent_env = load_envelope(&*self.state_provider, &parent_oid)?
-                .ok_or_else(|| TaskPrepareError::ObjectNotFound(
-                    hex::encode(parent_oid.as_bytes()),
-                ))?;
-            match parent_env.metadata.ownership {
-                setu_types::Ownership::AddressOwner(owner) => {
-                    if owner != sender_addr {
-                        return Err(TaskPrepareError::NotOwnedBySender {
-                            object_id: hex::encode(parent_oid.as_bytes()),
-                            sender: call.sender.clone(),
-                        });
-                    }
-                }
-                setu_types::Ownership::Shared { .. } => { /* any sender OK */ }
-                setu_types::Ownership::Immutable => {
-                    if df.mode != setu_types::dynamic_field::DfAccessMode::Read {
-                        return Err(TaskPrepareError::DynamicFieldOnImmutableParent);
-                    }
-                }
-                setu_types::Ownership::ObjectOwner(_) => {
-                    // Parent is itself a DF entry — nested DF not supported.
-                    return Err(TaskPrepareError::DynamicFieldParentNotRoot);
-                }
-            }
-
-            let key_bytes = hex::decode(&df.key_bcs_hex).map_err(|e| {
+            let parent = parse_oid_with_optional_prefix(&df.parent_object_id)?;
+            let key_bcs = hex::decode(&df.key_bcs_hex).map_err(|e| {
                 TaskPrepareError::InvalidInput(format!(
                     "invalid key_bcs_hex for DF parent={}: {}",
                     df.parent_object_id, e,
                 ))
             })?;
-            let df_oid = setu_types::dynamic_field::derive_df_oid(
-                &parent_oid,
-                &df.key_type,
-                &key_bytes,
-            );
-
-            // Per-mode resolution (fix-df-exists-absent-rejected, 2026-04-27):
-            //   - Mutate / Delete: presence required (need on-disk envelope
-            //     bytes for the StateChange `old_value`).
-            //   - Read           : presence OPTIONAL — `exists_` must work
-            //     for absent keys, and `borrow` cleanly aborts at the VM
-            //     native via `E_DF_DOES_NOT_EXIST` when `value_bytes=None`.
-            //   - Create         : entry must NOT exist.
-            let (value_bytes, value_type_tag_resolved, envelope_bytes) = match df.mode {
-                setu_types::dynamic_field::DfAccessMode::Mutate
-                | setu_types::dynamic_field::DfAccessMode::Delete => {
-                    let df_env = load_envelope(&*self.state_provider, &df_oid)?
-                        .ok_or_else(|| TaskPrepareError::DynamicFieldNotFound {
-                            parent: df.parent_object_id.clone(),
-                            key_type: df.key_type.clone(),
-                        })?;
-                    ensure_df_ownership(&df_env, parent_oid)?;
-                    let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
-                    let envelope_bytes = df_env.to_bytes();
-                    read_set.push(ReadSetEntry::new(key, envelope_bytes.clone()));
-
-                    // Decode the on-disk DfFieldValue and hand the native
-                    // its INNER `value_bcs`, not the envelope wrapper. The
-                    // dynamic_field natives call `deserialize_value_bytes`
-                    // with Move type `V`, so passing the wrapper bytes
-                    // triggers VALUE_DESERIALIZATION_ERROR in the VM.
-                    //
-                    // The full `envelope_bytes` is also carried through so
-                    // the VM engine can emit `StateChange.old_value` that
-                    // byte-matches the current SMT at CF apply time.
-                    let on_disk = bcs::from_bytes::<
-                        setu_types::dynamic_field::DfFieldValue,
-                    >(&df_env.data)
-                    .map_err(|e| TaskPrepareError::InvalidInput(format!(
-                        "malformed DfFieldValue at df_oid={}: {}",
-                        hex::encode(df_oid.as_bytes()), e,
-                    )))?;
-                    (Some(on_disk.value_bcs), on_disk.value_type_tag, Some(envelope_bytes))
-                }
-                setu_types::dynamic_field::DfAccessMode::Read => {
-                    let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
-                    match load_envelope(&*self.state_provider, &df_oid)? {
-                        Some(df_env) => {
-                            ensure_df_ownership(&df_env, parent_oid)?;
-                            let envelope_bytes = df_env.to_bytes();
-                            read_set.push(ReadSetEntry::new(key, envelope_bytes.clone()));
-                            let on_disk = bcs::from_bytes::<
-                                setu_types::dynamic_field::DfFieldValue,
-                            >(&df_env.data)
-                            .map_err(|e| TaskPrepareError::InvalidInput(format!(
-                                "malformed DfFieldValue at df_oid={}: {}",
-                                hex::encode(df_oid.as_bytes()), e,
-                            )))?;
-                            (
-                                Some(on_disk.value_bcs),
-                                on_disk.value_type_tag,
-                                Some(envelope_bytes),
-                            )
-                        }
-                        None => {
-                            // Absent-Read sentinel: shape is identical to
-                            // Create's pre-tx state — empty read-set bytes,
-                            // value_bytes=None, envelope_bytes=None. The VM
-                            // cache's `value_bytes.is_some()` predicate then
-                            // drives both natives correctly:
-                            //   * exists_internal → false
-                            //   * borrow_internal → E_DF_DOES_NOT_EXIST
-                            // PWOO conflict detection: empty bytes mean "I
-                            // observed this slot as absent"; any concurrent
-                            // CF that creates the same df_oid will produce a
-                            // post-state with non-empty envelope bytes →
-                            // conflict, txn rejected (same semantics as the
-                            // existing Create flow).
-                            read_set.push(ReadSetEntry::new(key, Vec::new()));
-                            (None, df.value_type.clone().unwrap_or_default(), None)
-                        }
-                    }
-                }
-                setu_types::dynamic_field::DfAccessMode::Create => {
-                    if load_envelope(&*self.state_provider, &df_oid)?.is_some() {
-                        return Err(TaskPrepareError::DynamicFieldAlreadyExists {
-                            parent: df.parent_object_id.clone(),
-                            key_type: df.key_type.clone(),
-                        });
-                    }
-                    let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
-                    read_set.push(ReadSetEntry::new(key, Vec::new()));
-                    (None, df.value_type.clone().unwrap_or_default(), None)
-                }
-            };
-
-            resolved_dfs.push(setu_types::task::ResolvedDynamicField {
-                parent_object_id: parent_oid,
-                df_object_id: df_oid,
-                name_type_tag: df.key_type.clone(),
-                name_bcs: key_bytes,
-                value_bytes,
-                value_type_tag: value_type_tag_resolved,
+            internal_dfs.push(DfAccessInternal {
+                parent,
+                key_type: df.key_type.clone(),
+                key_bcs,
                 mode: df.mode,
-                envelope_bytes,
+                value_type: df.value_type.clone(),
             });
         }
+        resolve_dynamic_fields_into(
+            &*self.state_provider,
+            sender_addr,
+            &call.sender,
+            &internal_dfs,
+            &declared_parents,
+            &mut read_set,
+            &mut resolved_dfs,
+        )?;
 
         // 2. Validate indices
         //
@@ -1305,6 +1188,194 @@ impl TaskPreparer {
         };
 
         let pre_state_root = self.state_provider.get_state_root();
+
+        Ok(SolverTask {
+            task_id,
+            subnet_id,
+            pre_state_root,
+            event: event.clone(),
+            read_set,
+            resolved_inputs,
+            gas_budget: setu_types::task::GasBudget::default(),
+            module_read_set,
+        })
+    }
+
+    // ========== Phase 9: PTB task preparation (FDP move-vm-phase9-ptb-event-wire) ==========
+
+    /// Prepare a SolverTask for a Programmable Transaction Block.
+    ///
+    /// PTB is the "many commands, one atomic effect" Move execution mode.
+    /// Compared to `prepare_move_call_task`, all input-object metadata
+    /// (version, digest, mutability) lives inside `ptb.inputs[].ObjectArg` —
+    /// there is no parallel `input_object_ids` / `mutable_indices` /
+    /// `consumed_indices` list. This function:
+    ///
+    /// 1. Walks `ptb.inputs` once; resolves every `ObjectArg` from the SMT.
+    ///    Owned-object size invariant: `input_objects.len() ≤ ptb.inputs.len()`.
+    ///    Pure args contribute no SMT lookup; the engine builds its
+    ///    `Slot[i]` vec linearly over `ptb.inputs` later, looking objects up
+    ///    by ObjectId (`engine.rs:792-803`), so the asymmetry is safe.
+    /// 2. Enforces stale-read defense (D4): `actual_version == expected_version`
+    ///    AND `blake3(envelope_bytes) == digest`.
+    /// 3. Rejects `ObjectArg::SharedObject` (D5 Phase-1 limitation —
+    ///    SharedObject's wire form has no digest, so a future unblock must
+    ///    introduce a separate stale-read mechanism).
+    /// 4. Resolves `ptb.dynamic_field_accesses` via the shared
+    ///    `resolve_dynamic_fields_into` helper.
+    /// 5. Collects every distinct `(package, module)` referenced by
+    ///    `Command::MoveCall` into `module_read_set`.
+    pub fn prepare_move_ptb_task(
+        &self,
+        event: &setu_types::Event,
+        payload: &setu_types::event::MovePtbPayload,
+        subnet_id: SubnetId,
+    ) -> Result<SolverTask, TaskPrepareError> {
+        use setu_types::ptb::{CallArg, ObjectArg};
+
+        let sender_addr = setu_types::Address::normalize(&payload.sender);
+        let ptb = &payload.ptb;
+
+        // 1. Resolve Object inputs.
+        let mut input_objects: Vec<ResolvedObject> = Vec::new();
+        let mut read_set: Vec<ReadSetEntry> = Vec::new();
+        let mut declared_parents: std::collections::HashSet<ObjectId> =
+            std::collections::HashSet::new();
+
+        for (i, arg) in ptb.inputs.iter().enumerate() {
+            match arg {
+                CallArg::Pure(_) => continue,
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(id, version, digest)) => {
+                    let env = load_envelope(&*self.state_provider, id)?
+                        .ok_or_else(|| TaskPrepareError::ObjectNotFound(
+                            hex::encode(id.as_bytes()),
+                        ))?;
+
+                    // Ownership check (mirrors prepare_move_call_task §1).
+                    match env.metadata.ownership {
+                        setu_types::Ownership::AddressOwner(owner) => {
+                            if owner != sender_addr {
+                                return Err(TaskPrepareError::NotOwnedBySender {
+                                    object_id: hex::encode(id.as_bytes()),
+                                    sender: payload.sender.clone(),
+                                });
+                            }
+                        }
+                        setu_types::Ownership::Immutable => {
+                            // Allowed read-only; engine's signature-based
+                            // mutability check still gates &mut binding at
+                            // command-resolve time. PTB has no separate
+                            // mutable_indices list to cross-check here.
+                        }
+                        setu_types::Ownership::ObjectOwner(parent) => {
+                            return Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs {
+                                object_id: hex::encode(id.as_bytes()),
+                                parent_object_id: hex::encode(parent.as_bytes()),
+                                index: i,
+                            });
+                        }
+                        setu_types::Ownership::Shared { .. } => {
+                            // A `Shared` on-chain object reaching us via
+                            // `ImmOrOwnedObject` is a client error — they
+                            // must use `ObjectArg::SharedObject` (which is
+                            // currently rejected anyway by D5).
+                            return Err(TaskPrepareError::UseSharedObjectIdsInstead {
+                                object_id: hex::encode(id.as_bytes()),
+                            });
+                        }
+                    }
+
+                    // D4: stale-read defense — version + digest.
+                    if env.metadata.version != *version {
+                        return Err(TaskPrepareError::StaleObjectVersion {
+                            object_id: hex::encode(id.as_bytes()),
+                            expected: *version,
+                            actual: env.metadata.version,
+                        });
+                    }
+                    let envelope_bytes = env.to_bytes();
+                    let actual_digest = blake3::hash(&envelope_bytes);
+                    if actual_digest.as_bytes() != digest {
+                        return Err(TaskPrepareError::ObjectDigestMismatch {
+                            object_id: hex::encode(id.as_bytes()),
+                        });
+                    }
+
+                    let key = format!("oid:{}", hex::encode(id.as_bytes()));
+                    read_set.push(ReadSetEntry::new(key, envelope_bytes));
+                    input_objects.push(
+                        ResolvedObject::new(*id, "MoveObject")
+                            .with_version(*version),
+                    );
+                    declared_parents.insert(*id);
+                }
+                CallArg::Object(ObjectArg::SharedObject { id, .. }) => {
+                    // D5 (R1-ISSUE-3): Phase-1 hard reject. When unblocked
+                    // later, a separate stale-read mechanism is required —
+                    // SharedObject wire form carries no digest.
+                    return Err(TaskPrepareError::SharedObjectsNotYetSupported {
+                        object_id: hex::encode(id.as_bytes()),
+                    });
+                }
+            }
+        }
+
+        // 2. Resolve PTB dynamic_field_accesses via the shared helper.
+        let internal_dfs: Vec<DfAccessInternal> = ptb
+            .dynamic_field_accesses
+            .iter()
+            .map(|d| DfAccessInternal {
+                parent: d.parent,
+                key_type: d.key_type.clone(),
+                key_bcs: d.key_bcs.clone(),
+                mode: d.mode,
+                value_type: d.value_type.clone(),
+            })
+            .collect();
+        let mut resolved_dfs: Vec<setu_types::task::ResolvedDynamicField> = Vec::new();
+        resolve_dynamic_fields_into(
+            &*self.state_provider,
+            sender_addr,
+            &payload.sender,
+            &internal_dfs,
+            &declared_parents,
+            &mut read_set,
+            &mut resolved_dfs,
+        )?;
+
+        // 3. Module read-set: union of every (package, module) referenced by
+        //    Command::MoveCall in ptb.commands.
+        let mut module_read_set: Vec<ReadSetEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for cmd in &ptb.commands {
+            if let setu_types::ptb::Command::MoveCall(mc) = cmd {
+                let pkg_hex = format!("0x{}", hex::encode(mc.package.as_bytes()));
+                if !seen.insert((pkg_hex.clone(), mc.module.clone())) {
+                    continue;
+                }
+                let module_set =
+                    self.resolve_module_dependencies(&pkg_hex, &mc.module)?;
+                module_read_set.extend(module_set);
+            }
+        }
+
+        // 4. Assemble SolverTask.
+        let task_id = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"SETU_TASK:");
+            hasher.update(event.id.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let pre_state_root = self.state_provider.get_state_root();
+
+        let resolved_inputs = ResolvedInputs {
+            operation: setu_types::task::OperationType::ProgrammableTransaction(
+                ptb.clone(),
+            ),
+            input_objects,
+            dynamic_fields: resolved_dfs,
+        };
 
         Ok(SolverTask {
             task_id,
@@ -1446,6 +1517,170 @@ fn ensure_df_ownership(
         setu_types::Ownership::ObjectOwner(parent) if parent == expected_parent => Ok(()),
         _ => Err(TaskPrepareError::DynamicFieldParentMismatch),
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// DF resolver — shared between MoveCall and PTB prepare paths
+// (FDP move-vm-phase9-ptb-event-wire R1-ISSUE-1)
+// ═══════════════════════════════════════════════════════════
+
+/// Internal binary form of a declared dynamic-field access.
+///
+/// Both `MoveCallPayload.dynamic_field_accesses` (hex-string
+/// `DynamicFieldAccess`) and `ProgrammableTransaction.dynamic_field_accesses`
+/// (binary `PtbDfAccess`) convert to this before resolution. Keeping a single
+/// resolver eliminates the cross-layer-mismatch class of bugs (G12).
+pub(crate) struct DfAccessInternal {
+    pub parent: ObjectId,
+    pub key_type: String,
+    pub key_bcs: Vec<u8>,
+    pub mode: setu_types::dynamic_field::DfAccessMode,
+    pub value_type: Option<String>,
+}
+
+/// Resolve a list of `DfAccessInternal` against the SMT, appending to
+/// `read_set` and `resolved_dfs`. Performs:
+///
+/// 1. Parent-declared check against `declared_parents` (caller-supplied set).
+/// 2. Parent ownership / authorisation (AddressOwner == sender, Shared OK,
+///    Immutable read-only, ObjectOwner forbidden).
+/// 3. Per-mode resolution:
+///    - Mutate / Delete: presence required, decode `DfFieldValue` envelope.
+///    - Read           : presence optional (absent-Read sentinel).
+///    - Create         : entry must NOT exist.
+///
+/// Mirrors the body that previously lived inline inside
+/// `prepare_move_call_task`.
+pub(crate) fn resolve_dynamic_fields_into(
+    state_provider: &dyn StateProvider,
+    sender_addr: setu_types::Address,
+    sender_hex_for_errors: &str,
+    accesses: &[DfAccessInternal],
+    declared_parents: &std::collections::HashSet<ObjectId>,
+    read_set: &mut Vec<ReadSetEntry>,
+    resolved_dfs: &mut Vec<setu_types::task::ResolvedDynamicField>,
+) -> Result<(), TaskPrepareError> {
+    for df in accesses {
+        let parent_oid = df.parent;
+
+        if !declared_parents.contains(&parent_oid) {
+            return Err(TaskPrepareError::DynamicFieldParentNotDeclared {
+                parent: hex::encode(parent_oid.as_bytes()),
+            });
+        }
+
+        // Parent ownership / authorisation (§3.4).
+        let parent_env = load_envelope(state_provider, &parent_oid)?
+            .ok_or_else(|| TaskPrepareError::ObjectNotFound(
+                hex::encode(parent_oid.as_bytes()),
+            ))?;
+        match parent_env.metadata.ownership {
+            setu_types::Ownership::AddressOwner(owner) => {
+                if owner != sender_addr {
+                    return Err(TaskPrepareError::NotOwnedBySender {
+                        object_id: hex::encode(parent_oid.as_bytes()),
+                        sender: sender_hex_for_errors.to_string(),
+                    });
+                }
+            }
+            setu_types::Ownership::Shared { .. } => { /* any sender OK */ }
+            setu_types::Ownership::Immutable => {
+                if df.mode != setu_types::dynamic_field::DfAccessMode::Read {
+                    return Err(TaskPrepareError::DynamicFieldOnImmutableParent);
+                }
+            }
+            setu_types::Ownership::ObjectOwner(_) => {
+                return Err(TaskPrepareError::DynamicFieldParentNotRoot);
+            }
+        }
+
+        let df_oid = setu_types::dynamic_field::derive_df_oid(
+            &parent_oid,
+            &df.key_type,
+            &df.key_bcs,
+        );
+
+        // Per-mode resolution (fix-df-exists-absent-rejected, 2026-04-27):
+        //   - Mutate / Delete: presence required (need on-disk envelope
+        //     bytes for the StateChange `old_value`).
+        //   - Read           : presence OPTIONAL — `exists_` must work
+        //     for absent keys, and `borrow` cleanly aborts at the VM
+        //     native via `E_DF_DOES_NOT_EXIST` when `value_bytes=None`.
+        //   - Create         : entry must NOT exist.
+        let (value_bytes, value_type_tag_resolved, envelope_bytes) = match df.mode {
+            setu_types::dynamic_field::DfAccessMode::Mutate
+            | setu_types::dynamic_field::DfAccessMode::Delete => {
+                let df_env = load_envelope(state_provider, &df_oid)?
+                    .ok_or_else(|| TaskPrepareError::DynamicFieldNotFound {
+                        parent: hex::encode(parent_oid.as_bytes()),
+                        key_type: df.key_type.clone(),
+                    })?;
+                ensure_df_ownership(&df_env, parent_oid)?;
+                let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                let envelope_bytes = df_env.to_bytes();
+                read_set.push(ReadSetEntry::new(key, envelope_bytes.clone()));
+
+                let on_disk = bcs::from_bytes::<
+                    setu_types::dynamic_field::DfFieldValue,
+                >(&df_env.data)
+                .map_err(|e| TaskPrepareError::InvalidInput(format!(
+                    "malformed DfFieldValue at df_oid={}: {}",
+                    hex::encode(df_oid.as_bytes()), e,
+                )))?;
+                (Some(on_disk.value_bcs), on_disk.value_type_tag, Some(envelope_bytes))
+            }
+            setu_types::dynamic_field::DfAccessMode::Read => {
+                let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                match load_envelope(state_provider, &df_oid)? {
+                    Some(df_env) => {
+                        ensure_df_ownership(&df_env, parent_oid)?;
+                        let envelope_bytes = df_env.to_bytes();
+                        read_set.push(ReadSetEntry::new(key, envelope_bytes.clone()));
+                        let on_disk = bcs::from_bytes::<
+                            setu_types::dynamic_field::DfFieldValue,
+                        >(&df_env.data)
+                        .map_err(|e| TaskPrepareError::InvalidInput(format!(
+                            "malformed DfFieldValue at df_oid={}: {}",
+                            hex::encode(df_oid.as_bytes()), e,
+                        )))?;
+                        (
+                            Some(on_disk.value_bcs),
+                            on_disk.value_type_tag,
+                            Some(envelope_bytes),
+                        )
+                    }
+                    None => {
+                        // Absent-Read sentinel (see fix-df-exists-absent-rejected).
+                        read_set.push(ReadSetEntry::new(key, Vec::new()));
+                        (None, df.value_type.clone().unwrap_or_default(), None)
+                    }
+                }
+            }
+            setu_types::dynamic_field::DfAccessMode::Create => {
+                if load_envelope(state_provider, &df_oid)?.is_some() {
+                    return Err(TaskPrepareError::DynamicFieldAlreadyExists {
+                        parent: hex::encode(parent_oid.as_bytes()),
+                        key_type: df.key_type.clone(),
+                    });
+                }
+                let key = format!("oid:{}", hex::encode(df_oid.as_bytes()));
+                read_set.push(ReadSetEntry::new(key, Vec::new()));
+                (None, df.value_type.clone().unwrap_or_default(), None)
+            }
+        };
+
+        resolved_dfs.push(setu_types::task::ResolvedDynamicField {
+            parent_object_id: parent_oid,
+            df_object_id: df_oid,
+            name_type_tag: df.key_type.clone(),
+            name_bcs: df.key_bcs.clone(),
+            value_bytes,
+            value_type_tag: value_type_tag_resolved,
+            mode: df.mode,
+            envelope_bytes,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2903,6 +3138,280 @@ mod tests {
                 .prepare_move_call_task(&test_event(), &call, SubnetId::ROOT)
                 .expect("prepare ok");
             assert!(task.resolved_inputs.dynamic_fields.is_empty());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // PTB event-wire tests (FDP move-vm-phase9-ptb-event-wire)
+    // U4-U13 from the test matrix.
+    // ════════════════════════════════════════════════════════════
+    mod ptb_event_wire_tests {
+        use super::*;
+        use setu_types::ptb::{CallArg, ObjectArg, ProgrammableTransaction};
+        use setu_types::event::MovePtbPayload;
+
+        fn empty_ptb() -> ProgrammableTransaction {
+            ProgrammableTransaction {
+                inputs: vec![],
+                commands: vec![],
+                dynamic_field_accesses: vec![],
+            }
+        }
+
+        /// Compute (envelope_bytes, blake3_digest) for a deterministic
+        /// alice-owned envelope at version 1.
+        fn make_owned_envelope_for_alice(
+            object_id: ObjectId,
+        ) -> (setu_types::ObjectEnvelope, [u8; 32]) {
+            let alice = setu_types::Address::normalize("alice");
+            let env = setu_types::ObjectEnvelope::from_move_result(
+                object_id,
+                alice,
+                1,
+                setu_types::Ownership::AddressOwner(alice),
+                "0xcafe::test::TestObj".to_string(),
+                vec![0u8; 32],
+            );
+            let bytes = env.to_bytes();
+            let digest = *blake3::hash(&bytes).as_bytes();
+            (env, digest)
+        }
+
+        fn ptb_payload(ptb: ProgrammableTransaction) -> MovePtbPayload {
+            let alice = setu_types::Address::normalize("alice");
+            MovePtbPayload {
+                sender: hex::encode(alice.as_bytes()),
+                ptb,
+            }
+        }
+
+        /// U4 — PTB with only `Pure` inputs needs no SMT lookup.
+        #[test]
+        fn u4_prepare_ptb_pure_only_succeeds() {
+            let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+            let mut ptb = empty_ptb();
+            ptb.inputs.push(CallArg::Pure(vec![1, 2, 3]));
+            let payload = ptb_payload(ptb);
+
+            let task = preparer
+                .prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT)
+                .expect("pure-only PTB must succeed");
+            assert!(
+                task.resolved_inputs.input_objects.is_empty(),
+                "Pure inputs must NOT contribute to input_objects"
+            );
+            // SolverTask::operation must be PTB.
+            assert!(matches!(
+                task.resolved_inputs.operation,
+                setu_types::task::OperationType::ProgrammableTransaction(_)
+            ));
+        }
+
+        /// U5 — owned object passes ownership + version + digest checks.
+        #[test]
+        fn u5_prepare_ptb_owned_object_passes() {
+            let alice = setu_types::Address::normalize("alice");
+            let obj_id = ObjectId::new([0x11; 32]);
+            let preparer = make_preparer_with_owned_object(
+                obj_id,
+                alice,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+            );
+            let (_, digest) = make_owned_envelope_for_alice(obj_id);
+
+            let mut ptb = empty_ptb();
+            ptb.inputs.push(CallArg::Object(ObjectArg::ImmOrOwnedObject(
+                obj_id, 1, digest,
+            )));
+            let payload = ptb_payload(ptb);
+
+            let task = preparer
+                .prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT)
+                .expect("owned object must pass");
+            assert_eq!(task.resolved_inputs.input_objects.len(), 1);
+            assert_eq!(task.resolved_inputs.input_objects[0].object_id, obj_id);
+            assert_eq!(task.resolved_inputs.input_objects[0].expected_version, 1);
+            // read_set must contain the oid envelope entry.
+            let oid_key = format!("oid:{}", hex::encode(obj_id.as_bytes()));
+            assert!(task.read_set.iter().any(|e| e.key == oid_key));
+        }
+
+        /// U6 — wrong owner is rejected with `NotOwnedBySender`.
+        #[test]
+        fn u6_prepare_ptb_wrong_owner_rejects() {
+            let bob = setu_types::Address::normalize("bob");
+            let obj_id = ObjectId::new([0x22; 32]);
+            // Stored under bob, but sender is alice (via ptb_payload).
+            let preparer = make_preparer_with_owned_object(
+                obj_id,
+                bob,
+                setu_types::Ownership::AddressOwner(bob),
+                None,
+            );
+            // Compute digest for the bob-owned envelope.
+            let bob_env = setu_types::ObjectEnvelope::from_move_result(
+                obj_id,
+                bob,
+                1,
+                setu_types::Ownership::AddressOwner(bob),
+                "0xcafe::test::TestObj".to_string(),
+                vec![0u8; 32],
+            );
+            let digest = *blake3::hash(&bob_env.to_bytes()).as_bytes();
+
+            let mut ptb = empty_ptb();
+            ptb.inputs.push(CallArg::Object(ObjectArg::ImmOrOwnedObject(
+                obj_id, 1, digest,
+            )));
+            let payload = ptb_payload(ptb); // sender = alice
+
+            let result =
+                preparer.prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT);
+            assert!(
+                matches!(result, Err(TaskPrepareError::NotOwnedBySender { .. })),
+                "got: {:?}", result
+            );
+        }
+
+        /// U7 — version mismatch yields `StaleObjectVersion`.
+        #[test]
+        fn u7_prepare_ptb_stale_version_rejects() {
+            let alice = setu_types::Address::normalize("alice");
+            let obj_id = ObjectId::new([0x33; 32]);
+            let preparer = make_preparer_with_owned_object(
+                obj_id,
+                alice,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+            );
+            let (_, digest) = make_owned_envelope_for_alice(obj_id);
+
+            let mut ptb = empty_ptb();
+            // Client claims version 99, on-chain is 1.
+            ptb.inputs.push(CallArg::Object(ObjectArg::ImmOrOwnedObject(
+                obj_id, 99, digest,
+            )));
+            let payload = ptb_payload(ptb);
+
+            let result =
+                preparer.prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT);
+            match result {
+                Err(TaskPrepareError::StaleObjectVersion { expected, actual, .. }) => {
+                    assert_eq!(expected, 99);
+                    assert_eq!(actual, 1);
+                }
+                other => panic!("expected StaleObjectVersion, got: {:?}", other),
+            }
+        }
+
+        /// U8 — digest mismatch yields `ObjectDigestMismatch`.
+        #[test]
+        fn u8_prepare_ptb_digest_mismatch_rejects() {
+            let alice = setu_types::Address::normalize("alice");
+            let obj_id = ObjectId::new([0x44; 32]);
+            let preparer = make_preparer_with_owned_object(
+                obj_id,
+                alice,
+                setu_types::Ownership::AddressOwner(alice),
+                None,
+            );
+
+            let mut ptb = empty_ptb();
+            // Client supplies a wrong digest.
+            ptb.inputs.push(CallArg::Object(ObjectArg::ImmOrOwnedObject(
+                obj_id, 1, [0xFFu8; 32],
+            )));
+            let payload = ptb_payload(ptb);
+
+            let result =
+                preparer.prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT);
+            assert!(
+                matches!(result, Err(TaskPrepareError::ObjectDigestMismatch { .. })),
+                "got: {:?}", result
+            );
+        }
+
+        /// U9 — `ObjectOwner`-owned objects must NOT be passed through raw
+        /// PTB inputs (DF entries belong in `dynamic_field_accesses`).
+        #[test]
+        fn u9_prepare_ptb_objectowner_rejected() {
+            let alice = setu_types::Address::normalize("alice");
+            let parent_id = ObjectId::new([0xAB; 32]);
+            let df_id = ObjectId::new([0xCD; 32]);
+
+            // Store a DF entry (ObjectOwner = parent).
+            let preparer = make_preparer_with_owned_object(
+                df_id,
+                alice,
+                setu_types::Ownership::ObjectOwner(parent_id),
+                None,
+            );
+            // Recompute the actual envelope digest stored under df_id.
+            let df_env = setu_types::ObjectEnvelope::from_move_result(
+                df_id,
+                alice,
+                1,
+                setu_types::Ownership::ObjectOwner(parent_id),
+                "0xcafe::test::TestObj".to_string(),
+                vec![0u8; 32],
+            );
+            let digest = *blake3::hash(&df_env.to_bytes()).as_bytes();
+
+            let mut ptb = empty_ptb();
+            ptb.inputs.push(CallArg::Object(ObjectArg::ImmOrOwnedObject(
+                df_id, 1, digest,
+            )));
+            let payload = ptb_payload(ptb);
+
+            let result =
+                preparer.prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT);
+            assert!(
+                matches!(result, Err(TaskPrepareError::ObjectOwnerNotAllowedInInputs { .. })),
+                "got: {:?}", result
+            );
+        }
+
+        /// U10 — `ObjectArg::SharedObject` is hard-rejected in Phase 1.
+        #[test]
+        fn u10_prepare_ptb_shared_object_phase1_rejected() {
+            let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+            let obj_id = ObjectId::new([0x55; 32]);
+
+            let mut ptb = empty_ptb();
+            ptb.inputs.push(CallArg::Object(ObjectArg::SharedObject {
+                id: obj_id,
+                initial_shared_version: 1,
+                mutable: true,
+            }));
+            let payload = ptb_payload(ptb);
+
+            let result =
+                preparer.prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT);
+            assert!(
+                matches!(result, Err(TaskPrepareError::SharedObjectsNotYetSupported { .. })),
+                "got: {:?}", result
+            );
+        }
+
+        /// U11 — referencing an unknown ObjectId yields `ObjectNotFound`.
+        #[test]
+        fn u11_prepare_ptb_unknown_object_rejects() {
+            let preparer = TaskPreparer::new_for_testing("validator-1".to_string());
+            let obj_id = ObjectId::new([0x66; 32]);
+
+            let mut ptb = empty_ptb();
+            ptb.inputs.push(CallArg::Object(ObjectArg::ImmOrOwnedObject(
+                obj_id, 1, [0u8; 32],
+            )));
+            let payload = ptb_payload(ptb);
+
+            let result =
+                preparer.prepare_move_ptb_task(&test_event(), &payload, SubnetId::ROOT);
+            assert!(
+                matches!(result, Err(TaskPrepareError::ObjectNotFound(_))),
+                "got: {:?}", result
+            );
         }
     }
 }

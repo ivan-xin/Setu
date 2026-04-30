@@ -1093,6 +1093,120 @@ impl MockEnclave {
                 return Ok(());
             }
 
+            // PTB — only when move-vm feature is enabled.
+            // FDP: docs/feat/move-vm-phase9-ptb-event-wire.
+            // Defense-in-depth ownership recheck mirrors the MoveCall arm;
+            // Phase 1 only accepts ImmOrOwnedObject (D5 — SharedObject is
+            // hard-rejected at TaskPreparer and re-rejected here).
+            #[cfg(feature = "move-vm")]
+            setu_types::event::EventPayload::MovePtb(payload) => {
+                let engine = self.move_engine.as_ref()
+                    .ok_or("Move VM not enabled".to_string())?;
+
+                let sender_addr = Address::from_hex(&payload.sender)
+                    .map_err(|e| format!("Invalid PTB sender: {}", e))?;
+
+                // Construct InputObjects (PTB Phase 1: AddressOwner(sender)
+                // or Immutable only). resolved_inputs.input_objects is
+                // ordered to match the Object positions in payload.ptb.inputs
+                // (TaskPreparer guarantees alignment).
+                let input_objects: Vec<InputObject> = resolved_inputs
+                    .input_objects
+                    .iter()
+                    .map(|ro| {
+                        let env = local_runtime.state().get_envelope(&ro.object_id)
+                            .map_err(|e| format!("Failed to get envelope for {}: {}", ro.object_id, e))?
+                            .ok_or_else(|| format!("Object {} not found in store", ro.object_id))?;
+
+                        match env.metadata.ownership {
+                            setu_types::Ownership::AddressOwner(owner) => {
+                                if owner != sender_addr {
+                                    return Err(format!(
+                                        "PTB object {} not owned by sender {}",
+                                        ro.object_id, payload.sender
+                                    ));
+                                }
+                            }
+                            setu_types::Ownership::Immutable => {
+                                // Read-only — no extra check beyond presence.
+                            }
+                            setu_types::Ownership::ObjectOwner(parent) => {
+                                return Err(format!(
+                                    "PTB object {} is ObjectOwner(parent={}) — DF entries \
+                                     must use dynamic_field_accesses, not raw inputs",
+                                    ro.object_id, parent
+                                ));
+                            }
+                            setu_types::Ownership::Shared { .. } => {
+                                return Err(format!(
+                                    "PTB object {} is Shared — Phase 1 PTB does not yet \
+                                     support shared inputs",
+                                    ro.object_id
+                                ));
+                            }
+                        }
+
+                        InputObject::from_envelope(&ro.object_id, &env)
+                            .map_err(|e| format!("Failed to convert object {}: {}", ro.object_id, e))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+
+                let move_ctx = MoveExecutionContext {
+                    tx_hash: Self::derive_tx_hash(&event.id),
+                    sender: sender_addr,
+                    gas_budget: 10_000_000,
+                    current_version: 0,
+                    epoch: 0,
+                    needs_tx_context: true,
+                    epoch_timestamp_ms: event.timestamp,
+                };
+
+                let output = engine.execute_ptb(
+                    local_runtime.state(),
+                    &payload.ptb,
+                    input_objects,
+                    resolved_inputs.dynamic_fields.clone(),
+                    &move_ctx,
+                ).map_err(|e| format!("PTB Move VM error: {}", e))?;
+
+                if !output.success {
+                    return Err(output.error.unwrap_or("PTB execution failed".into()));
+                }
+
+                // Write state changes (same shape as MoveCall arm).
+                for sc in &output.state_changes {
+                    let key = setu_types::object_key(&sc.object_id);
+                    match &sc.new_state {
+                        Some(new_state) => {
+                            let mut entry = WriteSetEntry::new(key, new_state.clone());
+                            if let Some(old) = sc.old_state.clone() {
+                                entry = entry.with_old_value(old);
+                            }
+                            diff.add_write(entry);
+                        }
+                        None => {
+                            diff.add_delete(key);
+                        }
+                    }
+                }
+
+                // PTB does not emit module changes (no Publish command in
+                // Phase 1 — see docs/feat/move-vm-phase9-ptb-event-wire/design.md §6).
+
+                for (i, (type_tag, bcs_bytes)) in output.events.iter().enumerate() {
+                    tracing::info!(
+                        event_idx = i,
+                        type_tag = %type_tag,
+                        bcs_len = bcs_bytes.len(),
+                        "PTB emitted event"
+                    );
+                }
+
+                let mut legacy_state = self.legacy_state.write().await;
+                self.record_event_processed(&mut legacy_state, event, diff);
+                return Ok(());
+            }
+
             _ => {}
         }
 
