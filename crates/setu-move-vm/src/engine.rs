@@ -865,8 +865,8 @@ mod tests {
         let engine = SetuMoveEngine::new_with_embedded_stdlib().unwrap();
         assert_eq!(
             engine.stdlib_module_count(),
-            19,
-            "Expected 19 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control, dynamic_field, bcs, address, hash, crypto)"
+            21,
+            "Expected 21 stdlib modules (object, transfer, tx_context, balance, coin, setu, vector, option, string, vec_map, vec_set, event, clock, access_control, dynamic_field, bcs, address, hash, crypto, table, bag)"
         );
     }
 

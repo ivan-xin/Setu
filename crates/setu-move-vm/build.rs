@@ -48,6 +48,9 @@ fn main() {
         "address",
         "hash",
         "crypto",
+        // B4 (Phase 7) — table / bag stdlib (pure Move shims over DF)
+        "table",
+        "bag",
     ];
 
     let mut code = String::from(
