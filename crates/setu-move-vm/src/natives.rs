@@ -57,7 +57,7 @@ const E_DF_VALUE_HAS_KEY_ABILITY: u64 = 4;
 /// Build the native function table for `0x1` (setu framework address).
 pub fn setu_native_functions() -> NativeFunctionTable {
     let addr = AccountAddress::ONE;
-    make_table(
+    let mut table = make_table(
         addr,
         &[
             ("object", "new_uid_internal", native_object_new_uid),
@@ -94,7 +94,45 @@ pub fn setu_native_functions() -> NativeFunctionTable {
             ("crypto", "ed25519_verify_internal", crate::natives_b3::native_ed25519_verify),
             ("crypto", "ecdsa_k1_verify_internal", crate::natives_b3::native_ecdsa_k1_verify),
         ],
-    )
+    );
+
+    // ── std::vector natives (sourced from upstream Sui Move stdlib) ──
+    //
+    // setu-framework/sources/vector.move declares 8 native fns
+    // (empty / length / borrow / push_back / borrow_mut / pop_back /
+    // destroy_empty / swap). Linking any module that imports std::vector
+    // — most notably `coin::split` / `coin::join` — fails with
+    // MISSING_DEPENDENCY unless these are registered. We delegate to
+    // upstream's `move_stdlib_natives::vector::make_all` which provides
+    // all 8 (borrow_mut reuses borrow's gas params via .clone() at
+    // upstream vector.rs:337). Gas params are zero — Setu uses
+    // InstructionCountGasMeter at the VM level, not native-fn level.
+    // Field shapes verified against
+    // ~/.cargo/git/checkouts/sui-.../move-stdlib-natives/src/vector.rs.
+    use move_stdlib_natives::vector as vector_natives;
+    let vector_gas = vector_natives::GasParameters {
+        empty: vector_natives::EmptyGasParameters { base: 0.into() },
+        length: vector_natives::LengthGasParameters { base: 0.into() },
+        push_back: vector_natives::PushBackGasParameters {
+            base: 0.into(),
+            legacy_per_abstract_memory_unit: 0.into(),
+        },
+        borrow: vector_natives::BorrowGasParameters { base: 0.into() },
+        pop_back: vector_natives::PopBackGasParameters { base: 0.into() },
+        destroy_empty: vector_natives::DestroyEmptyGasParameters { base: 0.into() },
+        swap: vector_natives::SwapGasParameters { base: 0.into() },
+    };
+    let vector_module = Identifier::new("vector").expect("\"vector\" is a valid identifier");
+    table.extend(vector_natives::make_all(vector_gas).map(|(func_name, f)| {
+        (
+            addr,
+            vector_module.clone(),
+            Identifier::new(func_name.as_str()).expect("upstream native identifier"),
+            f,
+        )
+    }));
+
+    table
 }
 
 type RawNativeFn = fn(
@@ -921,7 +959,9 @@ mod tests {
     fn test_make_table_count() {
         let table = setu_native_functions();
         // 14 base natives + 10 B3 natives (bcs/address/hash/crypto)
-        assert_eq!(table.len(), 24);
+        // + 8 std::vector natives (empty/length/borrow/borrow_mut/push_back/
+        //   pop_back/destroy_empty/swap) sourced from move-stdlib-natives.
+        assert_eq!(table.len(), 32);
     }
 
     #[test]
@@ -934,6 +974,7 @@ mod tests {
         assert!(modules.contains(&"event".to_string()));
         assert!(modules.contains(&"clock".to_string()));
         assert!(modules.contains(&"dynamic_field".to_string()));
+        assert!(modules.contains(&"vector".to_string()));
     }
 
     #[test]

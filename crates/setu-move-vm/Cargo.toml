@@ -15,6 +15,7 @@ move-vm-runtime        = { workspace = true }
 move-vm-types          = { workspace = true }
 move-binary-format     = { workspace = true }
 move-bytecode-verifier = { workspace = true }
+move-stdlib-natives    = { workspace = true }
 better_any = "0.1.1"
 
 # Serialization
