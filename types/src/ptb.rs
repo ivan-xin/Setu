@@ -213,6 +213,24 @@ pub enum PtbValidationError {
 
     #[error("Invalid hex string in DynamicFieldAccess: {field}")]
     InvalidHex { field: &'static str },
+
+    /// Same on-chain `ObjectId` appears in `inputs[]` more than once
+    /// (R2-ISSUE-4 — see `docs/feat/move-vm-phase9-ptb-exec/review-log.md`).
+    /// Each Slot would clone the same on-chain bytes independently, so a
+    /// `mutate_slot` on one occurrence would not be visible to the other and
+    /// only the last write-back would survive — silently dropping the other
+    /// branch's effects (a value-conservation hazard for `Coin<T>` etc.).
+    /// `Pure` inputs are NOT subject to this rule (multiple Pure args may
+    /// legitimately carry the same bytes). Owned vs Shared variant is
+    /// irrelevant — the same physical object cannot be referenced twice.
+    #[error(
+        "Duplicate Object input: oid={oid} appears at index {first_idx} and {dup_idx}"
+    )]
+    DuplicateObjectInput {
+        oid: ObjectId,
+        first_idx: usize,
+        dup_idx: usize,
+    },
 }
 
 impl ProgrammableTransaction {
@@ -240,6 +258,37 @@ impl ProgrammableTransaction {
         }
 
         let inputs_len = self.inputs.len();
+
+        // 1.5. Duplicate Object input rejection (R2-ISSUE-4).
+        //      Two `inputs[]` slots referencing the same on-chain ObjectId
+        //      would each receive an independent clone of `move_data` in
+        //      `engine::execute_ptb`, so mutations through one slot would
+        //      not be visible to the other and only the last write-back
+        //      would survive — a silent value-loss hazard. Reject at the
+        //      wire-validation boundary.
+        //      `Pure` inputs are intentionally NOT deduped.
+        //      Owned vs Shared classification is irrelevant — same physical
+        //      object cannot be referenced twice.
+        {
+            use std::collections::BTreeMap;
+            let mut seen: BTreeMap<ObjectId, usize> = BTreeMap::new();
+            for (idx, arg) in self.inputs.iter().enumerate() {
+                if let CallArg::Object(obj_arg) = arg {
+                    let oid = match obj_arg {
+                        ObjectArg::ImmOrOwnedObject(id, _, _) => *id,
+                        ObjectArg::SharedObject { id, .. } => *id,
+                    };
+                    if let Some(&first_idx) = seen.get(&oid) {
+                        return Err(PtbValidationError::DuplicateObjectInput {
+                            oid,
+                            first_idx,
+                            dup_idx: idx,
+                        });
+                    }
+                    seen.insert(oid, idx);
+                }
+            }
+        }
 
         // 2. Per-command checks
         for (cmd_idx, cmd) in self.commands.iter().enumerate() {
@@ -1001,5 +1050,109 @@ mod tests {
         // If someone deletes the doctest, `_COMPILE_FAIL_NO_UPGRADE_VARIANT`
         // is gone too — and this test fails to compile, forcing review.
         let _: () = _COMPILE_FAIL_NO_UPGRADE_VARIANT;
+    }
+
+    // ── U20 ─ R2-ISSUE-4: Object input dedup ────────────────────────────────
+    #[test]
+    fn u20_validate_rejects_duplicate_immowned_object_input() {
+        let oid = oid_from_seed(0xDEAD_BEEF);
+        let p = ProgrammableTransaction {
+            inputs: vec![
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(oid, 1, [0u8; 32])),
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(oid, 2, [1u8; 32])),
+            ],
+            commands: vec![Command::MoveCall(sample_move_call())],
+            dynamic_field_accesses: vec![],
+        };
+        assert!(matches!(
+            p.validate_wire(),
+            Err(PtbValidationError::DuplicateObjectInput { first_idx: 0, dup_idx: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn u21_validate_rejects_duplicate_shared_object_input() {
+        let oid = oid_from_seed(0xCAFE_F00D);
+        let p = ProgrammableTransaction {
+            inputs: vec![
+                CallArg::Object(ObjectArg::SharedObject {
+                    id: oid,
+                    initial_shared_version: 1,
+                    mutable: true,
+                }),
+                CallArg::Pure(vec![1, 2, 3]),
+                CallArg::Object(ObjectArg::SharedObject {
+                    id: oid,
+                    initial_shared_version: 1,
+                    mutable: false,
+                }),
+            ],
+            commands: vec![Command::MoveCall(sample_move_call())],
+            dynamic_field_accesses: vec![],
+        };
+        assert!(matches!(
+            p.validate_wire(),
+            Err(PtbValidationError::DuplicateObjectInput { first_idx: 0, dup_idx: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn u22_validate_rejects_mixed_owned_and_shared_same_oid() {
+        // Same physical ObjectId cannot legitimately be both ImmOrOwned and
+        // Shared in a single PTB — TaskPreparer cannot resolve it
+        // consistently, and engine.rs would clone the same on-chain bytes
+        // into two divergent Slots.
+        let oid = oid_from_seed(0xBEEF_C0DE);
+        let p = ProgrammableTransaction {
+            inputs: vec![
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(oid, 7, [9u8; 32])),
+                CallArg::Object(ObjectArg::SharedObject {
+                    id: oid,
+                    initial_shared_version: 1,
+                    mutable: true,
+                }),
+            ],
+            commands: vec![Command::MoveCall(sample_move_call())],
+            dynamic_field_accesses: vec![],
+        };
+        assert!(matches!(
+            p.validate_wire(),
+            Err(PtbValidationError::DuplicateObjectInput { first_idx: 0, dup_idx: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn u23_validate_allows_duplicate_pure_inputs() {
+        // Two Pure inputs with identical bytes are legitimate — they may
+        // back distinct logical parameters of the same Move function.
+        let p = ProgrammableTransaction {
+            inputs: vec![
+                CallArg::Pure(vec![1, 2, 3, 4]),
+                CallArg::Pure(vec![1, 2, 3, 4]),
+            ],
+            commands: vec![Command::MoveCall(sample_move_call())],
+            dynamic_field_accesses: vec![],
+        };
+        assert!(p.validate_wire().is_ok());
+    }
+
+    #[test]
+    fn u24_validate_allows_distinct_object_inputs() {
+        let oid_a = oid_from_seed(0xAA);
+        let oid_b = oid_from_seed(0xBB);
+        let p = ProgrammableTransaction {
+            inputs: vec![
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(oid_a, 1, [0u8; 32])),
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(oid_b, 1, [0u8; 32])),
+                CallArg::Object(ObjectArg::SharedObject {
+                    id: oid_from_seed(0xCC),
+                    initial_shared_version: 1,
+                    mutable: true,
+                }),
+            ],
+            commands: vec![Command::MoveCall(sample_move_call())],
+            dynamic_field_accesses: vec![],
+        };
+        assert!(p.validate_wire().is_ok());
     }
 }
