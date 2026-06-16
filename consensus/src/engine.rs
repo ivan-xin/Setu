@@ -134,6 +134,10 @@ pub struct ConsensusEngine {
     legacy_channel_drop_logged: AtomicBool,
     /// Network broadcaster for P2P message delivery (optional)
     broadcaster: Arc<RwLock<Option<Arc<dyn ConsensusBroadcaster>>>>,
+    /// Bounded FIFO broadcast queue (async-event-broadcast D4). Lazily spawned on first
+    /// `add_event` so all 3 constructors stay trivial. Off the submit critical path.
+    #[cfg(feature = "async-broadcast")]
+    broadcast_queue: std::sync::OnceLock<crate::broadcast_queue::BroadcastQueue>,
     /// Anchors from inline-finalized CFs (single-node mode) pending persistence.
     /// Callers should drain this after add_event() to persist finalized anchors.
     pending_persist_anchors: Arc<Mutex<Vec<setu_types::Anchor>>>,
@@ -195,6 +199,8 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "async-broadcast")]
+            broadcast_queue: std::sync::OnceLock::new(),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
@@ -242,6 +248,8 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "async-broadcast")]
+            broadcast_queue: std::sync::OnceLock::new(),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
@@ -285,6 +293,8 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "async-broadcast")]
+            broadcast_queue: std::sync::OnceLock::new(),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
@@ -327,6 +337,8 @@ impl ConsensusEngine {
             message_rx: Arc::new(Mutex::new(rx)),
             legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "async-broadcast")]
+            broadcast_queue: std::sync::OnceLock::new(),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
@@ -622,6 +634,8 @@ impl ConsensusEngine {
     pub async fn add_event(&self, event: Event) -> SetuResult<EventId> {
         // Update local VLC by merging with the event's VLC
         {
+            // M0 submit_vlc: VLC lock + merge + tick (no-op unless m0-profiling).
+            let _m0 = setu_timing::Span::start(setu_timing::StageId::SubmitVlc, setu_timing::TraceId(0));
             let mut vlc = self.vlc.write().await;
             vlc.merge(&event.vlc_snapshot);
             vlc.tick();
@@ -629,7 +643,11 @@ impl ConsensusEngine {
 
         // Add event through DagManager with retry (handles TOCTOU race with GC)
         // DuplicateEvent is treated as success (idempotent operation)
-        let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
+        let event_id = match {
+            // M0 submit_dag: DAG insertion (lock + parent resolution).
+            let _m0 = setu_timing::Span::start(setu_timing::StageId::SubmitDag, setu_timing::TraceId(0));
+            self.dag_manager.add_event_with_retry(event.clone()).await
+        } {
             Ok(id) => {
                 // M0 fold_wait start: event is now queued in the DAG (no-op unless m0-profiling).
                 setu_timing::mark(setu_timing::TraceId::from_hex(&id), setu_timing::StageId::FoldWait);
@@ -665,15 +683,41 @@ impl ConsensusEngine {
         // We broadcast regardless of whether we are the leader, as all validators
         // need the event for their DAGs.
         {
+            // M0 submit_broadcast: synchronous P2P broadcast to peers + legacy channel
+            // (no-op unless m0-profiling). Prime suspect for the ~100ms submit cost.
+            let _m0 = setu_timing::Span::start(setu_timing::StageId::SubmitBroadcast, setu_timing::TraceId(0));
             let broadcaster = self.broadcaster.read().await;
             if let Some(ref b) = *broadcaster {
-                // Background this to avoid blocking?
-                // For now, we await it but log errors instead of failing.
-                // Event propagation should be best-effort; state sync fixes gaps.
-                if let Err(e) = b.broadcast_event(&event).await {
-                    warn!(event_id = %event.id, error = %e, "Failed to broadcast event");
-                } else {
-                    debug!(event_id = %event.id, "Event broadcasted");
+                // Event propagation is best-effort; state sync fixes gaps.
+                #[cfg(not(feature = "async-broadcast"))]
+                {
+                    // Synchronous await (default). M0-report §9: this await was ~94% of
+                    // the submit/add_event cost (~111ms p50).
+                    if let Err(e) = b.broadcast_event(&event).await {
+                        warn!(event_id = %event.id, error = %e, "Failed to broadcast event");
+                    } else {
+                        debug!(event_id = %event.id, "Event broadcasted");
+                    }
+                }
+                #[cfg(feature = "async-broadcast")]
+                {
+                    // M0-driven fix (async-event-broadcast D4): enqueue onto the bounded
+                    // FIFO queue (non-blocking try_send) so the synchronous per-event
+                    // network send no longer blocks the submit path. A single worker
+                    // broadcasts in FIFO order off the critical path; drops on full are
+                    // best-effort (recovered when a CF references the event).
+                    let _ = b; // broadcaster used via the queue's slot, not directly here
+                    let queue = self.broadcast_queue.get_or_init(|| {
+                        crate::broadcast_queue::BroadcastQueue::spawn(
+                            std::sync::Arc::clone(&self.broadcaster),
+                            4096,
+                        )
+                    });
+                    if queue.enqueue(event.clone())
+                        == crate::broadcast_queue::EnqueueOutcome::DroppedFull
+                    {
+                        warn!(event_id = %event.id, "Broadcast queue full; event broadcast dropped (best-effort)");
+                    }
                 }
             }
 

@@ -589,7 +589,12 @@ impl ConsensusValidator {
         );
 
         // Step 0: Verify event ID matches content (anti-tampering)
-        if !event.verify_id() {
+        // M0 submit_verify: blake3 anti-tamper hash recompute (no-op unless m0-profiling).
+        let id_ok = {
+            let _m0 = setu_timing::Span::start(setu_timing::StageId::SubmitVerify, setu_timing::TraceId(0));
+            event.verify_id()
+        };
+        if !id_ok {
             return Err(SetuError::InvalidData(
                 format!("Event ID verification failed - possible tampering: {}", event.id)
             ));

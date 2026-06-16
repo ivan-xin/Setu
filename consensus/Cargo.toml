@@ -13,6 +13,10 @@ diag-root-drift = []
 # M0 pipeline profiling (docs/feat/m0-pipeline-baseline/). Flips setu-timing into
 # its real impl; default OFF — probe calls compile to zero-cost no-ops.
 m0-profiling = ["setu-timing/enabled"]
+# M0-driven optimization (M0-report §9): make per-event P2P broadcast in add_event
+# fire-and-forget instead of a synchronous await (which was ~94% of the submit cost).
+# Broadcast is best-effort (state sync fills gaps). Default OFF — sync behavior unchanged.
+async-broadcast = []
 
 [dependencies]
 setu-types = { path = "../types" }

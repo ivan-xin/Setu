@@ -23,6 +23,14 @@ pub enum StageId {
     Tee,
     /// 7. verify_id + add_event into the DAG
     Submit,
+    /// 7a. (submit breakdown) verify_id anti-tamper hash recompute
+    SubmitVerify,
+    /// 7b. (submit breakdown) VLC lock + merge + tick
+    SubmitVlc,
+    /// 7c. (submit breakdown) DAG insertion (add_event_with_retry: lock + parent resolution)
+    SubmitDag,
+    /// 7d. (submit breakdown) synchronous P2P broadcast to peers (prime suspect for the ~100ms submit cost)
+    SubmitBroadcast,
     /// 8a. Event queued in the DAG waiting to be folded into a CF (bottleneck ②: leader per-round serialization)
     FoldWait,
     /// 8b. The CF-folding work itself
@@ -38,8 +46,8 @@ pub enum StageId {
 }
 
 impl StageId {
-    /// All 13 segments, in pipeline order.
-    pub const ALL: [StageId; 13] = [
+    /// All segments, in pipeline order (incl. the 4 submit-breakdown sub-stages).
+    pub const ALL: [StageId; 17] = [
         StageId::Ingress,
         StageId::Reserve,
         StageId::Prep,
@@ -47,6 +55,10 @@ impl StageId {
         StageId::Dispatch,
         StageId::Tee,
         StageId::Submit,
+        StageId::SubmitVerify,
+        StageId::SubmitVlc,
+        StageId::SubmitDag,
+        StageId::SubmitBroadcast,
         StageId::FoldWait,
         StageId::FoldWork,
         StageId::Vote,
@@ -65,6 +77,10 @@ impl StageId {
             StageId::Dispatch => "dispatch",
             StageId::Tee => "tee",
             StageId::Submit => "submit",
+            StageId::SubmitVerify => "submit_verify",
+            StageId::SubmitVlc => "submit_vlc",
+            StageId::SubmitDag => "submit_dag",
+            StageId::SubmitBroadcast => "submit_broadcast",
             StageId::FoldWait => "fold_wait",
             StageId::FoldWork => "fold_work",
             StageId::Vote => "vote",
@@ -88,11 +104,11 @@ mod tests {
 
     #[test]
     fn all_names_unique_and_total() {
-        assert_eq!(StageId::ALL.len(), 13);
+        assert_eq!(StageId::ALL.len(), 17);
         let mut names: Vec<&str> = StageId::ALL.iter().map(|s| s.name()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 13, "stage names must be unique");
+        assert_eq!(names.len(), 17, "stage names must be unique");
     }
 
     #[test]

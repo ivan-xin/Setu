@@ -32,6 +32,7 @@
 //! ```
 
 pub mod anchor_builder;
+pub mod broadcast_queue;
 pub mod broadcaster;
 pub mod dag;
 pub mod dag_manager;
