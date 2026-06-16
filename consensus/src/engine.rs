@@ -630,7 +630,11 @@ impl ConsensusEngine {
         // Add event through DagManager with retry (handles TOCTOU race with GC)
         // DuplicateEvent is treated as success (idempotent operation)
         let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
-            Ok(id) => id,
+            Ok(id) => {
+                // M0 fold_wait start: event is now queued in the DAG (no-op unless m0-profiling).
+                setu_timing::mark(setu_timing::TraceId::from_hex(&id), setu_timing::StageId::FoldWait);
+                id
+            }
             Err(DagManagerError::DuplicateEvent(id)) => {
                 // Idempotent: event already exists, treat as success
                 debug!(event_id = %id, "Event already exists in DAG (idempotent)");
@@ -698,7 +702,11 @@ impl ConsensusEngine {
         // Add event through DagManager with retry (handles TOCTOU race with GC)
         // DuplicateEvent is treated as success (idempotent operation)
         let event_id = match self.dag_manager.add_event_with_retry(event.clone()).await {
-            Ok(id) => id,
+            Ok(id) => {
+                // M0 fold_wait start: event is now queued in the DAG (no-op unless m0-profiling).
+                setu_timing::mark(setu_timing::TraceId::from_hex(&id), setu_timing::StageId::FoldWait);
+                id
+            }
             Err(DagManagerError::DuplicateEvent(id)) => {
                 // Idempotent: event already exists (common during network sync)
                 debug!(event_id = %id, "Event already exists in DAG (idempotent, from network)");
@@ -834,10 +842,18 @@ impl ConsensusEngine {
 
         let dag = self.dag.read().await;
         // AnchorBuilder now handles all Merkle tree computation internally
-        let cf = manager.try_create_cf(&dag, &vlc, current_round);
+        let cf = {
+            // M0 fold_work: the folding computation itself (no-op unless m0-profiling).
+            let _fold = setu_timing::Span::start(setu_timing::StageId::FoldWork, setu_timing::TraceId(0));
+            manager.try_create_cf(&dag, &vlc, current_round)
+        };
         drop(dag);
 
         if let Some(ref frame) = cf {
+            // M0 fold_wait end: each folded event leaves the DAG queue now.
+            for eid in &frame.anchor.event_ids {
+                setu_timing::measure_from(setu_timing::TraceId::from_hex(eid), setu_timing::StageId::FoldWait);
+            }
             info!(
                 cf_id = %frame.id,
                 anchor_id = %frame.anchor.id,

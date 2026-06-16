@@ -480,6 +480,11 @@ impl TeeExecutor {
         task: SolverTask,
         reservations: Vec<ReservationHandle>,
     ) -> Result<(Event, u64, usize, u64), String> {
+        // M0 dispatch: semaphore queue-wait + HTTP round-trip to solver (no-op unless
+        // m0-profiling). Includes the remote TEE execution; the pure-execution subset is
+        // recorded separately as StageId::Tee below, so dispatch - tee = queue + network
+        // (Open-4: queue-wait is attributed to dispatch, NOT tee).
+        let _m0_dispatch = setu_timing::Span::start(setu_timing::StageId::Dispatch, setu_timing::TraceId(0));
         let task_id_hex = hex::encode(&task.task_id[..8]);
 
         // RAII guard for panic-safe reservation release
@@ -561,6 +566,12 @@ impl TeeExecutor {
                             reservation_guard.release();
 
                             let exec_time = result_dto.execution_time_us;
+                            // M0 tee: solver-reported pure TEE execution time (µs -> ns),
+                            // a subset of dispatch (no-op unless m0-profiling).
+                            setu_timing::record(
+                                setu_timing::StageId::Tee,
+                                exec_time.saturating_mul(1000),
+                            );
                             let events_proc = result_dto.events_processed;
                             let gas_used = result_dto.gas_used;
 

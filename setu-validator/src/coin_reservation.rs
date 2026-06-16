@@ -116,6 +116,8 @@ impl CoinReservationManager {
         amount: u64,
         transfer_id: &str,
     ) -> Option<ReservationHandle> {
+        // M0 reserve: per-coin reservation duration (no-op unless m0-profiling).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Reserve, setu_timing::TraceId(0));
         // Hot-switch: when disabled, always succeed
         if !self.enabled.load(Ordering::Relaxed) {
             return Some(ReservationHandle {

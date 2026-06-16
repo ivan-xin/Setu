@@ -481,8 +481,12 @@ impl ConsensusManager {
         approve: bool,
         private_key: Option<&[u8]>
     ) -> Option<Vote> {
+        // M0 vote: LOCAL vote processing only (no-op unless m0-profiling). Cross-node
+        // quorum RTT is not measurable on a single validator; the multi-node vote latency
+        // is captured by comparing single-node vs 3-validator runs (design D4).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Vote, setu_timing::TraceId(0));
         let cf = self.pending_cfs.get_mut(cf_id)?;
-        
+
         if cf.votes.contains_key(&self.local_validator_id) {
             return None;
         }

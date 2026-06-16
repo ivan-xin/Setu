@@ -759,7 +759,13 @@ impl AnchorBuilder {
         // Inner result lets us drop the write guard before running any overlay-clear
         // side effect on the error path (avoids holding two locks at once).
         let inner: Result<StateApplySummary, AnchorBuildError> = {
-            let mut guard = self.shared.lock_write();
+            // M0 apply_wait: time blocked on the global write lock (no-op unless m0-profiling).
+            let mut guard = {
+                let _wait = setu_timing::Span::start(setu_timing::StageId::ApplyWait, setu_timing::TraceId(0));
+                self.shared.lock_write()
+            };
+            // M0 apply_work: held-lock duration (apply + commit) for this CF.
+            let _work = setu_timing::Span::start(setu_timing::StageId::ApplyWork, setu_timing::TraceId(0));
 
             // DIAG H2: compare prepare-time base vs commit-time base (under the
             // same lock that apply will run under). Divergence signals that a
@@ -786,7 +792,12 @@ impl AnchorBuilder {
             Self::diag_h4_probes(&cf_id, "leader", &guard, &events);
 
             let summary = guard.apply_committed_events(&events, finalized_depth);
-            match guard.commit(anchor_id) {
+            // M0 commit: WriteBatch persist only (nested inside apply_work; no-op unless m0-profiling).
+            let commit_result = {
+                let _m0_commit = setu_timing::Span::start(setu_timing::StageId::Commit, setu_timing::TraceId(0));
+                guard.commit(anchor_id)
+            };
+            match commit_result {
                 Ok(()) => {
                     // DIAG H1: after the real apply+commit, the write GSM's
                     // actual root must match what was declared in the anchor
@@ -907,7 +918,13 @@ impl AnchorBuilder {
         // Inner result lets us drop the write guard before any overlay-clear side
         // effect runs on the error path.
         let inner: Result<StateApplySummary, AnchorBuildError> = {
-            let mut guard = self.shared.lock_write();
+            // M0 apply_wait: time blocked on the global write lock (no-op unless m0-profiling).
+            let mut guard = {
+                let _wait = setu_timing::Span::start(setu_timing::StageId::ApplyWait, setu_timing::TraceId(0));
+                self.shared.lock_write()
+            };
+            // M0 apply_work: held-lock duration (verify-clone + apply + commit) for this CF.
+            let _work = setu_timing::Span::start(setu_timing::StageId::ApplyWork, setu_timing::TraceId(0));
 
             // Phase 3 H4 probes (design.md §5): mirror leader-side probes on
             // the follower so `same_key_divergence.sh` can pair pre_apply_root,

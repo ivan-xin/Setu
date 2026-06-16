@@ -297,6 +297,8 @@ impl RouterManager {
     /// Also respects `permitted_subnets` filtering: solvers with non-empty
     /// permitted_subnets only serve listed subnets.
     pub fn route_transfer(&self, transfer: &Transfer) -> Result<String, RouterError> {
+        // M0 route: solver selection (no-op unless m0-profiling).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Route, setu_timing::TraceId(0));
         // Fallible resolution (design D1): never silently route an invalid
         // subnet string to ROOT.
         let subnet_id = transfer

@@ -817,6 +817,7 @@ dependencies = [
  "serde_json",
  "setu-merkle",
  "setu-storage",
+ "setu-timing",
  "setu-types",
  "setu-vlc",
  "thiserror 1.0.69",
@@ -4503,6 +4504,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "setu-timing"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "setu-transport"
 version = "0.1.0"
 dependencies = [
@@ -4574,6 +4583,7 @@ dependencies = [
  "setu-runtime",
  "setu-solver",
  "setu-storage",
+ "setu-timing",
  "setu-transport",
  "setu-types",
  "setu-vlc",

@@ -579,12 +579,15 @@ impl ConsensusValidator {
     /// Note: Events are NOT persisted here. They stay in DAG memory until CF is finalized.
     /// Persistence happens in receive_vote() when quorum is reached.
     pub async fn submit_event(&self, event: Event) -> SetuResult<EventId> {
+        // M0 submit: verify_id + admission checks + add_event into the DAG
+        // (no-op unless m0-profiling).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Submit, setu_timing::TraceId(0));
         info!(
             event_id = %event.id,
             creator = %event.creator,
             "Submitting event to consensus"
         );
-        
+
         // Step 0: Verify event ID matches content (anti-tampering)
         if !event.verify_id() {
             return Err(SetuError::InvalidData(

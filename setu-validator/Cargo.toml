@@ -16,10 +16,17 @@ diag-root-drift = [
     "consensus/diag-root-drift",
     "setu-storage/diag-root-drift",
 ]
+# M0 pipeline profiling (docs/feat/m0-pipeline-baseline/). Aggregates consensus probes
+# and flips setu-timing into its real impl; default OFF — probe calls are zero-cost no-ops.
+m0-profiling = [
+    "consensus/m0-profiling",
+    "setu-timing/enabled",
+]
 
 [dependencies]
 # Internal dependencies
 setu-core = { path = "../crates/setu-core" }
+setu-timing = { path = "../crates/setu-timing" }
 setu-types = { path = "../types" }
 setu-vlc = { path = "../crates/setu-vlc" }
 setu-protocol = { path = "../crates/setu-protocol" }

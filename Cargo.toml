@@ -5,6 +5,7 @@ members = [
     "crates/setu-vlc",        # VLC Hybrid Logical Clock Library
     "crates/setu-merkle",     # Merkle tree implementations (Binary + Sparse)
     "crates/setu-core",       # Shared core library
+    "crates/setu-timing",     # M0 pipeline profiling side-channel (leaf, feature-gated)
     "crates/setu-keys",       # Cryptographic key management
     "crates/setu-protocol",   # Protocol message definitions
     "crates/setu-network-anemo", # Anemo-based P2P network (production)

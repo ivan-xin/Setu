@@ -121,6 +121,8 @@ impl TaskPreparer {
         transfer: &setu_types::Transfer,
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
+        // M0 prep: coin selection + Merkle proof generation (no-op unless m0-profiling).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Prep, setu_timing::TraceId(0));
         let amount = transfer.amount;
 
         debug!(
@@ -284,6 +286,10 @@ impl TaskPreparer {
         subnet_id: SubnetId,
         reservation_mgr: &crate::coin_reservation::CoinReservationManager,
     ) -> Result<(SolverTask, Vec<crate::coin_reservation::ReservationHandle>), TaskPrepareError> {
+        // M0 prep: coin selection + Merkle proof on the hot (with-reservation) path
+        // (no-op unless m0-profiling). Note: nests the Reserve stage (try_reserve, ~µs),
+        // negligible vs proof generation — see implementation-log Step 3 fix.
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Prep, setu_timing::TraceId(0));
         let amount = transfer.amount;
 
         debug!(

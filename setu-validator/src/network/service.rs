@@ -597,6 +597,20 @@ impl ValidatorNetworkService {
             .route("/api/v1/move/modules/:address", get(setu_api::http_list_modules::<ValidatorNetworkService>))
             .with_state(service);
 
+        // M0 profiling endpoints (docs/feat/m0-pipeline-baseline/). Present ONLY under the
+        // m0-profiling feature — absent in production builds. GET returns per-stage jsonl;
+        // POST resets the measurement window (call before a measured load run).
+        #[cfg(feature = "m0-profiling")]
+        let app = app
+            .route("/api/v1/m0/report", get(|| async { setu_timing::report_jsonl() }))
+            .route(
+                "/api/v1/m0/reset",
+                post(|| async {
+                    setu_timing::reset();
+                    "ok"
+                }),
+            );
+
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
 
         info!(addr = %self.config.http_listen_addr, "HTTP API server started");

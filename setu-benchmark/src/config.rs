@@ -184,6 +184,16 @@ pub struct BenchmarkConfig {
     /// Move pure arguments (comma-separated hex-encoded BCS values)
     #[arg(long, default_value = "")]
     pub move_args: String,
+
+    // ── M0 pipeline profiling (docs/feat/m0-pipeline-baseline/) ──────────────
+    /// Pull the validator's per-stage M0 timing report after the run.
+    ///
+    /// Requires the validator to be built with `--features m0-profiling`.
+    /// Resets the measurement window before the load, then fetches and renders
+    /// the per-stage p50/p95/p99 breakdown from `{validator_url}/api/v1/m0/report`.
+    /// Run at several `--concurrency` levels to build the saturation sweep (design D4).
+    #[arg(long, default_value = "false")]
+    pub m0: bool,
 }
 
 impl BenchmarkConfig {

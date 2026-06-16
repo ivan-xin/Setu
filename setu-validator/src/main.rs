@@ -168,6 +168,11 @@ async fn main() -> anyhow::Result<()> {
         .with_thread_ids(true)
         .init();
 
+    // M0 profiling: start the timing aggregator as early as possible so consensus-thread
+    // probes are captured (docs/feat/m0-pipeline-baseline/). No-op without m0-profiling.
+    #[cfg(feature = "m0-profiling")]
+    setu_timing::init();
+
     // Load configuration
     let config = ValidatorConfig::from_env();
     

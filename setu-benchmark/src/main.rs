@@ -55,8 +55,18 @@ async fn main() -> anyhow::Result<()> {
     // Print configuration
     config.print_config();
 
-    // Save output format before config is moved
+    // Save output format + M0 settings before config is moved
     let output_format = config.output.clone();
+    let m0_enabled = config.m0;
+    let m0_url = config.validator_url.clone();
+
+    // M0: reset the validator's measurement window before applying load.
+    if m0_enabled {
+        match report::m0_reset(&m0_url).await {
+            Ok(()) => info!("M0: reset measurement window on {}", m0_url),
+            Err(e) => info!("M0: reset failed ({e}); is the validator built with --features m0-profiling?"),
+        }
+    }
 
     // Run benchmark
     let runner = benchmark::BenchmarkRunner::new(config);
@@ -66,6 +76,14 @@ async fn main() -> anyhow::Result<()> {
     match output_format.as_str() {
         "json" => println!("{}", report::json_report(&result)),
         _ => report::print_report(&result),
+    }
+
+    // M0: fetch and render the per-stage timing breakdown.
+    if m0_enabled {
+        match report::m0_fetch(&m0_url).await {
+            Ok(jsonl) => report::print_m0_report(&jsonl),
+            Err(e) => info!("M0: fetch failed ({e}); is the validator built with --features m0-profiling?"),
+        }
     }
 
     Ok(())

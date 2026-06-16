@@ -54,6 +54,10 @@ impl TransferHandler {
         request: SubmitTransferRequest,
         tee_executor: &TeeExecutor,
     ) -> SubmitTransferResponse {
+        // M0 ingress: request parse + admission (transfer build + D1 subnet resolution).
+        // Ended explicitly before coin reservation / prep / route below, so it does not
+        // overlap those stages (no-op unless m0-profiling).
+        let _m0_ingress = setu_timing::Span::start(setu_timing::StageId::Ingress, setu_timing::TraceId(0));
         let now = current_timestamp_secs();
         let transfer_id = format!(
             "tx-{}-{}",
@@ -147,6 +151,9 @@ impl TransferHandler {
                 );
             }
         };
+
+        // M0 ingress ends here — reservation / prep / route / dispatch begin below.
+        drop(_m0_ingress);
 
         let (solver_task, reservation_handles) = match task_preparer.prepare_transfer_task_with_reservation(
             &transfer, subnet_id, coin_reservation_manager
