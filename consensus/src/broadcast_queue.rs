@@ -11,6 +11,7 @@
 
 use crate::broadcaster::ConsensusBroadcaster;
 use setu_types::Event;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::RwLock;
@@ -30,9 +31,30 @@ pub enum EnqueueOutcome {
     Closed,
 }
 
+/// Always-on broadcast counters (NOT M0-gated): visible in production so async
+/// broadcast health is observable after promote-to-default. `dropped` is the key
+/// signal — a non-zero/growing value means the queue is overflowing (backpressure).
+#[derive(Default)]
+struct BroadcastMetrics {
+    enqueued: AtomicU64,
+    dropped: AtomicU64,
+}
+
+/// Point-in-time snapshot of broadcast queue health.
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcastStats {
+    pub enqueued: u64,
+    pub dropped: u64,
+    /// Current items waiting in the channel (≈ capacity − available permits).
+    pub depth: usize,
+    pub capacity: usize,
+}
+
 /// Handle to the bounded FIFO broadcast queue. Held by `ConsensusEngine`.
 pub struct BroadcastQueue {
     tx: mpsc::Sender<Event>,
+    capacity: usize,
+    metrics: Arc<BroadcastMetrics>,
     /// Worker handle. In production the task runs detached (it exits when `tx` drops on
     /// engine teardown); the handle is read only by tests (`drain_and_join`). Held to keep
     /// ownership tidy.
@@ -43,24 +65,43 @@ pub struct BroadcastQueue {
 impl BroadcastQueue {
     /// Create the bounded channel and spawn the single FIFO drain worker.
     pub fn spawn(broadcaster_slot: BroadcasterSlot, capacity: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<Event>(capacity.max(1));
-        let worker = tokio::spawn(drain_loop(rx, broadcaster_slot));
-        Self { tx, worker }
+        let capacity = capacity.max(1);
+        let (tx, rx) = mpsc::channel::<Event>(capacity);
+        let metrics = Arc::new(BroadcastMetrics::default());
+        let worker = tokio::spawn(drain_loop(rx, broadcaster_slot, Arc::clone(&metrics)));
+        Self { tx, capacity, metrics, worker }
     }
 
     /// Non-blocking enqueue. Never blocks the caller (the submit critical path).
     pub fn enqueue(&self, event: Event) -> EnqueueOutcome {
         match self.tx.try_send(event) {
-            Ok(()) => EnqueueOutcome::Enqueued,
-            Err(TrySendError::Full(_)) => EnqueueOutcome::DroppedFull,
+            Ok(()) => {
+                self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+                EnqueueOutcome::Enqueued
+            }
+            Err(TrySendError::Full(_)) => {
+                self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                EnqueueOutcome::DroppedFull
+            }
             Err(TrySendError::Closed(_)) => EnqueueOutcome::Closed,
+        }
+    }
+
+    /// Always-on health snapshot (production-visible; not M0-gated).
+    pub fn stats(&self) -> BroadcastStats {
+        BroadcastStats {
+            enqueued: self.metrics.enqueued.load(Ordering::Relaxed),
+            dropped: self.metrics.dropped.load(Ordering::Relaxed),
+            // Sender::capacity() = currently-available permits; depth = used slots.
+            depth: self.capacity.saturating_sub(self.tx.capacity()),
+            capacity: self.capacity,
         }
     }
 
     /// Test helper: close the sender and wait for the worker to drain + exit.
     #[cfg(test)]
     pub async fn drain_and_join(self) {
-        let BroadcastQueue { tx, worker } = self;
+        let BroadcastQueue { tx, worker, .. } = self;
         drop(tx);
         let _ = worker.await;
     }
@@ -76,13 +117,25 @@ impl BroadcastQueue {
 /// Throughput note: a single worker serializes broadcasts. The ~111ms seen on the
 /// synchronous path was contention from many concurrent broadcasts; serializing should
 /// remove that contention. Adequacy is an empirical question — measured on the cluster.
-async fn drain_loop(mut rx: mpsc::Receiver<Event>, slot: BroadcasterSlot) {
+async fn drain_loop(mut rx: mpsc::Receiver<Event>, slot: BroadcasterSlot, metrics: Arc<BroadcastMetrics>) {
+    let mut processed: u64 = 0;
     while let Some(event) = rx.recv().await {
         let broadcaster = { slot.read().await.clone() };
         if let Some(b) = broadcaster {
             if let Err(e) = b.broadcast_event(&event).await {
                 tracing::warn!(event_id = %event.id, error = %e, "Failed to broadcast event (async worker)");
             }
+        }
+        // Always-on periodic health line (every 1024 broadcasts) so production logs
+        // surface enqueued/dropped — `dropped > 0` flags queue overflow.
+        processed = processed.wrapping_add(1);
+        if processed % 1024 == 0 {
+            tracing::info!(
+                target: "consensus::broadcast",
+                enqueued = metrics.enqueued.load(Ordering::Relaxed),
+                dropped = metrics.dropped.load(Ordering::Relaxed),
+                "async broadcast stats"
+            );
         }
     }
 }
@@ -225,5 +278,48 @@ mod tests {
         }
         // 100 enqueues against a stuck worker must return ~instantly (non-blocking).
         assert!(start.elapsed() < Duration::from_secs(1), "enqueue blocked");
+    }
+
+    // M1: enqueued counter increments on accepted events
+    #[tokio::test]
+    async fn m1_enqueued_counted() {
+        let q = BroadcastQueue::spawn(slot_with(None), 8);
+        for i in 0..3 {
+            assert_eq!(q.enqueue(ev(&format!("e{i}"))), EnqueueOutcome::Enqueued);
+        }
+        let s = q.stats();
+        assert_eq!(s.enqueued, 3);
+        assert_eq!(s.dropped, 0);
+    }
+
+    // M2: dropped counter increments when full; enqueued counts only accepted
+    #[tokio::test]
+    async fn m2_dropped_counted() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let b: Arc<dyn ConsensusBroadcaster> =
+            Arc::new(RecordingBroadcaster::new(order, Some(Duration::from_secs(30))));
+        let q = BroadcastQueue::spawn(slot_with(Some(b)), 1); // stuck worker, cap 1
+        for i in 0..50 {
+            let _ = q.enqueue(ev(&format!("e{i}")));
+        }
+        let s = q.stats();
+        assert!(s.dropped > 0, "expected drops on a full queue");
+        assert_eq!(s.enqueued + s.dropped, 50, "every attempt is either enqueued or dropped");
+    }
+
+    // M3: depth reflects queued items while the worker is stuck
+    #[tokio::test]
+    async fn m3_depth_reflects_queue() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let b: Arc<dyn ConsensusBroadcaster> =
+            Arc::new(RecordingBroadcaster::new(order, Some(Duration::from_secs(30))));
+        let q = BroadcastQueue::spawn(slot_with(Some(b)), 8);
+        for i in 0..8 {
+            let _ = q.enqueue(ev(&format!("e{i}")));
+        }
+        // Worker is stuck broadcasting the first item; the rest sit in the channel.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(q.stats().depth > 0, "depth must reflect queued items, got 0");
+        assert_eq!(q.stats().capacity, 8);
     }
 }

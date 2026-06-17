@@ -8,7 +8,9 @@ name = "setu-validator"
 path = "src/main.rs"
 
 [features]
-default = []
+# async-broadcast promoted to default (validated; see docs/feat/async-event-broadcast/).
+# Revert to synchronous broadcast via `--no-default-features`.
+default = ["async-broadcast"]
 # Phase 1 diagnostic instrumentation for consensus-root-self-consistency FDP.
 # Pass-through to consensus + setu-storage. Enable only for stress diagnosis.
 # See docs/feat/consensus-root-self-consistency/design.md §3.6.

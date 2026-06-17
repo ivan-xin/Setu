@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+# async-broadcast promoted to default (M0-report §10: single-target A/B ×4.2 — 94→398
+# TPS, 100% success, submit_broadcast 111ms→4.5µs, validated FDP+REP+TDD). Opt back to
+# synchronous broadcast via `--no-default-features` (revert path). NOTE: the multi-host
+# "348→972" scaling claim (§11) was retracted (§11b) — confounded by benchmark account
+# funding; the single-target A/B is the reliable evidence. See docs/feat/async-event-broadcast/.
+default = ["async-broadcast"]
 # Phase 1 diagnostic instrumentation for consensus-root-self-consistency FDP.
 # Adds DIAG probes to commit_build / apply_follower_finalized_cf /
 # compute_state_root_from_events. Default OFF — zero overhead, zero behavior change.
@@ -13,9 +18,9 @@ diag-root-drift = []
 # M0 pipeline profiling (docs/feat/m0-pipeline-baseline/). Flips setu-timing into
 # its real impl; default OFF — probe calls compile to zero-cost no-ops.
 m0-profiling = ["setu-timing/enabled"]
-# M0-driven optimization (M0-report §9): make per-event P2P broadcast in add_event
-# fire-and-forget instead of a synchronous await (which was ~94% of the submit cost).
-# Broadcast is best-effort (state sync fills gaps). Default OFF — sync behavior unchanged.
+# M0-driven optimization (M0-report §9): per-event P2P broadcast goes through a bounded
+# FIFO worker (off the submit critical path) instead of a synchronous await (~94% of submit
+# cost). Broadcast is best-effort (state sync fills gaps). Now ON by default (see `default`).
 async-broadcast = []
 
 [dependencies]
