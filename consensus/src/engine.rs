@@ -165,6 +165,14 @@ pub struct ConsensusEngine {
     /// Injected by caller (ConsensusValidator) via set_finalization_tx().
     /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
     finalization_tx: parking_lot::RwLock<Option<broadcast::Sender<ConsensusFrame>>>,
+    /// Serializes CF apply across the decoupled begin→apply→finish window so the heavy
+    /// GSM apply runs off the cm lock without interleaving (decouple-cf-apply D3). Held
+    /// for the whole apply sequence; submit never touches it → no cycle with cm.
+    /// Scaffold for Part 3 (`apply_finalized_cf_decoupled` orchestration); wired when the
+    /// 4 finalize call sites adopt the decoupled flow.
+    #[cfg(feature = "decoupled-apply")]
+    #[allow(dead_code)]
+    apply_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ConsensusEngine {
@@ -205,6 +213,8 @@ impl ConsensusEngine {
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
+            #[cfg(feature = "decoupled-apply")]
+            apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -254,6 +264,8 @@ impl ConsensusEngine {
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
+            #[cfg(feature = "decoupled-apply")]
+            apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -299,6 +311,8 @@ impl ConsensusEngine {
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
+            #[cfg(feature = "decoupled-apply")]
+            apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -343,6 +357,8 @@ impl ConsensusEngine {
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
             pending_completions: Arc::new(Mutex::new(Vec::new())),
             finalization_tx: parking_lot::RwLock::new(None),
+            #[cfg(feature = "decoupled-apply")]
+            apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

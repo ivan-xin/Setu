@@ -197,6 +197,49 @@ impl PendingAnchorBuild {
     }
 }
 
+/// Owned, cm-independent inputs for applying a finalized CF off the cm lock
+/// (decouple-cf-apply D7.2). Holds no `&AnchorBuilder`/`&ConsensusManager` borrow, so the
+/// engine can hold it across the cm-release window without pinning the cm guard.
+#[cfg(feature = "decoupled-apply")]
+pub struct ApplyContext {
+    pub cf_id: String,
+    pub anchor: Anchor,
+    pub events: Vec<Event>,
+    /// = builder.anchor_depth + 1 at begin time.
+    pub anchor_id: u64,
+    pub finalized_depth: u64,
+    /// Snapshot captured when the build was prepared.
+    pub pre_build_snapshot: BuilderStateSnapshot,
+    /// Builder's current scalars at begin (== prepare snapshot iff no CF committed since).
+    pub current_state: BuilderStateSnapshot,
+    pub shared: Arc<SharedStateManager>,
+    pub outcomes_sink: Option<Arc<dyn OutcomeSink>>,
+    pub new_anchor_chain_root: [u8; 32],
+    pub new_anchor_depth: u64,
+    pub new_last_fold_vlc: u64,
+}
+
+/// Scalar anchor-metadata advance applied under the short finish cm-lock (decouple-cf-apply D4).
+#[cfg(feature = "decoupled-apply")]
+pub struct AdvanceData {
+    pub anchor: Anchor,
+    pub new_anchor_depth: u64,
+    pub new_last_fold_vlc: u64,
+    pub new_anchor_chain_root: [u8; 32],
+}
+
+/// Owned inputs to apply a finalized CF as a FOLLOWER off the cm lock (decouple-cf-apply).
+/// The follower advance is `synchronize_finalized_anchor(&cf.anchor)` in finish.
+#[cfg(feature = "decoupled-apply")]
+pub struct FollowerApplyContext {
+    pub cf: ConsensusFrame,
+    pub events: Vec<Event>,
+    pub anchor_id: u64,
+    pub finalized_depth: u64,
+    pub shared: Arc<SharedStateManager>,
+    pub outcomes_sink: Option<Arc<dyn OutcomeSink>>,
+}
+
 // ============================================================================
 // AnchorBuildResult and AnchorBuildError
 // ============================================================================
@@ -404,7 +447,19 @@ impl AnchorBuilder {
     /// Genesis is pre-applied at startup, so any apply-phase "conflict" here
     /// is an expected re-apply, not a real stale read (R1-ISSUE-1).
     fn ingest_outcomes(&self, cf_id: &str, applied_events: &[Event], summary: &StateApplySummary) {
-        let Some(sink) = self.outcomes_sink.as_ref() else {
+        Self::ingest_outcomes_with(self.outcomes_sink.as_ref(), cf_id, applied_events, summary);
+    }
+
+    /// Sink-parameterized outcome recording. Shared by the legacy `ingest_outcomes(&self)`
+    /// and the decoupled `apply_context` free fn (which holds the sink as owned Arc, not
+    /// `&self` — decouple-cf-apply D7.2). Behavior is identical to the original.
+    fn ingest_outcomes_with(
+        sink: Option<&Arc<dyn OutcomeSink>>,
+        cf_id: &str,
+        applied_events: &[Event],
+        summary: &StateApplySummary,
+    ) {
+        let Some(sink) = sink else {
             return;
         };
 
@@ -883,6 +938,221 @@ impl AnchorBuilder {
         self.last_fold_instant = Some(std::time::Instant::now());
 
         Ok(state_summary)
+    }
+
+    // ───────── decouple-cf-apply: leader apply split (cm-independent) ─────────
+    // Mirrors `commit_build`'s leader transaction but takes owned data (ApplyContext)
+    // so the heavy apply runs OFF the cm lock (D7.2). The advance (scalar mutation) is
+    // a separate `apply_advance` called under the short finish cm-lock (D4).
+
+    /// P1 helper (cm held): capture an owned, cm-independent `ApplyContext` from a
+    /// prepared build. No `&AnchorBuilder` is held past this call.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn build_apply_context(&self, pending: PendingAnchorBuild) -> ApplyContext {
+        let current_state = BuilderStateSnapshot {
+            last_anchor_id: self.last_anchor.as_ref().map(|a| a.id.clone()),
+            anchor_depth: self.anchor_depth,
+            last_fold_vlc: self.last_fold_vlc,
+            last_anchor_chain_root: self.last_anchor_chain_root,
+            total_anchor_count: self.total_anchor_count,
+        };
+        ApplyContext {
+            cf_id: pending.anchor.id.clone(),
+            anchor_id: self.anchor_depth + 1,
+            finalized_depth: pending.new_anchor_depth,
+            events: pending.all_events(),
+            pre_build_snapshot: pending.pre_build_snapshot.clone(),
+            current_state,
+            shared: Arc::clone(&self.shared),
+            outcomes_sink: self.outcomes_sink.clone(),
+            new_anchor_chain_root: pending.new_anchor_chain_root,
+            new_anchor_depth: pending.new_anchor_depth,
+            new_last_fold_vlc: pending.new_last_fold_vlc,
+            anchor: pending.anchor,
+        }
+    }
+
+    /// P2 (NO cm; caller holds apply_mutex): the full GSM apply transaction off owned
+    /// data. Classifies failures by `FailureKind` (D7.1): SnapshotMismatch is
+    /// pre-mutation/recoverable; a commit failure after `apply_committed_events` already
+    /// mutated the in-memory GSM is post-mutation/FATAL. On success returns the advance
+    /// data for `apply_advance` (P3). Equivalent to `commit_build`'s transaction.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn apply_context(
+        ctx: ApplyContext,
+    ) -> (crate::folder::ApplyResult, Option<AdvanceData>) {
+        use crate::folder::{ApplyFailure, ApplyFailureRole, ApplyResult, FailureKind};
+        let event_ids: Vec<String> = ctx.events.iter().map(|e| e.id.clone()).collect();
+
+        // Pre-mutation guard (== verify_snapshot, on owned scalars).
+        if ctx.current_state != ctx.pre_build_snapshot {
+            let _ = ctx.shared.clear_overlay_events(&event_ids);
+            return (
+                ApplyResult::Failed {
+                    failure: ApplyFailure {
+                        cf_id: ctx.cf_id,
+                        anchor_id: ctx.anchor.id.clone(),
+                        anchor_depth: ctx.current_state.anchor_depth,
+                        role: ApplyFailureRole::LeaderFollowerFallback,
+                        reason: format!(
+                            "snapshot mismatch: prepared at depth {}, builder at {}",
+                            ctx.pre_build_snapshot.anchor_depth, ctx.current_state.anchor_depth
+                        ),
+                    },
+                    kind: FailureKind::PreMutationRecoverable,
+                },
+                None,
+            );
+        }
+
+        // Transaction: apply + commit + publish under the GSM write lock (RCU; never cm).
+        let txn: Result<setu_storage::StateApplySummary, String> = {
+            let mut guard = ctx.shared.lock_write();
+            let summary = guard.apply_committed_events(&ctx.events, ctx.finalized_depth);
+            match guard.commit(ctx.anchor_id) {
+                Ok(()) => {
+                    ctx.shared.publish_snapshot(&guard);
+                    Ok(summary)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        match txn {
+            Ok(summary) => {
+                Self::ingest_outcomes_with(ctx.outcomes_sink.as_ref(), &ctx.cf_id, &ctx.events, &summary);
+                let _ = ctx.shared.clear_overlay_events(&event_ids);
+                let advance = AdvanceData {
+                    anchor: ctx.anchor,
+                    new_anchor_depth: ctx.new_anchor_depth,
+                    new_last_fold_vlc: ctx.new_last_fold_vlc,
+                    new_anchor_chain_root: ctx.new_anchor_chain_root,
+                };
+                (ApplyResult::Applied(summary), Some(advance))
+            }
+            Err(reason) => {
+                // POST-MUTATION: in-memory GSM already mutated by apply, commit failed →
+                // not re-foldable. Engine must fail-stop (D7.1).
+                let _ = ctx.shared.clear_overlay_events(&event_ids);
+                (
+                    ApplyResult::Failed {
+                        failure: ApplyFailure {
+                            cf_id: ctx.cf_id,
+                            anchor_id: ctx.anchor.id.clone(),
+                            anchor_depth: ctx.current_state.anchor_depth,
+                            role: ApplyFailureRole::LeaderCommitError,
+                            reason: format!("post-apply commit failed: {reason}"),
+                        },
+                        kind: FailureKind::PostMutationFatal,
+                    },
+                    None,
+                )
+            }
+        }
+    }
+
+    /// P3 (cm short): advance anchor metadata after a successful `apply_context`.
+    /// Identical scalar updates to `commit_build`'s tail.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn apply_advance(&mut self, advance: AdvanceData) {
+        self.last_anchor = Some(advance.anchor);
+        self.anchor_depth = advance.new_anchor_depth;
+        self.last_fold_vlc = advance.new_last_fold_vlc;
+        self.last_anchor_chain_root = advance.new_anchor_chain_root;
+        self.total_anchor_count += 1;
+        self.last_fold_instant = Some(std::time::Instant::now());
+    }
+
+    /// P1 helper (cm held): capture owned follower-apply inputs.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn build_follower_apply_context(
+        &self,
+        events: Vec<Event>,
+        cf: &ConsensusFrame,
+    ) -> FollowerApplyContext {
+        FollowerApplyContext {
+            anchor_id: self.anchor_depth + 1,
+            finalized_depth: cf.anchor.depth + 1,
+            shared: Arc::clone(&self.shared),
+            outcomes_sink: self.outcomes_sink.clone(),
+            cf: cf.clone(),
+            events,
+        }
+    }
+
+    /// P2 (NO cm; caller holds apply_mutex): follower apply transaction off owned data.
+    /// Mirrors `apply_follower_finalized_cf`: completeness (MissingEvents) and root verify
+    /// (RootMismatch) are PRE-mutation/recoverable; a commit failure after the real apply
+    /// is post-mutation/FATAL (D7.1). On success returns the anchor for the finish-stage
+    /// `synchronize_finalized_anchor` advance.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn apply_follower_context(
+        ctx: FollowerApplyContext,
+    ) -> (crate::folder::ApplyResult, Option<Anchor>) {
+        use crate::folder::{ApplyFailure, ApplyFailureRole, ApplyResult, FailureKind};
+        let FollowerApplyContext { cf, events, anchor_id, finalized_depth, shared, outcomes_sink } = ctx;
+        let event_ids = cf.anchor.event_ids.clone();
+        let fail = |reason: String, kind: FailureKind| -> (ApplyResult, Option<Anchor>) {
+            (
+                ApplyResult::Failed {
+                    failure: ApplyFailure {
+                        cf_id: cf.anchor.id.clone(),
+                        anchor_id: cf.anchor.id.clone(),
+                        anchor_depth: cf.anchor.depth,
+                        role: ApplyFailureRole::Follower,
+                        reason,
+                    },
+                    kind,
+                },
+                None,
+            )
+        };
+
+        // 1. Completeness (pre-mutation).
+        let have: std::collections::HashSet<&String> = events.iter().map(|e| &e.id).collect();
+        if !event_ids.iter().all(|id| have.contains(id)) {
+            let _ = shared.clear_overlay_events(&event_ids);
+            return fail("missing events for finalized CF".to_string(), FailureKind::PreMutationRecoverable);
+        }
+
+        // 2. Root verify (on a clone — pre-mutation) then 3. real apply + commit + publish.
+        let txn: Result<StateApplySummary, (String, FailureKind)> = {
+            let mut guard = shared.lock_write();
+            let do_apply = |guard: &mut GlobalStateManager| -> Result<StateApplySummary, (String, FailureKind)> {
+                let summary = guard.apply_committed_events(&events, finalized_depth);
+                match guard.commit(anchor_id) {
+                    Ok(()) => {
+                        shared.publish_snapshot(guard);
+                        Ok(summary)
+                    }
+                    Err(e) => Err((format!("post-apply commit failed: {e}"), FailureKind::PostMutationFatal)),
+                }
+            };
+            if let Some(ref mr) = cf.anchor.merkle_roots {
+                let mut temp = (*guard).clone();
+                let _ = temp.apply_committed_events(&events, finalized_depth);
+                let (expected, _) = temp.compute_global_root_bytes();
+                if expected != mr.global_state_root {
+                    Err(("follower root mismatch vs declared".to_string(), FailureKind::PreMutationRecoverable))
+                } else {
+                    do_apply(&mut guard)
+                }
+            } else {
+                do_apply(&mut guard)
+            }
+        };
+
+        match txn {
+            Ok(summary) => {
+                Self::ingest_outcomes_with(outcomes_sink.as_ref(), &cf.anchor.id, &events, &summary);
+                let _ = shared.clear_overlay_events(&event_ids);
+                (ApplyResult::Applied(summary), Some(cf.anchor))
+            }
+            Err((reason, kind)) => {
+                let _ = shared.clear_overlay_events(&event_ids);
+                fail(reason, kind)
+            }
+        }
     }
 
     /// Apply a finalized CF as a Follower (verify then apply)
@@ -3060,5 +3330,158 @@ mod tests {
             2,
             "force_prepare_build must bypass γ and keep both same-key events",
         );
+    }
+
+    // ───────── decouple-cf-apply Part 2: apply_context / apply_advance ─────────
+
+    /// T4-unit: the decoupled apply (build_apply_context → apply_context → apply_advance)
+    /// produces a byte-identical GSM root + anchor advance vs the legacy commit_build,
+    /// on identical events/state.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_apply_context_parity_with_commit_build() {
+        use crate::folder::ApplyResult;
+        let vlc = create_vlc("n1", 10);
+
+        // Legacy path.
+        let (mut a, ev_a) = fa_builder_with_overlay(2);
+        let pa = a.force_prepare_build(ev_a, &vlc, 0).expect("prepare a");
+        a.commit_build(pa).expect("legacy commit_build ok");
+        let (root_a, _) = a.shared_state_manager().lock_write().compute_global_root_bytes();
+
+        // Decoupled path (fa_make_event is deterministic → identical events + initial state).
+        let (mut b, ev_b) = fa_builder_with_overlay(2);
+        let pb = b.force_prepare_build(ev_b, &vlc, 0).expect("prepare b");
+        let ctx = b.build_apply_context(pb);
+        let (res, advance) = AnchorBuilder::apply_context(ctx);
+        assert!(matches!(res, ApplyResult::Applied(_)), "apply_context should succeed");
+        b.apply_advance(advance.expect("advance present on success"));
+        let (root_b, _) = b.shared_state_manager().lock_write().compute_global_root_bytes();
+
+        assert_eq!(root_a, root_b, "decoupled apply must yield identical GSM root (T4 parity)");
+        assert_eq!(a.anchor_depth, b.anchor_depth, "identical anchor advance");
+        assert_eq!(
+            b.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "decoupled apply must clear overlay (M4 invariant)"
+        );
+    }
+
+    /// SnapshotMismatch is PRE-mutation → recoverable; overlay still cleared; no advance.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_apply_context_snapshot_mismatch_recoverable() {
+        use crate::folder::{ApplyResult, FailureKind};
+        let (b, events) = fa_builder_with_overlay(2);
+        let vlc = create_vlc("n1", 10);
+        let mut pending = b.force_prepare_build(events, &vlc, 0).expect("prepare");
+        pending.pre_build_snapshot.anchor_depth = 99; // force verify mismatch
+        let ctx = b.build_apply_context(pending);
+        let (res, advance) = AnchorBuilder::apply_context(ctx);
+        assert!(advance.is_none(), "no advance on failure");
+        match res {
+            ApplyResult::Failed { kind, .. } => {
+                assert_eq!(kind, FailureKind::PreMutationRecoverable, "pre-mutation → recoverable");
+            }
+            _ => panic!("expected Failed"),
+        }
+        assert_eq!(
+            b.shared_state_manager().overlay_stats().entry_count,
+            0,
+            "overlay cleared even on SnapshotMismatch"
+        );
+    }
+
+    /// apply_advance advances anchor metadata (the P3 scalar update).
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_apply_advance_updates_metadata() {
+        use crate::folder::ApplyResult;
+        let (mut b, events) = fa_builder_with_overlay(1);
+        let vlc = create_vlc("n1", 10);
+        let pending = b.force_prepare_build(events, &vlc, 0).expect("prepare");
+        let expected_depth = pending.new_anchor_depth;
+        let depth_before = b.anchor_depth;
+        let ctx = b.build_apply_context(pending);
+        let (res, advance) = AnchorBuilder::apply_context(ctx);
+        assert!(matches!(res, ApplyResult::Applied(_)));
+        b.apply_advance(advance.unwrap());
+        assert!(b.anchor_depth > depth_before, "anchor_depth advanced");
+        assert_eq!(b.anchor_depth, expected_depth, "advanced to pending.new_anchor_depth");
+    }
+
+    // ───────── decouple-cf-apply Part 2b: follower apply_context ─────────
+
+    #[cfg(feature = "decoupled-apply")]
+    fn fa_two_events() -> Vec<Event> {
+        (0..2)
+            .map(|i| {
+                let key = test_oid_key(&format!("fa-coin-{i}"));
+                fa_make_event(&format!("{i}"), vec![StateChange::insert(key, vec![i as u8; 4])])
+            })
+            .collect()
+    }
+
+    /// Follower decoupled apply succeeds and yields the declared root (parity with the
+    /// legacy follower apply), clearing overlay; returns the anchor for synchronize.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_follower_apply_context_success_parity() {
+        use crate::folder::ApplyResult;
+        // Expected root from a scratch prepare (shares no state).
+        let scratch = AnchorBuilder::new(ConsensusConfig::default());
+        let events = fa_two_events();
+        let vlc = create_vlc("n1", 10);
+        let pending = scratch.force_prepare_build(events.clone(), &vlc, 0).expect("scratch prepare");
+        let expected_root = pending.anchor.merkle_roots.as_ref().expect("roots").global_state_root;
+
+        let follower = AnchorBuilder::new(ConsensusConfig::default());
+        let shared = follower.shared_state_manager();
+        for (i, ev) in events.iter().enumerate() {
+            fa_stage_overlay(&shared, &ev.id, &format!("fa-coin-{i}"));
+        }
+        let cf = fa_make_cf(&events, expected_root, 0);
+
+        let ctx = follower.build_follower_apply_context(events.clone(), &cf);
+        let (res, anchor) = AnchorBuilder::apply_follower_context(ctx);
+        assert!(matches!(res, ApplyResult::Applied(_)), "follower apply should succeed");
+        assert!(anchor.is_some(), "anchor returned for synchronize_finalized_anchor");
+        let (root, _) = follower.shared_state_manager().lock_write().compute_global_root_bytes();
+        assert_eq!(root, expected_root, "follower decoupled apply yields the declared root (parity)");
+        assert_eq!(follower.shared_state_manager().overlay_stats().entry_count, 0, "overlay cleared");
+    }
+
+    /// Follower RootMismatch is PRE-mutation → recoverable (verify runs on a clone).
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_follower_root_mismatch_recoverable() {
+        use crate::folder::{ApplyResult, FailureKind};
+        let follower = AnchorBuilder::new(ConsensusConfig::default());
+        let events = fa_two_events();
+        let cf = fa_make_cf(&events, [9u8; 32], 0); // bogus declared root
+        let ctx = follower.build_follower_apply_context(events.clone(), &cf);
+        let (res, anchor) = AnchorBuilder::apply_follower_context(ctx);
+        assert!(anchor.is_none(), "no advance on mismatch");
+        match res {
+            ApplyResult::Failed { kind, .. } => assert_eq!(kind, FailureKind::PreMutationRecoverable),
+            _ => panic!("expected RootMismatch → recoverable"),
+        }
+    }
+
+    /// Follower MissingEvents is PRE-mutation → recoverable.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_follower_missing_events_recoverable() {
+        use crate::folder::{ApplyResult, FailureKind};
+        let follower = AnchorBuilder::new(ConsensusConfig::default());
+        let events = fa_two_events();
+        let cf = fa_make_cf(&events, [0u8; 32], 0); // claims 2 events
+        let ctx = follower.build_follower_apply_context(events[..1].to_vec(), &cf); // provide 1
+        let (res, anchor) = AnchorBuilder::apply_follower_context(ctx);
+        assert!(anchor.is_none());
+        match res {
+            ApplyResult::Failed { kind, .. } => assert_eq!(kind, FailureKind::PreMutationRecoverable),
+            _ => panic!("expected MissingEvents → recoverable"),
+        }
     }
 }
