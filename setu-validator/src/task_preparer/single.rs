@@ -887,7 +887,7 @@ impl TaskPreparer {
     /// `old_value` conflict check at apply time), so dropping them is safe.
     /// See docs/feat/fix-transfer-parent-too-old-general/design.md.
     fn derive_dependencies(&self, input_objects: &[&ObjectId]) -> Vec<String> {
-        use super::COLD_PARENT_DROP_THRESHOLD;
+        let cold_parent_drop_threshold = super::cold_parent_drop_threshold();
 
         let mut parent_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -913,7 +913,7 @@ impl TaskPreparer {
             }
 
             // (2) Cold non-genesis drop: aged past the cross-CF window proxy.
-            if floor.saturating_sub(depth) >= COLD_PARENT_DROP_THRESHOLD {
+            if floor.saturating_sub(depth) >= cold_parent_drop_threshold {
                 debug!(
                     object_id = %object_id,
                     parent_event = %event_id,

@@ -64,17 +64,33 @@ pub const MAX_MERGE_SOURCES: usize = 50;
 /// levels is rejected as `ParentTooOld` at `resolve_parents` time.
 pub const MAX_CROSS_CF_DEPTH: u64 = 200;
 
-/// Safety margin below `MAX_CROSS_CF_DEPTH` for the prepare-time cold-parent
-/// drop. The decision is made at preparation against the (proxied) depth floor,
-/// which advances before the event finalizes; the margin guarantees an edge we
-/// *keep* cannot age past `MAX_CROSS_CF_DEPTH` before it lands. Empirically the
-/// floor advances ~0.32 depth/min, so a 50-level margin is >10× headroom.
-/// See docs/feat/fix-transfer-parent-too-old-general/design.md §5a.
-pub const COLD_PARENT_MARGIN: u64 = 50;
+/// Safety margin below `MAX_CROSS_CF_DEPTH` for the prepare-time cold-parent drop.
+/// The decision is made at preparation against the (proxied) depth floor, which
+/// advances before the event finalizes; the margin guarantees an edge we *keep*
+/// cannot age past `MAX_CROSS_CF_DEPTH` before it lands.
+///
+/// §5a calibrated 50 against a SLOW floor (~0.32 depth/min). Under faster
+/// finalization (e.g. decoupled-apply + large CFs) the floor can advance orders of
+/// magnitude faster within a single prepare→resolve window, so 50 under-drops and
+/// `ParentTooOld` recurs (M1-report §C2). Env-overridable via `COLD_PARENT_MARGIN`
+/// (clamped to [0, MAX_CROSS_CF_DEPTH]); larger margin → lower drop threshold →
+/// more aggressive (and always-safe, per fix-transfer-parent-too-old-general §1b) drop.
+pub fn cold_parent_margin() -> u64 {
+    static M: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy::new(|| {
+        std::env::var("COLD_PARENT_MARGIN")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(50)
+            .min(MAX_CROSS_CF_DEPTH)
+    });
+    *M
+}
 
 /// Drop a non-genesis parent edge when `floor − parent_depth` reaches this
-/// threshold (= `MAX_CROSS_CF_DEPTH − COLD_PARENT_MARGIN` = 150).
-pub const COLD_PARENT_DROP_THRESHOLD: u64 = MAX_CROSS_CF_DEPTH - COLD_PARENT_MARGIN;
+/// threshold (= `MAX_CROSS_CF_DEPTH − cold_parent_margin()`).
+pub fn cold_parent_drop_threshold() -> u64 {
+    MAX_CROSS_CF_DEPTH.saturating_sub(cold_parent_margin())
+}
 
 /// Result of coin selection for a transfer.
 ///

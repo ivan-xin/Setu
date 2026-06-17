@@ -29,7 +29,11 @@ use tracing::{debug, info, warn};
 use crate::broadcaster::ConsensusBroadcaster;
 use crate::dag::Dag;
 use crate::dag_manager::{DagManager, DagManagerError};
-use crate::folder::{CfLifecycleOutcome, ConsensusManager};
+use crate::folder::ConsensusManager;
+// `CfLifecycleOutcome` is only matched on by the legacy in-cm-lock apply paths; the
+// decoupled-apply engine paths use `BeginOutcome`/`FinishOutcome` (imported locally).
+#[cfg(not(feature = "decoupled-apply"))]
+use crate::folder::CfLifecycleOutcome;
 use crate::liveness::Round;
 use crate::outcome_sink::OutcomeSink;
 use crate::validator_set::ValidatorSet;
@@ -168,11 +172,58 @@ pub struct ConsensusEngine {
     /// Serializes CF apply across the decoupled begin→apply→finish window so the heavy
     /// GSM apply runs off the cm lock without interleaving (decouple-cf-apply D3). Held
     /// for the whole apply sequence; submit never touches it → no cycle with cm.
-    /// Scaffold for Part 3 (`apply_finalized_cf_decoupled` orchestration); wired when the
-    /// 4 finalize call sites adopt the decoupled flow.
+    /// Driven by `apply_finalized_cf_decoupled` (Part 3 orchestration).
     #[cfg(feature = "decoupled-apply")]
-    #[allow(dead_code)]
     apply_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Set once when a decoupled apply hits `PostMutationFatal` (in-memory GSM mutated then
+    /// commit/publish failed → dirty, NOT re-foldable; decouple-cf-apply D7.1 / R5 #3). Once
+    /// true the node fail-stops: `try_create_cf`/heartbeat refuse to fold and
+    /// `apply_finalized_cf_decoupled` refuses to apply, so nothing builds on the dirty state.
+    /// Recovery is operational (restart from persisted state). No-op in the legacy path.
+    #[cfg(feature = "decoupled-apply")]
+    decoupled_unhealthy: std::sync::atomic::AtomicBool,
+}
+
+/// Owned apply inputs captured under the short BEGIN cm-lock, carried across the
+/// cm-release window into the heavy apply step (decouple-cf-apply D2/D7.2). Neither
+/// variant borrows the `ConsensusManager`/`AnchorBuilder`, so holding it does not pin
+/// the cm guard.
+#[cfg(feature = "decoupled-apply")]
+enum PreparedApply {
+    Leader(crate::anchor_builder::ApplyContext),
+    Follower(crate::anchor_builder::FollowerApplyContext),
+}
+
+/// The scalar anchor-metadata advance to apply under the short FINISH cm-lock on a
+/// successful apply (decouple-cf-apply D4). Leader advances via `apply_advance`,
+/// follower via `synchronize_finalized_anchor`.
+#[cfg(feature = "decoupled-apply")]
+enum EngineFinalizeAdvance {
+    Leader(crate::anchor_builder::AdvanceData),
+    Follower(setu_types::Anchor),
+}
+
+/// Result of `apply_finalized_cf_decoupled` (decouple-cf-apply D2/D7.1).
+#[cfg(feature = "decoupled-apply")]
+enum DecoupledFinalize {
+    /// Applied + finished. Carries the just-finalized CF + new anchor depth, **captured
+    /// atomically under the finish cm-lock that pushed it** — the caller must NOT re-read
+    /// `last_finalized_cf()` (a concurrent finalize could push a later CF before the
+    /// caller's post-finalize read; review F1).
+    Finalized {
+        // Boxed: ConsensusFrame is ~464B and the other variants are unit
+        // (clippy::large_enum_variant).
+        cf: Box<ConsensusFrame>,
+        new_anchor_depth: u64,
+    },
+    /// `begin_finalization` did not yield a plan (pending / already-applying / rejected /
+    /// timed-out): nothing to apply this call.
+    NotFinalized,
+    /// Pre-mutation recoverable failure: CF discarded, events stay in DAG for re-fold.
+    FailedRecoverable,
+    /// Post-mutation fatal: in-memory GSM dirty, node marked unhealthy. Caller MUST NOT
+    /// post-finalize or broadcast (D7.1 / R5 #3).
+    Fatal,
 }
 
 impl ConsensusEngine {
@@ -215,6 +266,8 @@ impl ConsensusEngine {
             finalization_tx: parking_lot::RwLock::new(None),
             #[cfg(feature = "decoupled-apply")]
             apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "decoupled-apply")]
+            decoupled_unhealthy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -266,6 +319,8 @@ impl ConsensusEngine {
             finalization_tx: parking_lot::RwLock::new(None),
             #[cfg(feature = "decoupled-apply")]
             apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "decoupled-apply")]
+            decoupled_unhealthy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -313,6 +368,8 @@ impl ConsensusEngine {
             finalization_tx: parking_lot::RwLock::new(None),
             #[cfg(feature = "decoupled-apply")]
             apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "decoupled-apply")]
+            decoupled_unhealthy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -359,6 +416,8 @@ impl ConsensusEngine {
             finalization_tx: parking_lot::RwLock::new(None),
             #[cfg(feature = "decoupled-apply")]
             apply_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "decoupled-apply")]
+            decoupled_unhealthy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -422,6 +481,14 @@ impl ConsensusEngine {
     /// Read-only accessor for strict vote signature enforcement (health telemetry).
     pub fn strict_vote_signatures_enabled(&self) -> bool {
         self.require_vote_signatures()
+    }
+
+    /// False once a decoupled apply hit `PostMutationFatal` (decouple-cf-apply D7.1).
+    /// The fold/apply paths check this and fail-stop so nothing builds on the dirty
+    /// in-memory GSM. Always healthy in the legacy path (no decoupled apply runs).
+    #[cfg(feature = "decoupled-apply")]
+    pub fn is_decoupled_healthy(&self) -> bool {
+        !self.decoupled_unhealthy.load(Ordering::SeqCst)
     }
 
     /// Take all pending anchors that were finalized inline (single-node mode).
@@ -859,7 +926,327 @@ impl ConsensusEngine {
         new_round
     }
 
+    /// decouple-cf-apply D2/D7: orchestrate `begin_finalization` (short cm-lock) →
+    /// heavy GSM apply (OFF cm, under `apply_mutex` + the GSM write lock) →
+    /// `finish_finalization` (short cm-lock) for a CF that may have reached quorum.
+    ///
+    /// The whole point (G-1): the heavy apply runs between two O(1) cm-locks, so a
+    /// concurrent submit's fold-gate check (`try_create_cf`'s short cm-lock) is no longer
+    /// starved by a big CF's apply. `apply_mutex` is held for the entire begin→finish
+    /// window so applies never interleave (D3); submit never takes `apply_mutex`, and the
+    /// lock order is strictly `apply_mutex → cm (short) → GSM`, so there is no cycle with
+    /// submit's cm-only path → no deadlock (T6).
+    ///
+    /// no-cm-across-await (D7.5): the cm guard is held only across the synchronous
+    /// begin/finish bodies — never across the apply step or any `.await`.
+    ///
+    /// On `PostMutationFatal` the in-memory GSM is dirty and not re-foldable: the node is
+    /// marked unhealthy (fail-stop) and `Fatal` is returned WITHOUT advancing or
+    /// post-finalizing (D7.1 / R5 #3).
+    #[cfg(feature = "decoupled-apply")]
+    async fn apply_finalized_cf_decoupled(&self, cf_id: &str) -> SetuResult<DecoupledFinalize> {
+        use crate::anchor_builder::AnchorBuilder;
+        use crate::folder::{BeginOutcome, FinishOutcome};
+
+        // Fail-stop: never start another apply on a dirty in-memory GSM (D7.1 / R5 #3).
+        if !self.is_decoupled_healthy() {
+            return Ok(DecoupledFinalize::NotFinalized);
+        }
+
+        // Serialize the whole apply sequence. submit never takes this lock.
+        let _apply_guard = self.apply_mutex.lock().await;
+
+        // F2: re-check health AFTER acquiring the serialize lock — a concurrent apply may
+        // have gone PostMutationFatal while we waited on `apply_mutex`, dirtying the GSM.
+        // Without this re-check a queued caller would apply onto dirty state (D7.1 / R5 #3).
+        if !self.is_decoupled_healthy() {
+            return Ok(DecoupledFinalize::NotFinalized);
+        }
+
+        // ── BEGIN (cm.write, O(1)) — no `.await` while cm is held (D7.5). ──
+        let prepared = {
+            let mut cm = self.consensus_manager.write().await;
+            match cm.begin_finalization(cf_id) {
+                BeginOutcome::Apply(plan) => {
+                    let mut plan = *plan;
+                    if plan.is_leader {
+                        let pb = plan
+                            .pending_build
+                            .take()
+                            .expect("leader ApplyPlan carries a pending_build");
+                        // build_apply_context returns OWNED data (no &AnchorBuilder/&cm
+                        // borrow outlives it, D7.2), so cm is free to drop below.
+                        let ctx = cm.anchor_builder().build_apply_context(pb);
+                        Some((plan, PreparedApply::Leader(ctx)))
+                    } else {
+                        let events = plan.follower_events.take().unwrap_or_default();
+                        let ctx = cm
+                            .anchor_builder()
+                            .build_follower_apply_context(events, &plan.cf);
+                        Some((plan, PreparedApply::Follower(ctx)))
+                    }
+                }
+                BeginOutcome::AlreadyApplying
+                | BeginOutcome::Pending
+                | BeginOutcome::Rejected
+                | BeginOutcome::TimedOut => None,
+            }
+        }; // cm dropped — the heavy apply below runs OFF the cm lock.
+
+        let (plan, prepared) = match prepared {
+            Some(p) => p,
+            None => return Ok(DecoupledFinalize::NotFinalized),
+        };
+
+        // ── APPLY (NO cm held; apply_mutex held; GSM write-lock taken inside). ──
+        let (result, advance) = match prepared {
+            PreparedApply::Leader(ctx) => {
+                let (r, adv) = AnchorBuilder::apply_context(ctx);
+                (r, adv.map(EngineFinalizeAdvance::Leader))
+            }
+            PreparedApply::Follower(ctx) => {
+                let (r, anchor) = AnchorBuilder::apply_follower_context(ctx);
+                (r, anchor.map(EngineFinalizeAdvance::Follower))
+            }
+        };
+
+        // ── FINISH (cm.write, O(1)) — no `.await` while cm is held (D7.5). ──
+        // On success the finalized CF + new anchor depth are captured HERE, under the same
+        // cm guard that pushed them, and returned to the caller (F1: a post-finalize that
+        // re-read `last_finalized_cf()` after this lock released could observe a later CF
+        // pushed by a concurrent finalize). The warn/error + unhealthy store are non-await,
+        // so doing them inside the cm block does not violate D7.5.
+        let result_out = {
+            let mut cm = self.consensus_manager.write().await;
+            // Advance anchor metadata under the short finish lock (D4 / R5 #2). `advance`
+            // is `Some` iff apply succeeded, so this runs only on success.
+            if let Some(advance) = advance {
+                match advance {
+                    EngineFinalizeAdvance::Leader(a) => cm.anchor_builder_mut().apply_advance(a),
+                    EngineFinalizeAdvance::Follower(anchor) => {
+                        cm.anchor_builder_mut().synchronize_finalized_anchor(&anchor)
+                    }
+                }
+            }
+            match cm.finish_finalization(plan, result) {
+                FinishOutcome::Finalized { .. } => {
+                    let cf = cm
+                        .last_finalized_cf()
+                        .cloned()
+                        .expect("finalized CF present right after finish_finalization");
+                    let new_anchor_depth = cm.anchor_builder().anchor_depth();
+                    DecoupledFinalize::Finalized { cf: Box::new(cf), new_anchor_depth }
+                }
+                FinishOutcome::FailedRecoverable { cf_id } => {
+                    warn!(
+                        cf_id = %cf_id,
+                        "decoupled apply failed (pre-mutation, recoverable); CF discarded, events stay in DAG for re-fold"
+                    );
+                    DecoupledFinalize::FailedRecoverable
+                }
+                FinishOutcome::Fatal { cf_id } => {
+                    self.decoupled_unhealthy.store(true, Ordering::SeqCst);
+                    tracing::error!(
+                        cf_id = %cf_id,
+                        "decoupled apply FATAL (post-mutation): in-memory GSM mutated then commit/publish failed; \
+                         node marked unhealthy — fail-stop, will not fold/apply further (recover from persisted state)"
+                    );
+                    DecoupledFinalize::Fatal
+                }
+            }
+        }; // cm dropped.
+
+        Ok(result_out)
+        // _apply_guard released here.
+    }
+
+    /// Single-node post-finalize side effects, OFF the cm lock (decouple-cf-apply
+    /// post_finalize, D2 / D7.6 single-node path). Mirrors the legacy single-node block
+    /// (depth floor → mark events finalized in active DAG → buffer anchor+CF for caller
+    /// persistence → notify finalization subscribers) but runs after cm is released.
+    ///
+    /// `cf` / `new_anchor_depth` are the values captured atomically by
+    /// `apply_finalized_cf_decoupled` under the finish cm-lock — they must NOT be re-read
+    /// here (review F1: a concurrent finalize could have advanced `last_finalized_cf()` /
+    /// `anchor_depth()` between the finish lock release and this call).
+    #[cfg(feature = "decoupled-apply")]
+    async fn post_finalize_single_node(&self, cf: ConsensusFrame, new_anchor_depth: u64) {
+        // Update depth floor so new events land above anchor_depth (else old-parent events
+        // get a depth below anchor_depth → permanent InsufficientEvents).
+        self.dag_manager.update_min_depth(new_anchor_depth);
+        self.mark_anchor_events_finalized_in_active_dag(&cf.anchor)
+            .await;
+        info!(
+            new_min_depth = new_anchor_depth,
+            cf_id = %cf.id,
+            "CF finalized (single-node, decoupled), depth floor updated"
+        );
+
+        {
+            let mut pending = self.pending_persist_anchors.lock().await;
+            pending.push(cf.anchor.clone());
+        }
+        {
+            let mut pending = self.pending_persist_cfs.lock().await;
+            pending.push(cf.clone());
+        }
+        {
+            let tx_guard = self.finalization_tx.read();
+            if let Some(ref tx) = *tx_guard {
+                let _ = tx.send(cf);
+            }
+        }
+    }
+
+    /// Broadcast a freshly-created CF (with the leader self-vote embedded for atomic
+    /// delivery) plus a standalone backup vote. Runs OFF the cm lock; shared by the
+    /// decoupled `try_create_cf` / heartbeat paths.
+    #[cfg(feature = "decoupled-apply")]
+    async fn broadcast_proposed_cf(&self, frame: &ConsensusFrame, self_vote: &Option<Vote>) {
+        // Send to internal channel (legacy, not consumed in production).
+        self.send_legacy_message(ConsensusMessage::ProposeFrame(frame.clone()));
+
+        let mut broadcast_frame = frame.clone();
+        if let Some(v) = self_vote {
+            broadcast_frame.add_vote(v.clone());
+        }
+
+        let broadcaster = self.broadcaster.read().await;
+        if let Some(ref b) = *broadcaster {
+            match b.broadcast_cf(&broadcast_frame).await {
+                Ok(result) => {
+                    info!(
+                        cf_id = %frame.id,
+                        success = result.success_count,
+                        total = result.total_peers,
+                        "CF broadcasted to peers (with leader vote embedded)"
+                    );
+                }
+                Err(e) => {
+                    warn!(cf_id = %frame.id, error = %e, "Failed to broadcast CF");
+                }
+            }
+            // Defense-in-depth: a duplicate vote is idempotently ignored by receive_vote.
+            if let Some(vote) = self_vote {
+                match b.broadcast_vote(vote).await {
+                    Ok(result) => {
+                        debug!(
+                            cf_id = %frame.id,
+                            success = result.success_count,
+                            "Leader self-vote broadcasted (backup)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %frame.id, error = %e, "Failed to broadcast leader self-vote");
+                    }
+                }
+            }
+        } else {
+            debug!(cf_id = %frame.id, "No broadcaster configured, CF not sent to network");
+        }
+    }
+
+    /// Try to create a ConsensusFrame if conditions are met (decoupled-apply path).
+    ///
+    /// The heavy apply on the leader self-vote runs OFF the cm lock via
+    /// `apply_finalized_cf_decoupled`, so concurrent submits are not starved (G-1).
+    #[cfg(feature = "decoupled-apply")]
+    async fn try_create_cf(&self) -> SetuResult<Option<ConsensusFrame>> {
+        // Fail-stop: once a decoupled apply went fatally dirty, do not fold further (D7.1).
+        if !self.is_decoupled_healthy() {
+            debug!("try_create_cf skipped: node unhealthy after fatal decoupled apply");
+            return Ok(None);
+        }
+
+        let current_round = {
+            let validator_set = self.validator_set.read().await;
+            let round = validator_set.current_round();
+            if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
+                debug!(
+                    local_id = %self.local_validator_id,
+                    round = round,
+                    leader_id = ?validator_set.get_leader_id(),
+                    "try_create_cf: not valid proposer"
+                );
+                return Ok(None);
+            }
+            round
+        };
+
+        let vlc = self.vlc.read().await;
+        // no-cm-across-await (D7.5): read the signing key BEFORE taking cm so the cm guard
+        // never spans the private_key `.await`.
+        let key_bytes: Option<Vec<u8>> = self.private_key.read().await.clone();
+
+        // Fold + self-vote under a SHORT cm.write. dag.read is acquired BEFORE cm so the cm
+        // guard spans no `.await` (D7.5); both guards drop before the heavy apply.
+        let (cf, self_vote) = {
+            let dag = self.dag.read().await;
+            let mut manager = self.consensus_manager.write().await;
+
+            if !manager.should_fold(&vlc) {
+                debug!(
+                    vlc_logical_time = vlc.logical_time(),
+                    last_fold_vlc = manager.anchor_builder().last_fold_vlc(),
+                    "try_create_cf: should_fold=false"
+                );
+                return Ok(None);
+            }
+            info!(
+                vlc_logical_time = vlc.logical_time(),
+                "try_create_cf: starting CF creation"
+            );
+            let cf = {
+                // M0 fold_work: the folding computation itself (no-op unless m0-profiling).
+                let _fold =
+                    setu_timing::Span::start(setu_timing::StageId::FoldWork, setu_timing::TraceId(0));
+                manager.try_create_cf(&dag, &vlc, current_round)
+            };
+            // Leader auto-votes for its own CF (key read off-cm above).
+            let self_vote = cf
+                .as_ref()
+                .and_then(|f| manager.vote_for_cf(&f.id, true, key_bytes.as_deref()));
+            (cf, self_vote)
+        }; // cm + dag dropped — heavy apply runs OFF cm.
+
+        if let Some(ref frame) = cf {
+            // M0 fold_wait end: each folded event leaves the DAG queue now.
+            for eid in &frame.anchor.event_ids {
+                setu_timing::measure_from(
+                    setu_timing::TraceId::from_hex(eid),
+                    setu_timing::StageId::FoldWait,
+                );
+            }
+            info!(
+                cf_id = %frame.id,
+                anchor_id = %frame.anchor.id,
+                event_count = frame.anchor.event_ids.len(),
+                "CF created successfully"
+            );
+
+            if self_vote.is_some() {
+                debug!(cf_id = %frame.id, "Leader self-voted for CF");
+                // Decoupled finalize: begin (cm) → apply (off cm) → finish (cm).
+                match self.apply_finalized_cf_decoupled(&frame.id).await? {
+                    DecoupledFinalize::Finalized { cf, new_anchor_depth } => {
+                        self.post_finalize_single_node(*cf, new_anchor_depth).await;
+                    }
+                    DecoupledFinalize::Fatal => {
+                        // Node is now unhealthy (fail-stop). Do NOT post-finalize / broadcast.
+                        return Ok(None);
+                    }
+                    DecoupledFinalize::FailedRecoverable | DecoupledFinalize::NotFinalized => {}
+                }
+            }
+
+            self.broadcast_proposed_cf(frame, &self_vote).await;
+        }
+
+        Ok(cf)
+    }
+
     /// Try to create a ConsensusFrame if conditions are met
+    #[cfg(not(feature = "decoupled-apply"))]
     async fn try_create_cf(&self) -> SetuResult<Option<ConsensusFrame>> {
         let current_round = {
             let validator_set = self.validator_set.read().await;
@@ -1148,67 +1535,148 @@ impl ConsensusEngine {
             ));
         }
 
-        // Now we have all events, proceed with verification
-        let dag = self.dag.read().await;
-        let mut manager = self.consensus_manager.write().await;
-
-        // Double-check idempotency (another thread may have processed while we fetched)
-        if manager.has_cf(&cf.id) {
-            return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
+        // From here the flow diverges by feature: the decoupled path runs the heavy apply
+        // OFF the cm lock (G-1) and post-finalizes off cm; the legacy path applies inline
+        // under cm.write.
+        #[cfg(feature = "decoupled-apply")]
+        {
+            return self.receive_cf_apply_decoupled(cf).await;
         }
 
-        // Step 4: Verify the CF's merkle roots are internally consistent
-        if !manager.verify_cf_merkle_roots(&cf) {
-            return Err(setu_types::SetuError::InvalidData(
-                "CF merkle roots verification failed".to_string(),
-            ));
-        }
+        #[cfg(not(feature = "decoupled-apply"))]
+        {
+            // Now we have all events, proceed with verification
+            let dag = self.dag.read().await;
+            let mut manager = self.consensus_manager.write().await;
 
-        // Step 5-6: Collect events from CF for deferred state application at finalization.
-        // State is NOT applied here — it will be applied when the CF is finalized,
-        // guaranteeing correct ordering even if CFs arrive out of network order.
-        manager.apply_cf_state_changes(&dag, &cf);
-        drop(dag);
+            // Double-check idempotency (another thread may have processed while we fetched)
+            if manager.has_cf(&cf.id) {
+                return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
+            }
 
-        let cf_id = cf.id.clone();
+            // Step 4: Verify the CF's merkle roots are internally consistent
+            if !manager.verify_cf_merkle_roots(&cf) {
+                return Err(setu_types::SetuError::InvalidData(
+                    "CF merkle roots verification failed".to_string(),
+                ));
+            }
 
-        // Receive the CF
-        manager.receive_cf(cf.clone());
+            // Step 5-6: Collect events from CF for deferred state application at finalization.
+            // State is NOT applied here — it will be applied when the CF is finalized,
+            // guaranteeing correct ordering even if CFs arrive out of network order.
+            manager.apply_cf_state_changes(&dag, &cf);
+            drop(dag);
 
-        // Vote for the CF (in MVP, we always approve valid CFs)
-        let private_key = self.private_key.read().await;
-        let vote = manager.vote_for_cf(&cf_id, true, private_key.as_ref().map(|k| k.as_slice()));
-        if let Some(ref v) = vote {
-            // Broadcast vote to network via broadcaster (if configured)
-            let broadcaster = self.broadcaster.read().await;
-            if let Some(ref b) = *broadcaster {
-                match b.broadcast_vote(v).await {
-                    Ok(result) => {
-                        debug!(
-                            cf_id = %cf_id,
-                            success = result.success_count,
-                            "Vote broadcasted to peers"
-                        );
+            let cf_id = cf.id.clone();
+
+            // Receive the CF
+            manager.receive_cf(cf.clone());
+
+            // Vote for the CF (in MVP, we always approve valid CFs)
+            let private_key = self.private_key.read().await;
+            let vote = manager.vote_for_cf(&cf_id, true, private_key.as_ref().map(|k| k.as_slice()));
+            if let Some(ref v) = vote {
+                // Broadcast vote to network via broadcaster (if configured)
+                let broadcaster = self.broadcaster.read().await;
+                if let Some(ref b) = *broadcaster {
+                    match b.broadcast_vote(v).await {
+                        Ok(result) => {
+                            debug!(
+                                cf_id = %cf_id,
+                                success = result.success_count,
+                                "Vote broadcasted to peers"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(cf_id = %cf_id, error = %e, "Failed to broadcast vote");
+                        }
                     }
-                    Err(e) => {
-                        warn!(cf_id = %cf_id, error = %e, "Failed to broadcast vote");
-                    }
+                }
+
+                // Check if our vote caused finalization
+                // (vote_for_cf adds vote but doesn't check finalization, so we check here)
+                let outcome = manager.classify_finalization(&cf_id);
+                if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                    warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_cf path)");
+                }
+                if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
+                    let (finalized, anchor) = self.handle_finalization(&mut manager).await?;
+                    return Ok(CfReceiveOutcome::Accepted { finalized, anchor });
                 }
             }
 
-            // Check if our vote caused finalization
-            // (vote_for_cf adds vote but doesn't check finalization, so we check here)
-            let outcome = manager.classify_finalization(&cf_id);
-            if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
-                warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_cf path)");
-            }
-            if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
-                let (finalized, anchor) = self.handle_finalization(&mut manager).await?;
-                return Ok(CfReceiveOutcome::Accepted { finalized, anchor });
-            }
+            Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None })
+        }
+    }
+
+    /// decouple-cf-apply: receive_cf finalize tail (follower path). Verifies + buffers
+    /// deferred events + self-votes under a SHORT cm.write, then runs the heavy apply OFF
+    /// the cm lock via `apply_finalized_cf_decoupled`, then post-finalizes off cm (D2/D7.5).
+    #[cfg(feature = "decoupled-apply")]
+    async fn receive_cf_apply_decoupled(
+        &self,
+        cf: ConsensusFrame,
+    ) -> SetuResult<CfReceiveOutcome> {
+        // Fail-stop: do not apply on a dirty in-memory GSM (D7.1 / R5 #3).
+        if !self.is_decoupled_healthy() {
+            return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
         }
 
-        Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None })
+        let cf_id = cf.id.clone();
+        // no-cm-across-await (D7.5): read the signing key before taking cm.
+        let key_bytes: Option<Vec<u8>> = self.private_key.read().await.clone();
+
+        // Verify + buffer deferred events + self-vote under a SHORT cm.write (dag.read
+        // acquired first; no `.await` while cm is held).
+        let vote = {
+            let dag = self.dag.read().await;
+            let mut manager = self.consensus_manager.write().await;
+
+            // Double-check idempotency (another thread may have processed while we fetched).
+            if manager.has_cf(&cf.id) {
+                return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
+            }
+            if !manager.verify_cf_merkle_roots(&cf) {
+                return Err(setu_types::SetuError::InvalidData(
+                    "CF merkle roots verification failed".to_string(),
+                ));
+            }
+            // Deferred apply: store events now; the GSM apply happens at finalization.
+            manager.apply_cf_state_changes(&dag, &cf);
+            manager.receive_cf(cf.clone());
+            manager.vote_for_cf(&cf_id, true, key_bytes.as_deref())
+        }; // cm + dag dropped — heavy apply runs OFF cm.
+
+        let Some(vote) = vote else {
+            return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
+        };
+
+        // Broadcast the local vote off cm.
+        let broadcaster = self.broadcaster.read().await;
+        if let Some(ref b) = *broadcaster {
+            match b.broadcast_vote(&vote).await {
+                Ok(result) => {
+                    debug!(cf_id = %cf_id, success = result.success_count, "Vote broadcasted to peers");
+                }
+                Err(e) => {
+                    warn!(cf_id = %cf_id, error = %e, "Failed to broadcast vote");
+                }
+            }
+        }
+        drop(broadcaster);
+
+        // Decoupled finalize: begin (cm) → apply (off cm) → finish (cm).
+        match self.apply_finalized_cf_decoupled(&cf_id).await? {
+            DecoupledFinalize::Finalized { cf, .. } => {
+                let (finalized, anchor) = self.post_finalize_network(*cf).await?;
+                Ok(CfReceiveOutcome::Accepted { finalized, anchor })
+            }
+            DecoupledFinalize::Fatal
+            | DecoupledFinalize::FailedRecoverable
+            | DecoupledFinalize::NotFinalized => {
+                Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None })
+            }
+        }
     }
 
     pub async fn receive_finalized_cf(
@@ -1250,31 +1718,69 @@ impl ConsensusEngine {
 
         self.ensure_cf_events_available(&cf).await?;
 
-        let dag = self.dag.read().await;
-        let mut manager = self.consensus_manager.write().await;
-
-        if manager.is_finalized_cf(&cf.id) {
-            return Ok((false, None));
+        // Decoupled path: verify + ingest (merge votes / receive) under a short cm.write,
+        // then apply OFF cm via the orchestration helper, then post-finalize off cm.
+        #[cfg(feature = "decoupled-apply")]
+        {
+            if !self.is_decoupled_healthy() {
+                return Ok((false, None));
+            }
+            let cf_id = cf.id.clone();
+            let should_try = {
+                let dag = self.dag.read().await;
+                let mut manager = self.consensus_manager.write().await;
+                if manager.is_finalized_cf(&cf.id) {
+                    return Ok((false, None));
+                }
+                if !manager.verify_cf_merkle_roots(&cf) {
+                    return Err(setu_types::SetuError::InvalidData(
+                        "Finalized CF merkle roots verification failed".to_string(),
+                    ));
+                }
+                manager.apply_cf_state_changes(&dag, &cf);
+                manager.ingest_finalized_cf(cf)
+            }; // cm + dag dropped — heavy apply runs OFF cm.
+            if should_try {
+                match self.apply_finalized_cf_decoupled(&cf_id).await? {
+                    DecoupledFinalize::Finalized { cf, .. } => {
+                        return self.post_finalize_network(*cf).await
+                    }
+                    DecoupledFinalize::Fatal
+                    | DecoupledFinalize::FailedRecoverable
+                    | DecoupledFinalize::NotFinalized => {}
+                }
+            }
+            Ok((false, None))
         }
 
-        if !manager.verify_cf_merkle_roots(&cf) {
-            return Err(setu_types::SetuError::InvalidData(
-                "Finalized CF merkle roots verification failed".to_string(),
-            ));
-        }
+        #[cfg(not(feature = "decoupled-apply"))]
+        {
+            let dag = self.dag.read().await;
+            let mut manager = self.consensus_manager.write().await;
 
-        manager.apply_cf_state_changes(&dag, &cf);
-        drop(dag);
+            if manager.is_finalized_cf(&cf.id) {
+                return Ok((false, None));
+            }
 
-        let outcome = manager.receive_finalized_cf(cf.clone());
-        if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
-            warn!(cf_id = %cf.id, ?failure, "CF dropped on apply failure (receive_finalized_cf path)");
-        }
-        if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
-            return self.handle_finalization(&mut manager).await;
-        }
+            if !manager.verify_cf_merkle_roots(&cf) {
+                return Err(setu_types::SetuError::InvalidData(
+                    "Finalized CF merkle roots verification failed".to_string(),
+                ));
+            }
 
-        Ok((false, None))
+            manager.apply_cf_state_changes(&dag, &cf);
+            drop(dag);
+
+            let outcome = manager.receive_finalized_cf(cf.clone());
+            if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                warn!(cf_id = %cf.id, ?failure, "CF dropped on apply failure (receive_finalized_cf path)");
+            }
+            if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
+                return self.handle_finalization(&mut manager).await;
+            }
+
+            Ok((false, None))
+        }
     }
 
     async fn verify_finalized_cf_votes(&self, cf: &ConsensusFrame) -> SetuResult<()> {
@@ -1554,6 +2060,10 @@ impl ConsensusEngine {
     ///
     /// Note: This method extracts data from manager before acquiring other locks
     /// to avoid potential deadlock from holding multiple write locks.
+    ///
+    /// Legacy in-cm-lock path only; the decoupled path uses `post_finalize_network`
+    /// (same side effects, but run after cm is released — D2/D7.5).
+    #[cfg(not(feature = "decoupled-apply"))]
     async fn handle_finalization(
         &self,
         manager: &mut tokio::sync::RwLockWriteGuard<'_, ConsensusManager>,
@@ -1608,6 +2118,49 @@ impl ConsensusEngine {
         Ok((true, finalized_anchor))
     }
 
+    /// decouple-cf-apply: network post-finalize side effects, OFF the cm lock (D2 / D7.6
+    /// network path). Mirrors the legacy `handle_finalization` body (depth floor → mark
+    /// events finalized in active DAG → `pending_persist_cfs` → `pending_completions`) but
+    /// runs after cm is released. `cf` is the finalized CF captured atomically by
+    /// `apply_finalized_cf_decoupled` under the finish cm-lock (review F1 — do NOT re-read
+    /// `last_finalized_cf()` here, which could observe a later concurrently-finalized CF).
+    #[cfg(feature = "decoupled-apply")]
+    async fn post_finalize_network(
+        &self,
+        cf: ConsensusFrame,
+    ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        let anchor = cf.anchor.clone();
+        self.dag_manager.update_min_depth(anchor.depth + 1);
+        self.mark_anchor_events_finalized_in_active_dag(&anchor)
+            .await;
+
+        {
+            let mut pending = self.pending_persist_cfs.lock().await;
+            pending.push(cf.clone());
+        }
+
+        let expected_round = {
+            let vs = self.validator_set.read().await;
+            vs.current_round()
+        };
+        {
+            let mut q = self.pending_completions.lock().await;
+            q.push(CompletionEntry {
+                cf,
+                anchor_id: anchor.id.clone(),
+                expected_round,
+                persisted: false,
+            });
+        }
+
+        debug!(
+            anchor_id = %anchor.id,
+            expected_round,
+            "CF finalized in-memory (decoupled); queued for post-persist completion"
+        );
+        Ok((true, Some(anchor)))
+    }
+
     /// Receive a vote from another validator
     ///
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
@@ -1632,16 +2185,44 @@ impl ConsensusEngine {
         self.verify_vote_signature_policy(&vote, &validator.node.public_key, "vote")?;
 
         let cf_id = vote.cf_id.clone();
-        let mut manager = self.consensus_manager.write().await;
-        let outcome = manager.receive_vote(vote);
-        if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
-            warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_vote path)");
+
+        // Decoupled path: ingest the vote (add-only) under a short cm.write, then run any
+        // resulting apply OFF cm via the orchestration helper, then post-finalize off cm.
+        #[cfg(feature = "decoupled-apply")]
+        {
+            if !self.is_decoupled_healthy() {
+                return Ok((false, None));
+            }
+            let should_try = {
+                let mut manager = self.consensus_manager.write().await;
+                manager.ingest_vote(vote)
+            }; // cm dropped
+            if should_try {
+                match self.apply_finalized_cf_decoupled(&cf_id).await? {
+                    DecoupledFinalize::Finalized { cf, .. } => {
+                        return self.post_finalize_network(*cf).await
+                    }
+                    DecoupledFinalize::Fatal
+                    | DecoupledFinalize::FailedRecoverable
+                    | DecoupledFinalize::NotFinalized => {}
+                }
+            }
+            Ok((false, None))
         }
 
-        if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
-            self.handle_finalization(&mut manager).await
-        } else {
-            Ok((false, None))
+        #[cfg(not(feature = "decoupled-apply"))]
+        {
+            let mut manager = self.consensus_manager.write().await;
+            let outcome = manager.receive_vote(vote);
+            if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_vote path)");
+            }
+
+            if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
+                self.handle_finalization(&mut manager).await
+            } else {
+                Ok((false, None))
+            }
         }
     }
 
@@ -1730,10 +2311,96 @@ impl ConsensusEngine {
         }
     }
 
+    /// Heartbeat attempt to create a CF for low-frequency events (decoupled-apply path).
+    ///
+    /// Same as the legacy heartbeat but the leader self-vote's apply runs OFF the cm lock
+    /// via `apply_finalized_cf_decoupled`, with single-node post-finalize off cm.
+    #[cfg(feature = "decoupled-apply")]
+    pub async fn try_create_cf_heartbeat(
+        &self,
+        heartbeat_interval: Duration,
+    ) -> SetuResult<Option<ConsensusFrame>> {
+        // Fail-stop: do not fold on a dirty in-memory GSM (D7.1 / R5 #3).
+        if !self.is_decoupled_healthy() {
+            return Ok(None);
+        }
+
+        let current_round = {
+            let validator_set = self.validator_set.read().await;
+            let round = validator_set.current_round();
+            if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
+                return Ok(None);
+            }
+            round
+        };
+
+        let vlc = self.vlc.read().await;
+        // no-cm-across-await (D7.5): read the signing key before taking cm.
+        let key_bytes: Option<Vec<u8>> = self.private_key.read().await.clone();
+
+        // Fold + self-vote under a SHORT cm.write (dag.read acquired first; no await held).
+        let (cf, self_vote) = {
+            let dag = self.dag.read().await;
+            let mut manager = self.consensus_manager.write().await;
+            let cf =
+                manager.try_create_cf_heartbeat(&dag, &vlc, heartbeat_interval, current_round);
+            let self_vote = cf
+                .as_ref()
+                .and_then(|f| manager.vote_for_cf(&f.id, true, key_bytes.as_deref()));
+            (cf, self_vote)
+        }; // cm + dag dropped — heavy apply runs OFF cm.
+
+        if let Some(ref frame) = cf {
+            info!(
+                cf_id = %frame.id,
+                event_count = frame.anchor.event_ids.len(),
+                "Heartbeat: CF created for stale events"
+            );
+
+            if self_vote.is_some() {
+                match self.apply_finalized_cf_decoupled(&frame.id).await? {
+                    DecoupledFinalize::Finalized { cf, new_anchor_depth } => {
+                        info!(cf_id = %frame.id, "Heartbeat CF finalized (single-node, decoupled)");
+                        self.post_finalize_single_node(*cf, new_anchor_depth).await;
+                    }
+                    DecoupledFinalize::Fatal => return Ok(None),
+                    DecoupledFinalize::FailedRecoverable | DecoupledFinalize::NotFinalized => {}
+                }
+            }
+
+            // Send to internal channel (legacy).
+            self.send_legacy_message(ConsensusMessage::ProposeFrame(frame.clone()));
+
+            // Broadcast to network (multi-node: followers need to receive and vote).
+            let mut broadcast_frame = frame.clone();
+            if let Some(ref v) = self_vote {
+                broadcast_frame.add_vote(v.clone());
+            }
+            let broadcaster = self.broadcaster.read().await;
+            if let Some(ref b) = *broadcaster {
+                match b.broadcast_cf(&broadcast_frame).await {
+                    Ok(result) => {
+                        info!(
+                            cf_id = %frame.id,
+                            success = result.success_count,
+                            "Heartbeat CF broadcasted to peers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(cf_id = %frame.id, error = %e, "Failed to broadcast heartbeat CF");
+                    }
+                }
+            }
+        }
+
+        Ok(cf)
+    }
+
     /// Heartbeat attempt to create a CF for low-frequency events.
     ///
     /// Uses relaxed VLC delta (>= 1 instead of >= vlc_delta_threshold) with a time guard.
     /// Called by a background timer. No-op if not Leader or no stale events.
+    #[cfg(not(feature = "decoupled-apply"))]
     pub async fn try_create_cf_heartbeat(
         &self,
         heartbeat_interval: Duration,
@@ -3051,5 +3718,298 @@ mod tests {
             result.unwrap().is_some(),
             "pending event should produce a heartbeat CF"
         );
+    }
+
+    // ───────── decouple-cf-apply Part 3: engine orchestration (T6/T7) ─────────
+
+    /// decouple-cf-apply config: single-node leader so the leader self-vote finalizes
+    /// inline through the decoupled begin→apply→finish orchestration.
+    #[cfg(feature = "decoupled-apply")]
+    fn decoupled_single_node_config() -> ConsensusConfig {
+        ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 1,
+        }
+    }
+
+    /// A single-node submit folds + self-votes, and the heavy apply runs OFF the cm lock
+    /// via `apply_finalized_cf_decoupled`. The anchor metadata must advance (via the finish
+    /// step's `apply_advance`) and the finalized anchor/CF must be queued for persistence —
+    /// observably identical to the legacy inline path, but applied off cm.
+    #[cfg(feature = "decoupled-apply")]
+    #[tokio::test]
+    async fn decoupled_single_node_submit_finalizes_and_advances_anchor() {
+        let engine =
+            ConsensusEngine::new(decoupled_single_node_config(), "v1".to_string(), create_validator_set());
+
+        assert!(engine.is_decoupled_healthy(), "healthy at start");
+
+        let event = engine.create_event(vec![]).await.unwrap();
+        engine.add_event(event).await.unwrap();
+
+        // Finished off cm: anchor advanced + finalized CF queued for persistence.
+        {
+            let manager = engine.consensus_manager.read().await;
+            assert_eq!(
+                manager.anchor_builder().anchor_depth(),
+                1,
+                "decoupled finish must advance anchor_depth via apply_advance"
+            );
+        }
+        let anchors = engine.take_pending_anchors().await;
+        assert_eq!(anchors.len(), 1, "one finalized anchor queued via decoupled post_finalize");
+        let cfs = engine.take_pending_finalized_cfs().await;
+        assert_eq!(cfs.len(), 1, "one finalized CF queued");
+        assert_eq!(cfs[0].anchor.id, anchors[0].id);
+        assert!(engine.is_decoupled_healthy(), "still healthy after clean apply");
+    }
+
+    /// T7 (D7.1 / R5 #3) — fail-stop: once the node is marked unhealthy (a decoupled apply
+    /// went PostMutationFatal, dirtying the in-memory GSM), `try_create_cf` must refuse to
+    /// fold so nothing builds on the dirty state. (We set the flag directly because forcing
+    /// a real commit failure needs storage fault injection; the Fatal→unhealthy transition
+    /// itself is covered by the folder-level `decoupled_finish_failure_fatal_post_mutation`.)
+    #[cfg(feature = "decoupled-apply")]
+    #[tokio::test]
+    async fn decoupled_unhealthy_fail_stops_fold() {
+        let engine =
+            ConsensusEngine::new(decoupled_single_node_config(), "v1".to_string(), create_validator_set());
+
+        // Mark fail-stop (simulating a prior PostMutationFatal apply).
+        engine.decoupled_unhealthy.store(true, Ordering::SeqCst);
+        assert!(!engine.is_decoupled_healthy());
+
+        let event = engine.create_event(vec![]).await.unwrap();
+        engine.add_event(event).await.unwrap();
+
+        // No fold/finalize happened: no anchor queued, anchor_depth unchanged.
+        assert!(
+            engine.take_pending_anchors().await.is_empty(),
+            "unhealthy node must not fold/finalize (fail-stop)"
+        );
+        {
+            let manager = engine.consensus_manager.read().await;
+            assert_eq!(manager.anchor_builder().anchor_depth(), 0, "anchor must not advance after fail-stop");
+        }
+
+        // The orchestration helper also refuses to apply while unhealthy.
+        assert!(matches!(
+            engine.apply_finalized_cf_decoupled("any-cf").await.unwrap(),
+            DecoupledFinalize::NotFinalized
+        ));
+    }
+
+    /// T6 (D3/D5) — no deadlock: concurrent submits (each taking the short cm-lock for the
+    /// fold gate, and `apply_mutex → cm` for the decoupled apply) plus concurrent state-root
+    /// reads (cm.read) must never deadlock. Lock order is fixed `apply_mutex → cm → GSM` and
+    /// submit/read never take `apply_mutex`, so there is no cycle. Bounded by a timeout: a
+    /// deadlock would hang past it and fail the test.
+    #[cfg(feature = "decoupled-apply")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn decoupled_concurrent_submit_and_read_no_deadlock() {
+        let engine = Arc::new(ConsensusEngine::new(
+            decoupled_single_node_config(),
+            "v1".to_string(),
+            create_validator_set(),
+        ));
+
+        let mut handles = Vec::new();
+        // Submit storm: each task folds + (when quorum) applies off cm under apply_mutex.
+        for _ in 0..16 {
+            let e = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..8 {
+                    if let Ok(ev) = e.create_event(vec![]).await {
+                        let _ = e.add_event(ev).await; // Ok or Err — must never hang.
+                    }
+                }
+            }));
+        }
+        // Reader storm: contend the cm.read lock against the apply's short cm.write.
+        for _ in 0..4 {
+            let e = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..32 {
+                    let _ = e.get_global_state_root().await;
+                    let _ = e.take_pending_anchors().await;
+                }
+            }));
+        }
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for h in handles {
+                h.await.expect("submit/read task panicked");
+            }
+        })
+        .await;
+
+        assert!(joined.is_ok(), "concurrent submit + apply + read deadlocked (timed out)");
+        assert!(engine.is_decoupled_healthy(), "no apply went fatal under contention");
+    }
+
+    /// T9 (D7.6) — network-path finalization through the decoupled `receive_vote` seam:
+    /// a follower buffers a CF's events + self-vote, and the remote vote that crosses quorum
+    /// drives the apply OFF cm (`ingest_vote` → begin/apply/finish) then `post_finalize_network`,
+    /// which must queue the CF for post-persist completion and return the anchor — the same
+    /// network persistence contract as the legacy `handle_finalization`, run off cm. Round
+    /// still advances only after the anchor is marked persisted (Layer A, unchanged).
+    #[cfg(feature = "decoupled-apply")]
+    #[tokio::test]
+    async fn decoupled_receive_vote_finalizes_off_cm_and_queues_network_persistence() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let leader = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let follower = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+
+        // Leader builds a CF over one event; the follower learns the event.
+        let event = Event::new(
+            EventType::System,
+            vec![],
+            VLCSnapshot { vector_clock: VectorClock::new(), logical_time: 1, physical_time: 0 },
+            "v1".to_string(),
+        );
+        {
+            let mut vlc = leader.vlc.write().await;
+            vlc.merge(&event.vlc_snapshot);
+            vlc.tick();
+        }
+        leader.dag_manager.add_event_with_retry(event.clone()).await.unwrap();
+        follower.receive_event_from_network(event).await.unwrap();
+
+        let mut cf = leader
+            .try_create_cf()
+            .await
+            .unwrap()
+            .expect("leader should create a pending CF");
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+
+        // Follower receives the CF (decoupled): buffers events + self-votes v2. With quorum
+        // = (3*2)/3+1 = 3, v1+v2 is not yet quorum → not finalized.
+        let out = follower.receive_cf(cf.clone()).await.unwrap();
+        assert!(
+            matches!(out, CfReceiveOutcome::Accepted { finalized: false, .. }),
+            "v1+v2 (2/3) must not finalize before the third vote"
+        );
+        assert_eq!(follower.pending_completions_len().await, 0);
+
+        // The third vote crosses quorum → decoupled apply off cm + network post_finalize.
+        let (finalized, anchor) = follower
+            .receive_vote(Vote::new("v3".to_string(), cf.id.clone(), true))
+            .await
+            .unwrap();
+        assert!(finalized, "v3 crosses quorum → finalized via decoupled receive_vote");
+        let anchor = anchor.expect("finalized anchor returned for caller persistence");
+        assert_eq!(
+            follower.pending_completions_len().await,
+            1,
+            "network post_finalize must queue the CF for post-persist completion (D7.6)"
+        );
+
+        // Layer A: round advances only after the anchor is durably persisted.
+        assert_eq!(follower.current_round().await, 0);
+        follower.mark_anchor_persisted(&anchor.id).await;
+        follower.complete_pending_finalizations().await.unwrap();
+        assert_eq!(follower.current_round().await, 1);
+
+        // Idempotent: a duplicate finalized-CF notification must not re-finalize (has_cf /
+        // is_applying / is_finalized cover the decoupled window — D7.4). Give the local CF
+        // the full vote set so it passes quorum verification, then re-send it.
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        let (again, anchor_again) = follower.receive_finalized_cf(cf).await.unwrap();
+        assert!(!again, "duplicate finalized CF is idempotent");
+        assert!(anchor_again.is_none());
+        assert!(follower.is_decoupled_healthy());
+    }
+
+    /// T7 (D7.1 / R5 #3) — fail-stop covers ALL converted follower entry points, not just
+    /// the leader fold: once the node is unhealthy, `receive_finalized_cf` and `receive_vote`
+    /// must refuse to apply and queue NO network persistence.
+    #[cfg(feature = "decoupled-apply")]
+    #[tokio::test]
+    async fn decoupled_unhealthy_fail_stops_follower_paths() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+        engine.decoupled_unhealthy.store(true, Ordering::SeqCst);
+
+        let anchor = Anchor::new(vec![], VLCSnapshot::default(), "state-root".to_string(), None, 0);
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+
+        // receive_finalized_cf: unhealthy → no finalize, no anchor, no queue.
+        let (fin, anchor_out) = engine.receive_finalized_cf(cf.clone()).await.unwrap();
+        assert!(!fin && anchor_out.is_none(), "receive_finalized_cf must fail-stop while unhealthy");
+
+        // receive_vote: unhealthy → no finalize.
+        let (fin2, anchor2) = engine
+            .receive_vote(Vote::new("v3".to_string(), cf.id.clone(), true))
+            .await
+            .unwrap();
+        assert!(!fin2 && anchor2.is_none(), "receive_vote must fail-stop while unhealthy");
+
+        assert_eq!(
+            engine.pending_completions_len().await,
+            0,
+            "no network persistence may be queued while fail-stopped"
+        );
+    }
+
+    /// F1 regression — each finalization through the decoupled single-node path queues its
+    /// OWN distinct anchor/CF (1:1), proving `post_finalize_single_node` uses the CF captured
+    /// atomically under the finish lock rather than re-reading `last_finalized_cf()` (which a
+    /// concurrent finalize could have advanced — review F1). A chain of submits each folds +
+    /// finalizes; the queued anchors must be exactly the distinct finalized anchors.
+    #[cfg(feature = "decoupled-apply")]
+    #[tokio::test]
+    async fn decoupled_sequential_finalizations_queue_distinct_anchors() {
+        let engine =
+            ConsensusEngine::new(decoupled_single_node_config(), "v1".to_string(), create_validator_set());
+
+        let mut prev: Vec<EventId> = vec![];
+        let mut rounds = 0usize;
+        for _ in 0..4 {
+            let ev = engine.create_event(prev.clone()).await.unwrap();
+            let id = engine.add_event(ev).await.unwrap();
+            prev = vec![id];
+            rounds += 1;
+        }
+
+        let anchors = engine.take_pending_anchors().await;
+        assert!(
+            anchors.len() >= 2,
+            "the submit chain must drive multiple finalizations to exercise 1:1 queueing (got {})",
+            anchors.len()
+        );
+        let distinct: std::collections::HashSet<_> = anchors.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(
+            distinct.len(),
+            anchors.len(),
+            "no anchor queued twice (F1: post_finalize must use the captured CF, not a re-read)"
+        );
+        let cfs = engine.take_pending_finalized_cfs().await;
+        assert_eq!(
+            cfs.len(),
+            anchors.len(),
+            "finalized CFs and anchors queued 1:1 (no loss/duplication)"
+        );
+        assert!(rounds >= anchors.len(), "sanity: at most one finalize per submit");
+        assert!(engine.is_decoupled_healthy());
     }
 }

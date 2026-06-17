@@ -200,6 +200,73 @@ pub struct ConsensusManager {
     /// Overwritten on each failure; cleared on construction.
     /// Read by tests and operational diagnostics; never persisted or broadcast.
     last_apply_failure: Option<ApplyFailure>,
+    /// CFs currently mid-apply in the decoupled-apply path (begin..finish window,
+    /// during which cm is NOT held — see docs/feat/decouple-cf-apply-from-cm-lock/ D1).
+    /// Keeps the fold gate closed and shields the CF from `cleanup_timeout_cfs` while
+    /// its GSM apply runs off the cm lock. Always empty unless the decoupled path is
+    /// driving applies, so reads are no-ops in the legacy path.
+    applying_cf_ids: std::collections::HashSet<String>,
+}
+
+/// Classification of a CF apply failure (decouple-cf-apply D7.1).
+///
+/// Determines recovery: recoverable failures re-fold the events; a fatal failure
+/// means the in-memory GSM was already mutated then commit/publish failed, so the
+/// node must fail-stop rather than pretend the CF can be re-applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Detected BEFORE any GSM mutation (SnapshotMismatch / MissingEvents /
+    /// RootMismatch). Safe to discard + re-fold the events.
+    PreMutationRecoverable,
+    /// `apply_committed_events` already mutated the in-memory write GSM, then
+    /// commit/publish failed → dirty in-memory state, NOT re-foldable. Node must
+    /// fail-stop / go unhealthy and recover from persisted state.
+    PostMutationFatal,
+}
+
+/// Owned, cm-independent data needed to apply a finalized CF off the cm lock
+/// (decouple-cf-apply D7.2). Carries no `&ConsensusManager`/`&AnchorBuilder`
+/// borrow, so holding it does not pin the cm guard.
+#[cfg(feature = "decoupled-apply")]
+pub struct ApplyPlan {
+    pub cf_id: String,
+    pub cf: ConsensusFrame,
+    pub is_leader: bool,
+    /// Leader: the pending build moved out of `pending_builds`.
+    pub pending_build: Option<PendingAnchorBuild>,
+    /// Follower: events buffered when the CF arrived.
+    pub follower_events: Option<Vec<setu_types::Event>>,
+}
+
+/// Result of `begin_finalization` (decouple-cf-apply D2/D7.4).
+#[cfg(feature = "decoupled-apply")]
+pub enum BeginOutcome {
+    /// CF reached quorum; apply this plan off the cm lock, then call `finish_finalization`.
+    Apply(Box<ApplyPlan>),
+    /// Idempotent: this CF is already mid-apply (duplicate vote/finalized).
+    AlreadyApplying,
+    /// Not yet decided.
+    Pending,
+    /// Rejected / timed out — pending state already cleaned.
+    Rejected,
+    TimedOut,
+}
+
+/// Outcome of applying an `ApplyPlan` off the cm lock (filled by the apply step).
+#[cfg(feature = "decoupled-apply")]
+pub enum ApplyResult {
+    Applied(setu_storage::StateApplySummary),
+    Failed { failure: ApplyFailure, kind: FailureKind },
+}
+
+/// Result of `finish_finalization` (decouple-cf-apply D2).
+#[cfg(feature = "decoupled-apply")]
+pub enum FinishOutcome {
+    Finalized { cf_id: String },
+    /// Pre-mutation failure: events stay in the DAG for re-folding.
+    FailedRecoverable { cf_id: String },
+    /// Post-mutation failure: caller must fail-stop / go unhealthy.
+    Fatal { cf_id: String },
 }
 
 impl ConsensusManager {
@@ -218,9 +285,10 @@ impl ConsensusManager {
             local_validator_id: validator_id,
             last_build_result: None,
             last_apply_failure: None,
+            applying_cf_ids: std::collections::HashSet::new(),
         }
     }
-    
+
     /// Create with a shared GlobalStateManager (for state persistence and sharing)
     pub fn with_shared_state_manager(
         config: ConsensusConfig, 
@@ -240,6 +308,7 @@ impl ConsensusManager {
             local_validator_id: validator_id,
             last_build_result: None,
             last_apply_failure: None,
+            applying_cf_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -262,7 +331,10 @@ impl ConsensusManager {
     /// Called from BOTH `try_create_cf` and `try_create_cf_heartbeat` so the
     /// guard cannot be bypassed via the heartbeat path.
     fn can_start_new_pending_build(&self) -> bool {
-        self.pending_builds.is_empty()
+        // Gate also stays closed while a CF is mid-apply off the cm lock
+        // (decouple-cf-apply D7.3). `applying_cf_ids` is empty in the legacy path,
+        // so this is equivalent to the original check there.
+        self.pending_builds.is_empty() && self.applying_cf_ids.is_empty()
     }
 
     /// Emit the BUG-010 follow-up diagnostic trace at `prepare_build` entry.
@@ -400,7 +472,18 @@ impl ConsensusManager {
     /// Check if a CF (pending or finalized) already exists
     pub fn has_cf(&self, cf_id: &str) -> bool {
         self.pending_cfs.contains_key(cf_id) ||
-            self.finalized_cfs.iter().any(|cf| cf.id == cf_id)
+            self.finalized_cfs.iter().any(|cf| cf.id == cf_id) ||
+            // decouple-cf-apply #1: a CF mid-apply has been removed from pending_cfs
+            // but is not yet in finalized_cfs — duplicate proposals must still be
+            // recognized as known (idempotent). Empty set in the legacy path.
+            self.applying_cf_ids.contains(cf_id)
+    }
+
+    /// True while `cf_id` is mid-apply off the cm lock (decouple-cf-apply). Used by the
+    /// decoupled engine path to make duplicate finalized-CF notifications idempotent.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn is_applying(&self, cf_id: &str) -> bool {
+        self.applying_cf_ids.contains(cf_id)
     }
 
     pub fn is_finalized_cf(&self, cf_id: &str) -> bool {
@@ -777,7 +860,10 @@ impl ConsensusManager {
         let timeout_ms = self.config.cf_timeout_ms;
         let timeout_ids: Vec<String> = self.pending_cfs
             .iter()
-            .filter(|(_, cf)| cf.is_timeout(timeout_ms))
+            // decouple-cf-apply D1/#1: never time-out a CF that is mid-apply off the
+            // cm lock (begin..finish window) — removing its pending entries here would
+            // strand a GSM apply with no finalized bookkeeping. Empty set in legacy path.
+            .filter(|(id, cf)| cf.is_timeout(timeout_ms) && !self.applying_cf_ids.contains(*id))
             .map(|(id, _)| id.clone())
             .collect();
         
@@ -803,7 +889,156 @@ impl ConsensusManager {
         }
         count
     }
-    
+
+    // ─────────────── decouple-cf-apply: begin / finish (cm short locks) ───────────────
+    // The heavy GSM apply runs BETWEEN these two, off the cm lock (engine orchestrates;
+    // see docs/feat/decouple-cf-apply-from-cm-lock/ D2). begin/finish only touch the
+    // ConsensusManager bookkeeping under a short cm.write.
+
+    /// P1 (cm short): classify the CF; if it reached quorum, move its build out, mark it
+    /// Applying, and return an owned `ApplyPlan`. Idempotent on an already-applying CF.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn begin_finalization(&mut self, cf_id: &str) -> BeginOutcome {
+        // D7.4: idempotent — a duplicate vote/finalized while mid-apply must not
+        // produce a second plan.
+        if self.applying_cf_ids.contains(cf_id) {
+            return BeginOutcome::AlreadyApplying;
+        }
+        let decision = match self.pending_cfs.get(cf_id) {
+            Some(cf) => {
+                if cf.check_quorum(self.config.validator_count) {
+                    Some(CFDecision::Finalize)
+                } else if cf.check_rejection(self.config.validator_count) {
+                    Some(CFDecision::Reject)
+                } else if cf.is_timeout(self.config.cf_timeout_ms) {
+                    Some(CFDecision::Timeout)
+                } else {
+                    None
+                }
+            }
+            None => return BeginOutcome::Pending,
+        };
+        match decision {
+            Some(CFDecision::Finalize) => {
+                let mut cf = self.pending_cfs.remove(cf_id).expect("present (just checked)");
+                cf.finalize();
+                let pending_build = self.pending_builds.remove(cf_id);
+                let is_leader = pending_build.is_some();
+                let follower_events = if is_leader {
+                    None
+                } else {
+                    Some(self.pending_cf_events.remove(cf_id).unwrap_or_default())
+                };
+                // D7.3 form B: pending_build moved out, but the CF is marked Applying so the
+                // fold gate stays closed and cleanup_timeout_cfs skips it until finish.
+                self.applying_cf_ids.insert(cf_id.to_string());
+                BeginOutcome::Apply(Box::new(ApplyPlan {
+                    cf_id: cf_id.to_string(),
+                    cf,
+                    is_leader,
+                    pending_build,
+                    follower_events,
+                }))
+            }
+            Some(CFDecision::Reject) => {
+                self.discard_pending_cf(cf_id);
+                BeginOutcome::Rejected
+            }
+            Some(CFDecision::Timeout) => {
+                self.discard_pending_cf(cf_id);
+                BeginOutcome::TimedOut
+            }
+            None => BeginOutcome::Pending,
+        }
+    }
+
+    /// P3 (cm short): record the apply outcome. Both success and failure clear the
+    /// Applying mark + pending bookkeeping (D2/#2 — failure must NOT strand the gate).
+    #[cfg(feature = "decoupled-apply")]
+    pub fn finish_finalization(&mut self, plan: ApplyPlan, result: ApplyResult) -> FinishOutcome {
+        let cf_id = plan.cf_id;
+        // Always clear, success or failure (else the fold gate deadlocks).
+        self.applying_cf_ids.remove(&cf_id);
+        self.pending_cf_events.remove(&cf_id);
+        self.buffered_votes.remove(&cf_id);
+        match result {
+            ApplyResult::Applied(_summary) => {
+                // anchor metadata advance is done by the apply step (AnchorBuilder) in the
+                // engine path; here we record CF-lifecycle finalization.
+                self.last_apply_failure = None;
+                self.finalized_cfs.push(plan.cf);
+                // Parity with legacy `classify_finalization`: GC persisted finalized CFs so
+                // `finalized_cfs` does not grow unbounded over a long run (review F3).
+                self.gc_finalized_cfs();
+                FinishOutcome::Finalized { cf_id }
+            }
+            ApplyResult::Failed { failure, kind: FailureKind::PreMutationRecoverable } => {
+                self.last_apply_failure = Some(failure);
+                // Events remain in the DAG for re-folding (CF discarded).
+                FinishOutcome::FailedRecoverable { cf_id }
+            }
+            ApplyResult::Failed { failure, kind: FailureKind::PostMutationFatal } => {
+                self.last_apply_failure = Some(failure);
+                FinishOutcome::Fatal { cf_id }
+            }
+        }
+    }
+
+    /// Drop all pending state for a rejected/timed-out CF (decouple-cf-apply begin path).
+    #[cfg(feature = "decoupled-apply")]
+    fn discard_pending_cf(&mut self, cf_id: &str) {
+        self.pending_cfs.remove(cf_id);
+        self.pending_builds.remove(cf_id);
+        self.pending_cf_events.remove(cf_id);
+        self.buffered_votes.remove(cf_id);
+    }
+
+    /// decouple-cf-apply: ingest a remote vote WITHOUT applying (the apply is now
+    /// engine-orchestrated via `begin_finalization`). Mirrors `receive_vote`'s add/buffer
+    /// logic minus the `classify_finalization` call. Returns `true` iff the vote landed on
+    /// a present, not-yet-applying CF, so the engine should attempt `begin_finalization`.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn ingest_vote(&mut self, vote: Vote) -> bool {
+        let cf_id = vote.cf_id.clone();
+        // Idempotent: a CF mid-apply already reached quorum (D7.4); ignore late votes.
+        if self.applying_cf_ids.contains(&cf_id) {
+            return false;
+        }
+        if let Some(cf) = self.pending_cfs.get_mut(&cf_id) {
+            if cf.votes.contains_key(&vote.validator_id) {
+                return false; // duplicate vote from this validator
+            }
+            cf.add_vote(vote);
+            true
+        } else {
+            // CF not yet received — buffer for replay on `receive_cf` (P2P reordering).
+            self.buffered_votes.entry(cf_id).or_default().push(vote);
+            false
+        }
+    }
+
+    /// decouple-cf-apply: ingest a network-finalized CF (merge its votes / receive it)
+    /// WITHOUT applying. Mirrors `receive_finalized_cf` minus `classify_finalization`.
+    /// Returns `true` iff the CF is now present and not already finalized/applying, so the
+    /// engine should attempt `begin_finalization`.
+    #[cfg(feature = "decoupled-apply")]
+    pub fn ingest_finalized_cf(&mut self, cf: ConsensusFrame) -> bool {
+        let cf_id = cf.id.clone();
+        if self.is_finalized_cf(&cf_id) || self.applying_cf_ids.contains(&cf_id) {
+            return false;
+        }
+        if let Some(existing) = self.pending_cfs.get_mut(&cf_id) {
+            for vote in cf.votes.values() {
+                if !existing.votes.contains_key(&vote.validator_id) {
+                    existing.add_vote(vote.clone());
+                }
+            }
+        } else {
+            self.receive_cf(cf);
+        }
+        true
+    }
+
     /// Get the last finalized anchor (for storage)
     pub fn get_last_finalized_anchor(&self) -> Option<setu_types::Anchor> {
         self.finalized_cfs.last().map(|cf| cf.anchor.clone())
@@ -1515,5 +1750,197 @@ mod tests {
             manager.last_apply_failure().is_some(),
             "non-matching failure must survive cleanup"
         );
+    }
+
+    // ───────── decouple-cf-apply: begin/finish state machine (feature-gated) ─────────
+
+    /// Quorum CF setup: validator_count 1 → a single vote finalizes.
+    #[cfg(feature = "decoupled-apply")]
+    fn quorum_manager() -> (ConsensusManager, String) {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 1,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(10);
+        let cf = manager.try_create_cf(&dag, &vlc, 0).expect("first CF");
+        let cf_id = cf.id.clone();
+        manager.vote_for_cf(&cf_id, true, None); // reaches quorum (validator_count=1)
+        (manager, cf_id)
+    }
+
+    /// D7.3: begin moves the build out (pending_builds emptied) but the fold gate MUST
+    /// stay closed via `applying_cf_ids` — else fold builds a new CF on un-applied GSM.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_begin_marks_applying_keeps_gate_closed() {
+        let (mut manager, cf_id) = quorum_manager();
+        assert!(!manager.can_start_new_pending_build(), "gate closed: pending_build open pre-begin");
+        match manager.begin_finalization(&cf_id) {
+            BeginOutcome::Apply(plan) => {
+                assert_eq!(plan.cf_id, cf_id);
+                assert!(plan.is_leader, "leader had a pending_build");
+                assert_eq!(manager.pending_builds_len_for_testing(), 0, "build moved out");
+                assert!(
+                    !manager.can_start_new_pending_build(),
+                    "gate MUST stay closed during applying (applying_cf_ids non-empty)"
+                );
+            }
+            _ => panic!("expected Apply"),
+        }
+    }
+
+    /// D7.4: a duplicate vote/finalized while mid-apply must not produce a 2nd plan.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_begin_idempotent_on_applying() {
+        let (mut manager, cf_id) = quorum_manager();
+        assert!(matches!(manager.begin_finalization(&cf_id), BeginOutcome::Apply(_)));
+        assert!(
+            matches!(manager.begin_finalization(&cf_id), BeginOutcome::AlreadyApplying),
+            "second begin on an applying CF must be idempotent"
+        );
+    }
+
+    /// finish(Applied): clears applying, pushes finalized, reopens the fold gate.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_finish_success_reopens_gate() {
+        let (mut manager, cf_id) = quorum_manager();
+        let plan = match manager.begin_finalization(&cf_id) {
+            BeginOutcome::Apply(p) => *p,
+            _ => panic!("expected Apply"),
+        };
+        let out = manager.finish_finalization(
+            plan,
+            ApplyResult::Applied(setu_storage::StateApplySummary::default()),
+        );
+        assert!(matches!(out, FinishOutcome::Finalized { .. }));
+        assert_eq!(manager.finalized_count(), 1);
+        assert!(manager.can_start_new_pending_build(), "gate reopens after finish");
+    }
+
+    /// #2: finish(failure) MUST clear applying + reopen the gate (else deadlock), and
+    /// PreMutationRecoverable leaves events for re-folding.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_finish_failure_reopens_gate_no_deadlock() {
+        let (mut manager, cf_id) = quorum_manager();
+        let plan = match manager.begin_finalization(&cf_id) {
+            BeginOutcome::Apply(p) => *p,
+            _ => panic!("expected Apply"),
+        };
+        let failure = ApplyFailure {
+            cf_id: cf_id.clone(),
+            anchor_id: "anchor-1".to_string(),
+            anchor_depth: 1,
+            role: ApplyFailureRole::Follower,
+            reason: "injected".to_string(),
+        };
+        let out = manager.finish_finalization(
+            plan,
+            ApplyResult::Failed { failure, kind: FailureKind::PreMutationRecoverable },
+        );
+        assert!(matches!(out, FinishOutcome::FailedRecoverable { .. }));
+        assert_eq!(manager.finalized_count(), 0, "failed CF not finalized");
+        assert!(
+            manager.can_start_new_pending_build(),
+            "gate MUST reopen after apply failure (else fold deadlocks)"
+        );
+        assert!(manager.last_apply_failure().is_some(), "failure recorded");
+    }
+
+    /// PostMutationFatal → finish returns Fatal (engine fail-stops); gate still cleared.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_finish_fatal_classifies_and_clears() {
+        let (mut manager, cf_id) = quorum_manager();
+        let plan = match manager.begin_finalization(&cf_id) {
+            BeginOutcome::Apply(p) => *p,
+            _ => panic!("expected Apply"),
+        };
+        let failure = ApplyFailure {
+            cf_id: cf_id.clone(),
+            anchor_id: "anchor-1".to_string(),
+            anchor_depth: 1,
+            role: ApplyFailureRole::LeaderCommitError,
+            reason: "post-apply commit failed".to_string(),
+        };
+        let out = manager.finish_finalization(
+            plan,
+            ApplyResult::Failed { failure, kind: FailureKind::PostMutationFatal },
+        );
+        assert!(matches!(out, FinishOutcome::Fatal { .. }), "post-mutation failure is Fatal");
+        assert!(manager.can_start_new_pending_build(), "applying cleared even on fatal");
+    }
+
+    /// Review seam #1: a CF mid-apply (removed from pending_cfs, not yet finalized) must
+    /// still be recognized by has_cf/is_applying so duplicate proposals are idempotent.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_has_cf_covers_applying() {
+        let (mut manager, cf_id) = quorum_manager();
+        assert!(manager.has_cf(&cf_id), "known while pending");
+        let plan = match manager.begin_finalization(&cf_id) {
+            BeginOutcome::Apply(p) => *p,
+            _ => panic!("expected Apply"),
+        };
+        // mid-apply: gone from pending_cfs, not in finalized_cfs yet
+        assert!(manager.is_applying(&cf_id), "is_applying true mid-apply");
+        assert!(manager.has_cf(&cf_id), "has_cf must still recognize an applying CF (idempotent dedup)");
+        assert!(!manager.is_finalized_cf(&cf_id), "not finalized until finish");
+        // after finish: no longer applying, now finalized
+        let _ = manager.finish_finalization(plan, ApplyResult::Applied(setu_storage::StateApplySummary::default()));
+        assert!(!manager.is_applying(&cf_id));
+        assert!(manager.is_finalized_cf(&cf_id));
+    }
+
+    /// T1 (D1 / R3 #1): a CF mid-apply (begin done, finish pending) must survive a
+    /// `cleanup_timeout_cfs` maintenance sweep even when the CF timeout has elapsed — the
+    /// Applying mark keeps the fold gate closed and the in-flight apply is NOT stranded
+    /// (removing its pending entries here would leave a GSM apply with no finalized
+    /// bookkeeping). The apply can then finish normally.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn decoupled_cleanup_timeout_does_not_strand_applying_cf() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 1,
+            cf_timeout_ms: 0, // any pending CF is immediately past its timeout
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(10);
+        let cf_id = manager.try_create_cf(&dag, &vlc, 0).expect("first CF").id.clone();
+        manager.vote_for_cf(&cf_id, true, None); // quorum (validator_count = 1)
+
+        // Enter the apply window.
+        let plan = match manager.begin_finalization(&cf_id) {
+            BeginOutcome::Apply(p) => *p,
+            _ => panic!("expected Apply"),
+        };
+        assert!(manager.is_applying(&cf_id));
+
+        // A maintenance sweep with an elapsed timeout must NOT disturb the applying CF.
+        let removed = manager.cleanup_timeout_cfs();
+        assert_eq!(removed, 0, "cleanup must not remove a CF that is mid-apply");
+        assert!(manager.is_applying(&cf_id), "Applying mark survives the cleanup sweep");
+        assert!(
+            !manager.can_start_new_pending_build(),
+            "fold gate must stay closed while the apply is in flight"
+        );
+
+        // The apply still finishes normally → finalized, gate reopens.
+        let out = manager.finish_finalization(
+            plan,
+            ApplyResult::Applied(setu_storage::StateApplySummary::default()),
+        );
+        assert!(matches!(out, FinishOutcome::Finalized { .. }));
+        assert!(!manager.is_applying(&cf_id));
+        assert_eq!(manager.finalized_count(), 1);
+        assert!(manager.can_start_new_pending_build());
     }
 }

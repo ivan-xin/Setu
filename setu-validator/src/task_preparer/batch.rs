@@ -652,7 +652,7 @@ impl BatchTaskPreparer {
         coin_object_id: &ObjectId,
         snapshot: &BatchStateSnapshot,
     ) -> Vec<String> {
-        use super::COLD_PARENT_DROP_THRESHOLD;
+        let cold_parent_drop_threshold = super::cold_parent_drop_threshold();
 
         // Mirror single.rs::derive_dependencies (see
         // docs/feat/fix-transfer-parent-too-old-general/design.md):
@@ -670,7 +670,7 @@ impl BatchTaskPreparer {
         if *event_id == genesis_id {
             return Vec::new();
         }
-        if floor.saturating_sub(depth) >= COLD_PARENT_DROP_THRESHOLD {
+        if floor.saturating_sub(depth) >= cold_parent_drop_threshold {
             return Vec::new();
         }
         vec![event_id.clone()]
@@ -952,7 +952,7 @@ mod tests {
     fn test_snapshot_drop_boundary() {
         let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
         let object = oid(3);
-        let threshold = super::super::COLD_PARENT_DROP_THRESHOLD;
+        let threshold = super::super::cold_parent_drop_threshold();
 
         // age == threshold-1 → keep.
         let keep = BatchStateSnapshot::new_for_testing(
