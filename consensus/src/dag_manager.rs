@@ -53,6 +53,17 @@ impl Default for DagManagerConfig {
     }
 }
 
+/// Whether a cross-CF (Cache/Store) parent at `depth_diff` below the new event should be
+/// REJECTED as "too old".
+///
+/// New submissions reject beyond `max` (bounds how far back a fresh event may reference).
+/// CF-driven adds (`allow_cold_parent == true`) NEVER reject: events a finalizing CF
+/// references are consensus-authoritative, and rejecting them stalls finalization — the
+/// cold-parent cascade deadlock (M1-report §2 / fix-cold-parent-finalization-stall).
+fn reject_cold_parent(depth_diff: u64, max: u64, allow_cold_parent: bool) -> bool {
+    !allow_cold_parent && depth_diff > max
+}
+
 /// Information about where a parent was found
 #[derive(Debug, Clone)]
 pub enum ParentInfo {
@@ -280,7 +291,7 @@ impl DagManager {
     ///
     /// Phase 1: Collect all parent depths
     /// Phase 2: Calculate new_event_depth and check depth_diff
-    pub async fn resolve_parents(&self, event: &Event) -> Result<ResolvedParents, DagManagerError> {
+    pub async fn resolve_parents(&self, event: &Event, allow_cold_parent: bool) -> Result<ResolvedParents, DagManagerError> {
         let mut parent_results = Vec::with_capacity(event.parent_ids.len());
         let mut max_parent_depth: u64 = 0;
         
@@ -361,7 +372,7 @@ impl DagManager {
                 }
                 ParentInfo::InCache { depth, .. } | ParentInfo::InStore { depth } => {
                     let depth_diff = new_event_depth.saturating_sub(*depth);
-                    if depth_diff > self.config.max_cross_cf_depth {
+                    if reject_cold_parent(depth_diff, self.config.max_cross_cf_depth, allow_cold_parent) {
                         // M1 (C3): cold-parent rejection — parent deeper than max_cross_cf_depth.
                         setu_timing::m1_cold_parent(depth_diff);
                         return Err(DagManagerError::ParentTooOld {
@@ -370,6 +381,8 @@ impl DagManager {
                             max_allowed: self.config.max_cross_cf_depth,
                         });
                     }
+                    // allow_cold_parent (CF-driven add): accept regardless of depth_diff.
+                    // The depth floor (above) keeps the event at/above the GC watermark.
                 }
             }
         }
@@ -389,11 +402,25 @@ impl DagManager {
     /// This is the ONLY entry point for adding events to the DAG.
     /// All events must go through this method to ensure depth is correctly calculated.
     pub async fn add_event(&self, event: Event) -> Result<EventId, DagManagerError> {
+        self.add_event_inner(event, false).await
+    }
+
+    /// Add an event a finalizing CF references, accepting it regardless of cold-parent
+    /// depth. CF events are consensus-authoritative; rejecting them on the cold-parent
+    /// guard stalls finalization (the cascade deadlock — M1-report §2). Use ONLY from the
+    /// CF event-fetch path (engine::ensure_cf_events_available), never for new/gossip events.
+    pub async fn add_event_for_cf(&self, event: Event) -> Result<EventId, DagManagerError> {
+        self.add_event_inner(event, true).await
+    }
+
+    /// Shared add path. `allow_cold_parent` is the cold-parent-guard bypass (see
+    /// `add_event` vs `add_event_for_cf`).
+    async fn add_event_inner(&self, event: Event, allow_cold_parent: bool) -> Result<EventId, DagManagerError> {
         let event_id = event.id.clone();
-        
+
         // Handle warmup period
         if self.warming_up.load(Ordering::Acquire) {
-            match self.resolve_parents(&event).await {
+            match self.resolve_parents(&event, allow_cold_parent).await {
                 Ok(_) => { /* Continue normal flow */ }
                 Err(DagManagerError::MissingParent(_)) => {
                     // During warmup, queue the event for later processing
@@ -412,8 +439,8 @@ impl DagManager {
         }
         
         // Phase 1: Resolve all parents
-        let resolved = self.resolve_parents(&event).await?;
-        
+        let resolved = self.resolve_parents(&event, allow_cold_parent).await?;
+
         // Phase 2: depth_diff check already done in resolve_parents
         
         // Phase 3: Write to DAG (acquire write lock, use Phase 1 results)
@@ -440,12 +467,22 @@ impl DagManager {
         Ok(event_id)
     }
     
-    /// Add event with automatic retry on TOCTOU errors
+    /// Add event with automatic retry on TOCTOU (ParentGCed) errors. New/gossip path —
+    /// keeps the cold-parent guard.
     pub async fn add_event_with_retry(&self, event: Event) -> Result<EventId, DagManagerError> {
+        self.add_event_with_retry_inner(event, false).await
+    }
+
+    /// CF event-fetch path: retry wrapper that accepts cold parents (see `add_event_for_cf`).
+    pub async fn add_event_for_cf_with_retry(&self, event: Event) -> Result<EventId, DagManagerError> {
+        self.add_event_with_retry_inner(event, true).await
+    }
+
+    async fn add_event_with_retry_inner(&self, event: Event, allow_cold_parent: bool) -> Result<EventId, DagManagerError> {
         let event_id = event.id.clone();
-        
+
         for attempt in 0..MAX_RETRY {
-            match self.add_event(event.clone()).await {
+            match self.add_event_inner(event.clone(), allow_cold_parent).await {
                 Ok(id) => return Ok(id),
                 Err(DagManagerError::ParentGCed(parent_id)) if attempt < MAX_RETRY - 1 => {
                     debug!(
@@ -457,7 +494,7 @@ impl DagManager {
                 Err(e) => return Err(e),
             }
         }
-        
+
         Err(DagManagerError::Internal(format!(
             "Max retry ({}) exceeded for event {}",
             MAX_RETRY, event_id
@@ -749,6 +786,21 @@ mod tests {
         
         // Should not exist
         assert!(!manager.exists(&"nonexistent".to_string()).await);
+    }
+
+    /// T1 — cold-parent reject decision: new submissions reject beyond max; CF-driven
+    /// adds never reject; within-max never rejects either way.
+    #[test]
+    fn t1_reject_cold_parent_decision() {
+        let max = 200;
+        // new submission (allow=false): reject only when depth_diff > max
+        assert!(reject_cold_parent(201, max, false), "new event, cold parent -> reject");
+        assert!(!reject_cold_parent(200, max, false), "new event, at limit -> ok");
+        assert!(!reject_cold_parent(5, max, false), "new event, recent parent -> ok");
+        // CF-driven add (allow=true): NEVER reject (liveness — accept consensus events)
+        assert!(!reject_cold_parent(201, max, true), "CF event, cold parent -> accept");
+        assert!(!reject_cold_parent(100_000, max, true), "CF event, very old parent -> accept");
+        assert!(!reject_cold_parent(5, max, true), "CF event, recent parent -> ok");
     }
 
     #[tokio::test]

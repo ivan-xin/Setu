@@ -1459,7 +1459,11 @@ impl ConsensusEngine {
                             vlc.merge(&event.vlc_snapshot);
                         }
 
-                        match self.dag_manager.add_event_with_retry(event.clone()).await {
+                        // CF-driven add: accept events this finalizing CF references
+                        // regardless of cold-parent depth. Rejecting on the cold-parent
+                        // guard here is what stalls finalization (the cascade deadlock —
+                        // M1-report §2 / fix-cold-parent-finalization-stall).
+                        match self.dag_manager.add_event_for_cf_with_retry(event.clone()).await {
                             Ok(_) => {}
                             Err(DagManagerError::DuplicateEvent(_)) => {}
                             Err(e) => {
