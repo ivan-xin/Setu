@@ -194,6 +194,46 @@ pub struct BenchmarkConfig {
     /// Run at several `--concurrency` levels to build the saturation sweep (design D4).
     #[arg(long, default_value = "false")]
     pub m0: bool,
+
+    // ── Multi-target reliability (docs/feat/benchmark-multitarget-funding-gate/) ──
+    /// Funding gate (D1): accounts sampled PER VALIDATOR before load starts.
+    /// A number polls first+last+evenly-strided middle accounts; "all" polls every
+    /// account. The gate blocks until every sampled account is funded on EVERY
+    /// validator — so round-robin load never hits a validator that hasn't yet
+    /// applied the funding state ("No coins"). Default 8.
+    #[arg(long, default_value = "8")]
+    pub funding_gate_accounts: String,
+
+    /// Funding gate timeout in seconds (default 60).
+    #[arg(long, default_value = "60")]
+    pub funding_gate_timeout_secs: u64,
+
+    /// If the funding gate times out, continue anyway. Default false = abort
+    /// (fail loud, since a timed-out gate yields misleading TPS).
+    #[arg(long, default_value = "false")]
+    pub funding_gate_allow_timeout: bool,
+
+    /// Per-validator account partitioning (D2): in multi-target mode, each validator's
+    /// load draws sender AND receiver only from its own disjoint block of accounts,
+    /// so a coin is never reserved on more than one validator. Set false to reproduce
+    /// the legacy cross-validator behavior (A/B). No effect in single-target mode.
+    /// `ArgAction::Set` so `--partition-accounts true|false` is accepted (a bare bool
+    /// field becomes a flag that rejects an explicit value and defaults to false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub partition_accounts: bool,
+
+    /// Emit-genesis mode: print a JSON array of N pre-funded test-account entries
+    /// (user_001..user_N, address = same blake3 derivation the load uses) and exit.
+    /// Splice the output into genesis `accounts` so the accounts are funded at genesis
+    /// — then run the benchmark with `--skip-funding` to skip the (slow, conflict-prone)
+    /// seed-funding entirely. Uses --init-account-balance and --coins-per-account.
+    #[arg(long, default_value = "0")]
+    pub emit_genesis_accounts: u64,
+
+    /// Skip the seed-funding phase (accounts are pre-funded at genesis). The funding
+    /// gate still runs to confirm the pre-funded accounts are applied on all validators.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub skip_funding: bool,
 }
 
 impl BenchmarkConfig {
@@ -207,6 +247,16 @@ impl BenchmarkConfig {
                 .collect()
         } else {
             vec![self.validator_url.clone()]
+        }
+    }
+
+    /// Funding-gate sample count: 0 means "all accounts", otherwise the parsed number.
+    pub fn funding_gate_sample_count(&self) -> u64 {
+        let v = self.funding_gate_accounts.trim();
+        if v.eq_ignore_ascii_case("all") {
+            0
+        } else {
+            v.parse().unwrap_or(8)
         }
     }
 
@@ -308,5 +358,35 @@ impl BenchmarkConfig {
             }
         }
         info!("");
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> BenchmarkConfig {
+        let mut argv = vec!["setu-benchmark"];
+        argv.extend_from_slice(extra);
+        BenchmarkConfig::try_parse_from(argv).expect("parse should succeed")
+    }
+
+    /// Regression guard: a bare `bool` field with a string `default_value` becomes a
+    /// flag that rejects an explicit value and defaults to false. `partition_accounts`
+    /// must default TRUE and accept `--partition-accounts true|false` (ArgAction::Set).
+    #[test]
+    fn partition_accounts_defaults_true_and_takes_value() {
+        assert!(parse(&[]).partition_accounts, "default must be true");
+        assert!(!parse(&["--partition-accounts", "false"]).partition_accounts);
+        assert!(parse(&["--partition-accounts", "true"]).partition_accounts);
+    }
+
+    #[test]
+    fn funding_gate_sample_count_parsing() {
+        assert_eq!(parse(&[]).funding_gate_sample_count(), 8);
+        assert_eq!(parse(&["--funding-gate-accounts", "all"]).funding_gate_sample_count(), 0);
+        assert_eq!(parse(&["--funding-gate-accounts", "ALL"]).funding_gate_sample_count(), 0);
+        assert_eq!(parse(&["--funding-gate-accounts", "20"]).funding_gate_sample_count(), 20);
     }
 }

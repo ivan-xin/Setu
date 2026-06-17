@@ -1,6 +1,6 @@
 //! Benchmark runner implementation
 
-use crate::client::{generate_move_call, generate_transfer, generate_transfer_with_n_accounts, load_seed_addresses_from_genesis, name_to_hex_address, BenchClient, BenchTransferRequest};
+use crate::client::{funding_gate_sample, gate_ready, generate_move_call, generate_transfer, generate_transfer_partitioned, generate_transfer_with_n_accounts, load_seed_addresses_from_genesis, name_to_hex_address, BenchClient, BenchTransferRequest};
 use crate::config::{BenchmarkConfig, BenchmarkMode, WorkloadType};
 use crate::metrics::{BenchmarkSummary, MetricsCollector, RequestMetrics};
 use anyhow::{bail, Result};
@@ -20,17 +20,23 @@ fn generate_transfer_batch(
     seed_addresses: &[String],
     subnet_ids: &[String],
 ) -> Vec<BenchTransferRequest> {
+    // Batch mode uses the primary client only (single-target), so partitioning is a no-op.
     (0..batch_size)
         .map(|i| {
             let seq = start_seq + i;
-            generate_single_transfer(config, seq, seed_addresses, subnet_ids)
+            generate_single_transfer(config, seq, seed_addresses, subnet_ids, 0, 1)
         })
         .collect()
 }
 
 /// Generate a single transfer request based on config.
 /// If subnet_ids is non-empty, assigns subnet_id round-robin by seq.
-fn generate_single_transfer(config: &BenchmarkConfig, seq: u64, seed_addresses: &[String], subnet_ids: &[String]) -> BenchTransferRequest {
+///
+/// `client_idx`/`num_clients` identify which validator this transfer is routed to.
+/// In multi-target mode with `--partition-accounts` (D2), sender+receiver are drawn
+/// from this validator's disjoint account block; single-target falls through to the
+/// legacy selection unchanged (G4).
+fn generate_single_transfer(config: &BenchmarkConfig, seq: u64, seed_addresses: &[String], subnet_ids: &[String], client_idx: usize, num_clients: usize) -> BenchTransferRequest {
     let subnet_id = if !subnet_ids.is_empty() {
         Some(subnet_ids[seq as usize % subnet_ids.len()].clone())
     } else {
@@ -38,6 +44,17 @@ fn generate_single_transfer(config: &BenchmarkConfig, seq: u64, seed_addresses: 
     };
 
     if config.use_test_accounts {
+        // Multi-target partitioned path (D2): each validator uses its own account block.
+        if config.partition_accounts && num_clients > 1 && config.init_accounts > 0 {
+            return generate_transfer_partitioned(
+                config.amount,
+                config.init_accounts as usize,
+                num_clients,
+                client_idx,
+                seq,
+                subnet_id,
+            );
+        }
         let num_accounts = if config.init_accounts > 0 {
             Some(config.init_accounts)
         } else {
@@ -67,18 +84,23 @@ async fn execute_transfer_with_retry(
     seq: u64,
     seed_addresses: &[String],
     subnet_ids: &[String],
+    client_idx: usize,
+    num_clients: usize,
 ) -> Option<RequestMetrics> {
     let max_retries = 20u32;
     let base_delay_ms = 3u64;
     let total_accounts = config.init_accounts.max(3) as u64;
 
     for attempt in 0..=max_retries {
+        // Vary effective_seq across retries to pick a DIFFERENT in-block account;
+        // client_idx stays fixed so a retry can never spill into another validator's
+        // block (design D2 / R1-4).
         let effective_seq = if attempt == 0 {
             seq
         } else {
             seq.wrapping_add(attempt as u64 * 7)
         };
-        let request = generate_single_transfer(config, effective_seq, seed_addresses, subnet_ids);
+        let request = generate_single_transfer(config, effective_seq, seed_addresses, subnet_ids, client_idx, num_clients);
         let result = client.submit_transfer(request).await;
 
         if result.success {
@@ -123,10 +145,12 @@ async fn execute_request(
     seq: u64,
     seed_addresses: &[String],
     subnet_ids: &[String],
+    client_idx: usize,
+    num_clients: usize,
 ) -> Option<RequestMetrics> {
     match config.workload {
         WorkloadType::Transfer => {
-            execute_transfer_with_retry(client, config, seq, seed_addresses, subnet_ids).await
+            execute_transfer_with_retry(client, config, seq, seed_addresses, subnet_ids, client_idx, num_clients).await
         }
         WorkloadType::MoveCall => {
             Some(execute_move_call_request(client, config, seq, seed_addresses).await)
@@ -230,6 +254,25 @@ impl BenchmarkRunner {
             }
         }
 
+        // Multi-target partition provisioning checks (D5 / R1-5).
+        let num_clients = self.clients.len();
+        if self.config.partition_accounts && num_clients > 1 && self.config.init_accounts > 0 {
+            let na = self.config.init_accounts;
+            let nc = num_clients as u64;
+            if na % nc != 0 {
+                let used = (na / nc) * nc;
+                warn!("⚠ --init-accounts {} not divisible by {} validators; partition uses {} ({} trailing account(s) never sent from)",
+                    na, num_clients, used, na - used);
+            }
+            let per_block = na / nc;
+            let block_capacity = per_block * self.config.coins_per_account;
+            let per_validator_conc = self.config.concurrency.div_ceil(nc);
+            if block_capacity < per_validator_conc {
+                warn!("⚠ Under-provisioned for partitioning: each validator has {} account(s) × {} coin(s) = {} reservable, but ~{} concurrent in-flight per validator. Raise --init-accounts or --coins-per-account to avoid in-block coin contention.",
+                    per_block, self.config.coins_per_account, block_capacity, per_validator_conc);
+            }
+        }
+
         // Initialize test accounts if requested (transfers only)
         if self.config.init_accounts > 0 && matches!(self.config.workload, WorkloadType::Transfer) {
             info!("");
@@ -298,7 +341,8 @@ impl BenchmarkRunner {
                 let subnet_ids = self.subnet_ids.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let _ = execute_request(&client, &config, warmup_seq_offset + i, &seed_addrs, &subnet_ids).await;
+                    // Warmup uses the primary client only → single-target (0, 1).
+                    let _ = execute_request(&client, &config, warmup_seq_offset + i, &seed_addrs, &subnet_ids, 0, 1).await;
                 }
             })
             .collect();
@@ -341,167 +385,139 @@ impl BenchmarkRunner {
     /// Accounts are distributed across seeds in round-robin fashion.
     async fn init_test_accounts(&self, client: &Arc<BenchClient>) -> Result<()> {
         let num_accounts = self.config.init_accounts;
-        let total_balance = self.config.init_account_balance;
-        let coins_per_account = std::cmp::max(1, self.config.coins_per_account);
-        
-        // Each coin gets an equal share of the total balance
-        let balance_per_coin = total_balance / coins_per_account;
-        // Last coin gets the remainder to avoid rounding loss
-        let last_coin_balance = total_balance - balance_per_coin * (coins_per_account - 1);
-        
-        // Seed accounts: use authoritative addresses from genesis.json
-        let seed_accounts = self.seed_addresses.clone();
-        const MAX_RETRIES: u32 = 20;
-        const RETRY_DELAY_MS: u64 = 50;
-        const BATCH_WAIT_MS: u64 = 100;
-        
-        // Seed accounts are pre-sharded at genesis with multiple coins.
-        // Each seed coin can independently reserve one outbound transfer,
-        // so we can process up to SEED_COINS_PER_ACCOUNT accounts per seed
-        // in parallel per coin round.
-        //
-        // batch_size = SEED_ACCOUNTS.len() × seed_coins = 3 × 5 = 15 accounts/round
-        let seed_coins: u64 = 5; // matches genesis.json coins_per_account
-        let batch_size = seed_accounts.len() as u64 * seed_coins;
-        
-        let total_transfers = num_accounts * coins_per_account;
-        info!("  Creating {} test accounts with {} balance each ({} coins/account, {} per coin)...",
-            num_accounts, total_balance, coins_per_account, balance_per_coin);
-        info!("  Total init transfers: {} (using {} seeds × {} coins = {} parallel slots)",
-            total_transfers, seed_accounts.len(), seed_coins, batch_size);
-        
-        // Track success/failure
-        let mut success_count = 0u64;
-        let mut fail_count = 0u64;
-        
-        // Process accounts in large batches, distributing across seed accounts round-robin
-        let mut i = 0u64;
-        while i < num_accounts {
-            let current_batch = std::cmp::min(batch_size, num_accounts - i);
-            
-            // For each coin round, fire transfers for all accounts in this batch in parallel
-            for coin_idx in 0..coins_per_account {
-                let mut handles = Vec::new();
-                let amount = if coin_idx == coins_per_account - 1 {
-                    last_coin_balance
-                } else {
-                    balance_per_coin
-                };
-                
-                for j in 0..current_batch {
-                    let account_idx = i + j;
-                    let account_name = format!("user_{:03}", account_idx + 1);
-                    let account_hex = name_to_hex_address(&account_name);
-                    // Round-robin across seed accounts
-                    let seed_account = seed_accounts[(j as usize) % seed_accounts.len()].clone();
+
+        if self.config.skip_funding {
+            // Accounts are pre-funded at genesis (see --emit-genesis-accounts). Skip the
+            // (slow, few-seed-contended) funding entirely; the gate below confirms genesis
+            // funding has been applied on every validator. This is the recommended path for
+            // clean measurement (M0-report §11b-2).
+            info!("  --skip-funding: accounts pre-funded at genesis; skipping seed-funding, gate will confirm.");
+        } else {
+            let total_balance = self.config.init_account_balance;
+            let coins_per_account = std::cmp::max(1, self.config.coins_per_account);
+            // Each coin gets an equal share of the total balance; last coin takes the remainder.
+            let balance_per_coin = total_balance / coins_per_account;
+            let last_coin_balance = total_balance - balance_per_coin * (coins_per_account - 1);
+            // Seed accounts: authoritative addresses from genesis.json.
+            let seed_accounts = self.seed_addresses.clone();
+            const MAX_RETRIES: u32 = 20;
+            const RETRY_DELAY_MS: u64 = 50;
+            const INIT_CONCURRENCY: usize = 64;
+
+            let total_transfers = num_accounts * coins_per_account;
+            let per_seed = total_transfers.div_ceil(seed_accounts.len().max(1) as u64);
+            info!("  Funding {} accounts × {} coins = {} transfers (burst, concurrency {})...",
+                num_accounts, coins_per_account, total_transfers, INIT_CONCURRENCY);
+            info!("  ~{} transfers/seed from {} seed(s). NOTE: funding from few genesis seeds is\
+                  contention- and finalization-bound; prefer --emit-genesis-accounts + --skip-funding\
+                  for clean measurement (M0-report §11b-2).",
+                per_seed, seed_accounts.len());
+
+            // Best-effort burst funding (the gate below catches any unfunded accounts). For
+            // clean measurement use genesis pre-funding instead — funding from few seeds
+            // conflicts at apply ("old_value mismatch") under concurrency.
+            let success = Arc::new(AtomicU64::new(0));
+            let mut tasks = Vec::with_capacity(total_transfers as usize);
+            let mut t: u64 = 0;
+            for account_idx in 0..num_accounts {
+                let account_hex = name_to_hex_address(&format!("user_{:03}", account_idx + 1));
+                for coin_idx in 0..coins_per_account {
+                    let amount = if coin_idx == coins_per_account - 1 {
+                        last_coin_balance
+                    } else {
+                        balance_per_coin
+                    };
+                    let seed_account = seed_accounts[(t as usize) % seed_accounts.len()].clone();
+                    t += 1;
                     let client = Arc::clone(client);
-                    
-                    let handle = tokio::spawn(async move {
-                        Self::init_single_account_with_retry(
-                            &client,
-                            &seed_account,
-                            &account_hex,
-                            amount,
-                            MAX_RETRIES,
-                            RETRY_DELAY_MS,
-                        ).await
-                    });
-                    handles.push((account_name, handle));
-                }
-                
-                // Wait for all parallel transfers to complete
-                for (account_name, handle) in handles {
-                    match handle.await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => {
-                            fail_count += 1;
-                            warn!("  Failed to init coin {} for {}", coin_idx + 1, account_name);
+                    let success = success.clone();
+                    let account_hex = account_hex.clone();
+                    tasks.push(async move {
+                        if Self::init_single_account_with_retry(
+                            &client, &seed_account, &account_hex, amount, MAX_RETRIES, RETRY_DELAY_MS,
+                        )
+                        .await
+                        {
+                            success.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(e) => {
-                            fail_count += 1;
-                            warn!("  Task error for {} coin {}: {:?}", account_name, coin_idx + 1, e);
+                    });
+                }
+            }
+            let total_tasks = tasks.len() as u64;
+            stream::iter(tasks)
+                .buffer_unordered(INIT_CONCURRENCY)
+                .for_each(|_| async {})
+                .await;
+            let success_count = success.load(Ordering::Relaxed);
+            info!("  Funding submitted: {} success, {} failed (of {} transfers)",
+                success_count, total_tasks - success_count, total_tasks);
+        }
+
+        // ── Funding finalization gate (D1) ──────────────────────────────────
+        // Setu uses eventual consistency: state is only written after anchor creation,
+        // and validators apply finalized anchors with some lag relative to each other.
+        // Funding is submitted via the primary validator only, but the load round-robins
+        // across ALL validators — so we must confirm every validator that will receive
+        // load has APPLIED the funding state for the accounts it will use, otherwise the
+        // sender "has no coins" on a lagging validator ("No coins" failures, M0-report §11b).
+        //
+        // Poll a sample of accounts (first + last + strided middle, or "all") on EVERY
+        // validator client; only proceed once all are funded everywhere. On timeout, fail
+        // loud (bail) — a timed-out gate yields misleading TPS — unless --funding-gate-allow-timeout.
+        let sample = funding_gate_sample(num_accounts, self.config.funding_gate_sample_count());
+        let timeout_secs = self.config.funding_gate_timeout_secs;
+        let poll_interval_ms = 500u64;
+        info!("  Funding gate: polling {} sampled account(s) × {} validator(s) (timeout {}s)...",
+            sample.len(), self.clients.len(), timeout_secs);
+
+        let mut waited_ms = 0u64;
+        loop {
+            // Build balance matrix: matrix[client_idx][sample_pos]
+            let mut matrix: Vec<Vec<Option<u64>>> = Vec::with_capacity(self.clients.len());
+            for c in &self.clients {
+                let mut row = Vec::with_capacity(sample.len());
+                for &acct in &sample {
+                    row.push(c.get_balance(&format!("user_{:03}", acct)).await);
+                }
+                matrix.push(row);
+            }
+
+            match gate_ready(&matrix, &sample) {
+                Ok(()) => {
+                    info!("  ✓ Funding gate passed: all {} sampled account(s) funded on all {} validator(s)",
+                        sample.len(), self.clients.len());
+                    break;
+                }
+                Err((ci, acct)) => {
+                    if waited_ms >= timeout_secs * 1000 {
+                        let msg = format!(
+                            "Funding gate TIMEOUT after {}s: validator[{}] still missing user_{:03} (funding state not applied)",
+                            timeout_secs, ci, acct
+                        );
+                        if self.config.funding_gate_allow_timeout {
+                            warn!("  ⚠ {} — continuing anyway (--funding-gate-allow-timeout)", msg);
+                            break;
+                        } else {
+                            bail!("{}. Pass --funding-gate-allow-timeout to proceed regardless.", msg);
                         }
                     }
+                    if waited_ms % 5000 == 0 {
+                        info!("  Still waiting for funding... ({}s elapsed, validator[{}] missing user_{:03})",
+                            waited_ms / 1000, ci, acct);
+                    }
+                    tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+                    waited_ms += poll_interval_ms;
                 }
-                
-                // Wait between coin rounds for TEE to complete and release reservations
-                if coin_idx < coins_per_account - 1 {
-                    tokio::time::sleep(Duration::from_millis(BATCH_WAIT_MS)).await;
-                }
-            }
-            
-            i += current_batch;
-            
-            // Wait between account batches
-            if i < num_accounts {
-                tokio::time::sleep(Duration::from_millis(BATCH_WAIT_MS)).await;
-            }
-            
-            // Progress update
-            let expected = i * coins_per_account;
-            if i % 30 < current_batch || i >= num_accounts {
-                info!("  Progress: {}/{} accounts ({}/{} transfers, {} success, {} failed)",
-                    i, num_accounts, expected, total_transfers, success_count, fail_count);
             }
         }
-        
-        if fail_count > 0 {
-            warn!("  ⚠ {} accounts failed to initialize", fail_count);
-        }
-        
-        // Wait for consensus to apply state changes
-        // Setu uses eventual consistency - state is only written after anchor creation
-        // We poll BOTH the first AND last account's balance to confirm ALL state has been applied
-        info!("  Waiting for consensus to apply state changes...");
-        let first_account = "user_001";
-        let last_account = format!("user_{:03}", num_accounts);
-        let max_wait_secs = 60;
-        let poll_interval_ms = 500;
-        let mut waited_ms = 0u64;
-        let mut first_ready = false;
-        let mut last_ready = false;
-        
-        loop {
-            if !first_ready {
-                if let Some(balance) = client.get_balance(first_account).await {
-                    info!("  ✓ First account state applied! {} balance: {}", first_account, balance);
-                    first_ready = true;
-                }
-            }
-            if !last_ready {
-                if let Some(balance) = client.get_balance(&last_account).await {
-                    info!("  ✓ Last account state applied! {} balance: {}", last_account, balance);
-                    last_ready = true;
-                }
-            }
-            
-            if first_ready && last_ready {
-                break;
-            }
-            
-            if waited_ms >= max_wait_secs * 1000 {
-                warn!("  ⚠ Timeout waiting for state to be applied ({}s)", max_wait_secs);
-                warn!("    first_ready={}, last_ready={}", first_ready, last_ready);
-                warn!("    This may indicate consensus is not running or vlc_delta_threshold not reached");
-                break;
-            }
-            
-            tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
-            waited_ms += poll_interval_ms;
-            
-            if waited_ms % 5000 == 0 {
-                info!("  Still waiting for consensus... ({}s elapsed, first={}, last={})", 
-                    waited_ms / 1000, first_ready, last_ready);
-            }
-        }
-        
-        info!("  ✓ Account initialization complete: {} success, {} failed", success_count, fail_count);
-        
+
+        info!("  ✓ Account setup complete (funded accounts confirmed applied on all validators)");
+
         Ok(())
     }
-    
+
     /// Initialize a single account with retry logic
-    /// 
+    ///
     /// Retries if the seed account's coins are all currently reserved
     async fn init_single_account_with_retry(
         client: &BenchClient,
@@ -600,9 +616,13 @@ impl BenchmarkRunner {
 
         metrics.mark_start();
 
+        let num_clients = self.clients.len();
         let tasks: Vec<_> = (0..total)
             .map(|i| {
-                // Round-robin client selection for multi-validator distribution
+                // Round-robin client selection for multi-validator distribution.
+                // client_idx must match client_for_seq so the partition block (D2)
+                // aligns with the validator this transfer is routed to.
+                let client_idx = (i as usize) % num_clients;
                 let client = self.client_for_seq(i).clone();
                 let sem = semaphore.clone();
                 let metrics = metrics.clone();
@@ -612,7 +632,7 @@ impl BenchmarkRunner {
                 let counter = counter.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    if let Some(result) = execute_request(&client, &config, i, &seed_addrs, &subnet_ids).await {
+                    if let Some(result) = execute_request(&client, &config, i, &seed_addrs, &subnet_ids, client_idx, num_clients).await {
                         metrics.record(result).await;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -691,6 +711,8 @@ impl BenchmarkRunner {
             let current_seq = seq;
             seq += 1;
 
+            let num_clients = self.clients.len();
+            let client_idx = (current_seq as usize) % num_clients;
             let client = self.client_for_seq(current_seq).clone();
             let sem = semaphore.clone();
             let metrics_clone = metrics.clone();
@@ -701,7 +723,7 @@ impl BenchmarkRunner {
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                if let Some(result) = execute_request(&client, &config, current_seq, &seed_addrs, &subnet_ids).await {
+                if let Some(result) = execute_request(&client, &config, current_seq, &seed_addrs, &subnet_ids, client_idx, num_clients).await {
                     metrics_clone.record(result).await;
                 }
                 counter_clone.fetch_add(1, Ordering::Relaxed);
@@ -746,6 +768,8 @@ impl BenchmarkRunner {
             while step_start.elapsed() < step_duration && start.elapsed() < total_duration {
                 request_interval.tick().await;
 
+                let num_clients = self.clients.len();
+                let client_idx = (seq as usize) % num_clients;
                 let client = self.client_for_seq(seq).clone();
                 let sem = semaphore.clone();
                 let metrics_clone = metrics.clone();
@@ -757,7 +781,7 @@ impl BenchmarkRunner {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    if let Some(result) = execute_request(&client, &config, s, &seed_addrs, &subnet_ids).await {
+                    if let Some(result) = execute_request(&client, &config, s, &seed_addrs, &subnet_ids, client_idx, num_clients).await {
                         metrics_clone.record(result).await;
                     }
                     counter_clone.fetch_add(1, Ordering::Relaxed);

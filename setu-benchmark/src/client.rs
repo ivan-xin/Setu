@@ -508,6 +508,138 @@ impl BenchClient {
     }
 }
 
+// =============================================================================
+// Multi-target funding gate + account partitioning
+// (docs/feat/benchmark-multitarget-funding-gate/design.md — D1/D2)
+// =============================================================================
+
+/// Compute `(sender_idx, receiver_idx)` — 0-based account indices — for a
+/// partitioned transfer. Validator `client_idx` (of `num_clients`) draws BOTH
+/// sender and receiver ONLY from its own contiguous block of accounts
+/// (intra-block closed economy, D2), so a coin is never reserved on more than
+/// one validator and total coins per block are conserved across a run.
+///
+/// `local_seq` advances the in-block selection; it varies across retries to pick
+/// a different in-block account while `client_idx` keeps the block fixed (so a
+/// retry can never spill into another validator's block — design F5/R1-4).
+///
+/// Single-target (`num_clients <= 1`) reduces to the legacy
+/// `generate_transfer_with_n_accounts` selection exactly when `local_seq == seq`
+/// (block = all accounts). Leftover accounts when `num_accounts % num_clients != 0`
+/// are simply never selected (D5).
+pub fn partition_indices(
+    num_accounts: usize,
+    num_clients: usize,
+    client_idx: usize,
+    local_seq: u64,
+) -> (usize, usize) {
+    debug_assert!(num_accounts > 0, "num_accounts must be > 0");
+    let num_clients = num_clients.max(1);
+    let client_idx = client_idx % num_clients;
+    // Block size (accounts per validator). Round down; leftover accounts when
+    // num_accounts % num_clients != 0 are never selected (D5). max(1) guards the
+    // degenerate num_accounts < num_clients case (config should prevent it).
+    let k = (num_accounts / num_clients).max(1);
+    let block_start = client_idx * k;
+
+    let local = local_seq as usize;
+    let s = local % k;
+    let mut r = (local + 1 + (local / k)) % k;
+    if r == s {
+        r = (r + 1) % k;
+    }
+    (block_start + s, block_start + r)
+}
+
+/// Generate a partitioned transfer request (multi-target path, D2/D3).
+pub fn generate_transfer_partitioned(
+    amount: u64,
+    num_accounts: usize,
+    num_clients: usize,
+    client_idx: usize,
+    local_seq: u64,
+    subnet_id: Option<String>,
+) -> BenchTransferRequest {
+    let (sender_idx, receiver_idx) =
+        partition_indices(num_accounts, num_clients, client_idx, local_seq);
+    let from = name_to_hex_address(&format!("user_{:03}", sender_idx + 1));
+    let to = name_to_hex_address(&format!("user_{:03}", receiver_idx + 1));
+    BenchTransferRequest {
+        from,
+        to,
+        amount,
+        transfer_type: "setu".to_string(),
+        preferred_solver: None,
+        shard_id: None,
+        subnet_id,
+        resources: vec![format!("bench_resource_{}_{}", client_idx, local_seq)],
+    }
+}
+
+/// Account indices (1-based, for `user_{:03}` names) to sample in the funding gate
+/// (D1). `sample == 0` → all accounts. Otherwise first + last + evenly-strided
+/// middle accounts, deduped and sorted (so the returned length may be `<= sample`).
+pub fn funding_gate_sample(num_accounts: u64, sample: u64) -> Vec<u64> {
+    if num_accounts == 0 {
+        return vec![];
+    }
+    if sample == 0 || sample >= num_accounts {
+        return (1..=num_accounts).collect();
+    }
+    if sample == 1 {
+        // The last account is the strictest single probe (funded last).
+        return vec![num_accounts];
+    }
+    let mut idxs = std::collections::BTreeSet::new();
+    idxs.insert(1);
+    idxs.insert(num_accounts);
+    // Distribute the remaining (sample - 2) probes evenly across the middle.
+    let remaining = sample - 2;
+    let span = num_accounts - 1; // positions 1..num_accounts
+    for j in 1..=remaining {
+        let pos = 1 + (span * j) / (remaining + 1);
+        idxs.insert(pos);
+    }
+    idxs.into_iter().collect()
+}
+
+/// Funding-gate readiness predicate (D1). `balances[client_idx][sample_pos]` is the
+/// polled balance (or `None` if absent). Returns `Ok(())` iff every entry is
+/// `Some(>0)`; otherwise `Err((client_idx, account_index))` for the first not-ready
+/// pair (`account_index` is the 1-based user index from `sample`).
+pub fn gate_ready(
+    balances: &[Vec<Option<u64>>],
+    sample: &[u64],
+) -> Result<(), (usize, u64)> {
+    for (ci, row) in balances.iter().enumerate() {
+        for (si, bal) in row.iter().enumerate() {
+            match bal {
+                Some(b) if *b > 0 => {}
+                _ => return Err((ci, sample.get(si).copied().unwrap_or(0))),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit a JSON array of `count` pre-funded genesis account entries (user_001..user_count),
+/// using the SAME `name_to_hex_address` derivation the load path uses — so the accounts
+/// baked into genesis are exactly the ones the benchmark will transfer between. Splice the
+/// output into genesis `accounts`, then run with `--skip-funding`.
+pub fn emit_genesis_accounts_json(count: u64, balance: u64, coins_per_account: u64) -> String {
+    let entries: Vec<String> = (1..=count)
+        .map(|i| {
+            let name = format!("user_{:03}", i);
+            let addr = name_to_hex_address(&name);
+            format!(
+                "    {{ \"address\": \"{}\", \"name\": \"{}\", \"balance\": {}, \"coins_per_account\": {} }}",
+                addr, name, balance, coins_per_account
+            )
+        })
+        .collect();
+    format!("[\n{}\n]", entries.join(",\n"))
+}
+
 /// Generate a Move call request from benchmark config
 pub fn generate_move_call(
     config: &crate::config::BenchmarkConfig,
@@ -529,5 +661,117 @@ pub fn generate_move_call(
         consumed_indices: vec![],
         needs_tx_context: true,
         subnet_id: None,
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::{funding_gate_sample, gate_ready, partition_indices};
+
+    /// Legacy selection formula from `generate_transfer_with_n_accounts` (client.rs),
+    /// reproduced here as the oracle for single-target equivalence (T2).
+    fn legacy_indices(seq: u64, num: usize) -> (usize, usize) {
+        let s = seq as usize % num;
+        let mut r = (seq as usize + 1 + (seq as usize / num)) % num;
+        if r == s {
+            r = (r + 1) % num;
+        }
+        (s, r)
+    }
+
+    /// T1 — sender & receiver always land inside the validator's own block.
+    #[test]
+    fn t1_sender_receiver_in_block() {
+        let (na, nc) = (198usize, 3usize);
+        let k = na / nc; // 66
+        for client_idx in 0..nc {
+            let (lo, hi) = (client_idx * k, client_idx * k + k);
+            for seq in 0..500u64 {
+                let (s, r) = partition_indices(na, nc, client_idx, seq);
+                assert!((lo..hi).contains(&s), "sender {} not in [{},{})", s, lo, hi);
+                assert!((lo..hi).contains(&r), "receiver {} not in [{},{})", r, lo, hi);
+            }
+        }
+    }
+
+    /// T2 — single-target (num_clients=1) matches the legacy formula byte-for-byte.
+    #[test]
+    fn t2_single_target_matches_legacy() {
+        let num = 200usize;
+        for seq in 0..1000u64 {
+            assert_eq!(
+                partition_indices(num, 1, 0, seq),
+                legacy_indices(seq, num),
+                "mismatch at seq {}",
+                seq
+            );
+        }
+    }
+
+    /// T3 — sender != receiver for any block size >= 2.
+    #[test]
+    fn t3_sender_ne_receiver() {
+        for &(na, nc) in &[(198usize, 3usize), (200, 1), (120, 4), (99, 3)] {
+            for client_idx in 0..nc {
+                for seq in 0..300u64 {
+                    let (s, r) = partition_indices(na, nc, client_idx, seq);
+                    assert_ne!(s, r, "na={} nc={} c={} seq={}", na, nc, client_idx, seq);
+                }
+            }
+        }
+    }
+
+    /// T4 — remainder alignment: (200,3) → k=66, blocks [0,66)[66,132)[132,198);
+    /// leftover accounts 198,199 (0-based) are never selected; never out of bounds.
+    #[test]
+    fn t4_remainder_alignment() {
+        let (na, nc) = (200usize, 3usize);
+        let k = na / nc;
+        assert_eq!(k, 66);
+        for client_idx in 0..nc {
+            let (lo, hi) = (client_idx * k, client_idx * k + k);
+            assert!(hi <= 198, "block end {} leaks into leftover region", hi);
+            for seq in 0..400u64 {
+                let (s, r) = partition_indices(na, nc, client_idx, seq);
+                assert!(s < na && r < na, "out of bounds s={} r={}", s, r);
+                assert!((lo..hi).contains(&s) && (lo..hi).contains(&r));
+            }
+        }
+    }
+
+    /// T5 — funding-gate sample set: includes first+last, deduped/sorted, capped.
+    #[test]
+    fn t5_funding_gate_sample() {
+        let s = funding_gate_sample(200, 8);
+        assert!(s.contains(&1) && s.contains(&200), "must include first & last");
+        assert!(s.len() <= 8 && s.len() >= 2);
+        assert!(s.windows(2).all(|w| w[0] < w[1]), "must be strictly sorted+deduped");
+        assert!(s.iter().all(|&x| (1..=200).contains(&x)));
+        // sample == 0 → all
+        assert_eq!(funding_gate_sample(50, 0), (1..=50).collect::<Vec<_>>());
+        // sample >= total → all
+        assert_eq!(funding_gate_sample(5, 8), vec![1, 2, 3, 4, 5]);
+        // empty
+        assert!(funding_gate_sample(0, 8).is_empty());
+    }
+
+    /// T6 — readiness predicate: all Some(>0) ⇒ Ok; first not-ready ⇒ Err((client,acct)).
+    #[test]
+    fn t6_gate_ready_predicate() {
+        let sample = vec![1u64, 50, 100];
+        let ok = vec![
+            vec![Some(10), Some(10), Some(10)],
+            vec![Some(5), Some(5), Some(5)],
+        ];
+        assert!(gate_ready(&ok, &sample).is_ok());
+        // client 1, account 50 absent
+        let missing = vec![
+            vec![Some(10), Some(10), Some(10)],
+            vec![Some(5), None, Some(5)],
+        ];
+        assert_eq!(gate_ready(&missing, &sample), Err((1, 50)));
+        // zero balance counts as not-ready (client 0, account 1)
+        let zero = vec![vec![Some(0), Some(10), Some(10)]];
+        assert_eq!(gate_ready(&zero, &sample), Err((0, 1)));
     }
 }

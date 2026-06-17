@@ -47,6 +47,19 @@ async fn main() -> anyhow::Result<()> {
     // Parse command line arguments
     let config = BenchmarkConfig::parse();
 
+    // Emit-genesis mode: print pre-funded account entries and exit (no benchmark run).
+    if config.emit_genesis_accounts > 0 {
+        println!(
+            "{}",
+            client::emit_genesis_accounts_json(
+                config.emit_genesis_accounts,
+                config.init_account_balance,
+                config.coins_per_account,
+            )
+        );
+        return Ok(());
+    }
+
     info!("╔══════════════════════════════════════════════════════════╗");
     info!("║            Setu TPS Benchmark Tool v0.1.0                ║");
     info!("╚══════════════════════════════════════════════════════════╝");
