@@ -264,6 +264,12 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    // CF size cap. Env-configurable for the §C2-C isolation experiment (vary CF size at
+    // fixed account count to test whether CF size affects submit). Default 1000.
+    consensus.max_events_per_cf = std::env::var("MAX_EVENTS_PER_CF")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
     
     let consensus_config = ConsensusValidatorConfig {
         node_info,
