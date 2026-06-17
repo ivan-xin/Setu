@@ -68,16 +68,29 @@ async fn main() -> anyhow::Result<()> {
     // Print configuration
     config.print_config();
 
-    // Save output format + M0 settings before config is moved
+    // Save output format + M0/M1 settings before config is moved
     let output_format = config.output.clone();
     let m0_enabled = config.m0;
     let m0_url = config.validator_url.clone();
+    let m1_enabled = config.m1;
+    // M1 is per-validator: reset/fetch every target (finalized throughput is local to each).
+    let m1_urls = config.get_validator_urls();
 
     // M0: reset the validator's measurement window before applying load.
     if m0_enabled {
         match report::m0_reset(&m0_url).await {
             Ok(()) => info!("M0: reset measurement window on {}", m0_url),
             Err(e) => info!("M0: reset failed ({e}); is the validator built with --features m0-profiling?"),
+        }
+    }
+
+    // M1: reset every validator's measurement window before applying load.
+    if m1_enabled {
+        for url in &m1_urls {
+            match report::m1_reset(url).await {
+                Ok(()) => info!("M1: reset window on {}", url),
+                Err(e) => info!("M1: reset failed on {url} ({e}); built with --features m1-profiling?"),
+            }
         }
     }
 
@@ -96,6 +109,16 @@ async fn main() -> anyhow::Result<()> {
         match report::m0_fetch(&m0_url).await {
             Ok(jsonl) => report::print_m0_report(&jsonl),
             Err(e) => info!("M0: fetch failed ({e}); is the validator built with --features m0-profiling?"),
+        }
+    }
+
+    // M1: fetch + render each validator's finalized-throughput snapshot.
+    if m1_enabled {
+        for (i, url) in m1_urls.iter().enumerate() {
+            match report::m1_fetch(url).await {
+                Ok(json) => report::print_m1_report(&format!("v{}", i + 1), &json),
+                Err(e) => info!("M1: fetch failed on {url} ({e}); built with --features m1-profiling?"),
+            }
         }
     }
 

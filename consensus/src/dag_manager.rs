@@ -362,6 +362,8 @@ impl DagManager {
                 ParentInfo::InCache { depth, .. } | ParentInfo::InStore { depth } => {
                     let depth_diff = new_event_depth.saturating_sub(*depth);
                     if depth_diff > self.config.max_cross_cf_depth {
+                        // M1 (C3): cold-parent rejection — parent deeper than max_cross_cf_depth.
+                        setu_timing::m1_cold_parent(depth_diff);
                         return Err(DagManagerError::ParentTooOld {
                             parent_id: parent_id.clone(),
                             depth_diff,

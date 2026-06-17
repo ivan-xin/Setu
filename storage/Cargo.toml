@@ -11,10 +11,14 @@ test-utils = ["setu-types/test-utils"]
 # writes that bypass apply_committed_events.
 # See docs/feat/consensus-root-self-consistency/design.md §3.4.
 diag-root-drift = []
+# M1 finalized-throughput profiling (docs/feat/m1-finalized-throughput/). Flips
+# setu-timing into its real impl; default OFF — probe calls compile to zero-cost no-ops.
+m1-profiling = ["setu-timing/enabled"]
 
 [dependencies]
 setu-types = { path = "../types" }
 setu-merkle = { path = "../crates/setu-merkle" }
+setu-timing = { path = "../crates/setu-timing" }
 serde = { workspace = true }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }

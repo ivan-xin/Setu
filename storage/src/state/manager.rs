@@ -1226,6 +1226,8 @@ impl GlobalStateManager {
                                 key = %change.key,
                                 "Conflict detected: old_value mismatch, skipping event (stale read)"
                             );
+                            // M1 (C4): hot-object OCC conflict — finalized but skipped at apply.
+                            setu_timing::m1_occ_conflict();
                             summary.conflicted_events.push(ConflictRecord {
                                 event_id: event.id.clone(),
                                 conflicting_object: change.key.clone(),
@@ -1262,6 +1264,8 @@ impl GlobalStateManager {
                                     key = %change.key,
                                     "Create conflict: key already exists (duplicate coin ID?), skipping event"
                                 );
+                                // M1 (C4): genuine create-conflict (genesis dup is benign, not counted).
+                                setu_timing::m1_occ_conflict();
                             }
                             summary.conflicted_events.push(ConflictRecord {
                                 event_id: event.id.clone(),
@@ -1301,6 +1305,9 @@ impl GlobalStateManager {
                     changes_count,
                     new_root,
                 );
+                // M1: a finalized (state-applied) event. latency 0 = count only
+                // (end-to-end finalize latency is covered by the M0 stages).
+                setu_timing::m1_applied(0);
             }
         }
 

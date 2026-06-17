@@ -611,6 +611,20 @@ impl ValidatorNetworkService {
                 }),
             );
 
+        // M1 finalized-throughput endpoints (docs/feat/m1-finalized-throughput/). Present
+        // ONLY under m1-profiling. GET returns the M1 snapshot JSON (finalized_tps, CF size,
+        // occ/cold-parent counts + distributions); POST resets the window before a load run.
+        #[cfg(feature = "m1-profiling")]
+        let app = app
+            .route("/api/v1/m1/report", get(|| async { setu_timing::m1_report_json() }))
+            .route(
+                "/api/v1/m1/reset",
+                post(|| async {
+                    setu_timing::m1_reset();
+                    "ok"
+                }),
+            );
+
         let listener = tokio::net::TcpListener::bind(self.config.http_listen_addr).await?;
 
         info!(addr = %self.config.http_listen_addr, "HTTP API server started");

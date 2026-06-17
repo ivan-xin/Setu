@@ -18,6 +18,9 @@ diag-root-drift = []
 # M0 pipeline profiling (docs/feat/m0-pipeline-baseline/). Flips setu-timing into
 # its real impl; default OFF — probe calls compile to zero-cost no-ops.
 m0-profiling = ["setu-timing/enabled"]
+# M1 finalized-throughput profiling (docs/feat/m1-finalized-throughput/). Adds CF-size/
+# fold-cadence (folder.rs) + cold-parent (dag_manager.rs) probes. Default OFF — zero-cost.
+m1-profiling = ["setu-timing/enabled"]
 # M0-driven optimization (M0-report §9): per-event P2P broadcast goes through a bounded
 # FIFO worker (off the submit critical path) instead of a synchronous await (~94% of submit
 # cost). Broadcast is best-effort (state sync fills gaps). Now ON by default (see `default`).

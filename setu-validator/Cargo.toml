@@ -24,6 +24,13 @@ m0-profiling = [
     "consensus/m0-profiling",
     "setu-timing/enabled",
 ]
+# M1 finalized-throughput profiling (docs/feat/m1-finalized-throughput/). Aggregates the
+# consensus + storage M1 probes; default OFF — probe calls are zero-cost no-ops.
+m1-profiling = [
+    "consensus/m1-profiling",
+    "setu-storage/m1-profiling",
+    "setu-timing/enabled",
+]
 # M0-driven optimization (M0-report §9): async fire-and-forget P2P broadcast.
 # Default OFF — production keeps synchronous broadcast until validated.
 async-broadcast = ["consensus/async-broadcast"]

@@ -21,6 +21,70 @@ pub async fn m0_fetch(validator_url: &str) -> anyhow::Result<String> {
     Ok(resp.text().await?)
 }
 
+// ─────────────────────── M1 finalized-throughput profiling (docs/feat/m1-finalized-throughput/) ───────────────────────
+
+/// Reset a validator's M1 measurement window.
+pub async fn m1_reset(validator_url: &str) -> anyhow::Result<()> {
+    let url = format!("{}/api/v1/m1/reset", validator_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new().post(&url).send().await?;
+    anyhow::ensure!(resp.status().is_success(), "m1 reset HTTP {}", resp.status());
+    Ok(())
+}
+
+/// Fetch a validator's M1 snapshot (single JSON object).
+pub async fn m1_fetch(validator_url: &str) -> anyhow::Result<String> {
+    let url = format!("{}/api/v1/m1/report", validator_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new().get(&url).send().await?;
+    anyhow::ensure!(resp.status().is_success(), "m1 report HTTP {}", resp.status());
+    Ok(resp.text().await?)
+}
+
+#[derive(serde::Deserialize)]
+struct M1Dist {
+    count: u64,
+    mean_ns: u64,
+    p50_ns: u64,
+    p95_ns: u64,
+    p99_ns: u64,
+    max_ns: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct M1Report {
+    events_applied: u64,
+    occ_conflicts: u64,
+    cold_parent_rejects: u64,
+    cf_count: u64,
+    finalized_tps: f64,
+    occ_rate: f64,
+    cf_size: M1Dist,
+    fold_interval_ns: M1Dist,
+    cold_parent_depth_diff: M1Dist,
+}
+
+/// Render one validator's M1 snapshot: finalized TPS + the C2/C3/C4 constraint signals.
+pub fn print_m1_report(label: &str, json: &str) {
+    let r: M1Report = match serde_json::from_str(json) {
+        Ok(r) => r,
+        Err(e) => {
+            info!("M1[{label}]: parse failed ({e}); raw: {json}");
+            return;
+        }
+    };
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    info!("┌─ M1 finalized-throughput [{label}] ─────────────────────────");
+    info!("│ finalized TPS (applied/s):  {:.1}", r.finalized_tps);
+    info!("│ events applied:             {}", r.events_applied);
+    info!("│ C2 fold cadence:  CF count {}  | events/CF p50 {} p95 {} max {} | fold interval p50 {:.1}ms p95 {:.1}ms",
+        r.cf_count, r.cf_size.p50_ns, r.cf_size.p95_ns, r.cf_size.max_ns,
+        ms(r.fold_interval_ns.p50_ns), ms(r.fold_interval_ns.p95_ns));
+    info!("│ C4 OCC conflicts:  {} ({:.2}% of apply attempts)", r.occ_conflicts, r.occ_rate * 100.0);
+    info!("│ C3 cold-parent rejects: {} | depth_diff p50 {} p95 {} max {}",
+        r.cold_parent_rejects, r.cold_parent_depth_diff.p50_ns,
+        r.cold_parent_depth_diff.p95_ns, r.cold_parent_depth_diff.max_ns);
+    info!("└──────────────────────────────────────────────────────────");
+}
+
 /// One stage's stats parsed from the validator's jsonl report.
 #[derive(serde::Deserialize)]
 struct M0Stage {

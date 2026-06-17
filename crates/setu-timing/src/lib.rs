@@ -42,10 +42,15 @@
 
 mod collector;
 mod histogram;
+mod m1;
 mod stage;
 
 pub use collector::{init, mark, measure_from, record, report, reset, Span, TraceId};
 pub use histogram::{percentile_ns, Aggregator, StageHistogram, StageStats};
+pub use m1::{
+    m1_applied, m1_cf, m1_cold_parent, m1_init, m1_occ_conflict, m1_report_json, m1_reset,
+    m1_snapshot, rate_per_sec, ratio, Dist, M1Metrics, M1Snapshot,
+};
 pub use stage::StageId;
 
 /// Render the per-stage stats snapshot as jsonl (one stage per line), for offline

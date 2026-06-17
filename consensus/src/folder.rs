@@ -338,6 +338,8 @@ impl ConsensusManager {
             round,
             "CF created with anchor"
         );
+        // M1 (C2): CF size + fold cadence — events folded per ConsensusFrame.
+        setu_timing::m1_cf(anchor.event_ids.len() as u64);
         let cf = ConsensusFrame::new(round, anchor, self.local_validator_id.clone());
         self.pending_builds.insert(cf.id.clone(), pending_build);
         self.pending_cfs.insert(cf.id.clone(), cf.clone());

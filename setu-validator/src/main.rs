@@ -173,6 +173,11 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "m0-profiling")]
     setu_timing::init();
 
+    // M1 finalized-throughput profiling: init the M1 globals + measurement window
+    // (docs/feat/m1-finalized-throughput/). No-op without m1-profiling.
+    #[cfg(feature = "m1-profiling")]
+    setu_timing::m1_init();
+
     // Load configuration
     let config = ValidatorConfig::from_env();
     

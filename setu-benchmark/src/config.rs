@@ -195,6 +195,15 @@ pub struct BenchmarkConfig {
     #[arg(long, default_value = "false")]
     pub m0: bool,
 
+    /// Pull each validator's M1 finalized-throughput report after the run.
+    ///
+    /// Requires the validators built with `--features m1-profiling`. Resets each
+    /// validator's M1 window before the load, then fetches + renders finalized TPS +
+    /// the C2 (fold cadence) / C3 (cold-parent) / C4 (OCC) constraint signals.
+    /// See docs/feat/m1-finalized-throughput/.
+    #[arg(long, default_value = "false")]
+    pub m1: bool,
+
     // ── Multi-target reliability (docs/feat/benchmark-multitarget-funding-gate/) ──
     /// Funding gate (D1): accounts sampled PER VALIDATOR before load starts.
     /// A number polls first+last+evenly-strided middle accounts; "all" polls every
