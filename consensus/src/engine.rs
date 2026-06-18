@@ -979,10 +979,10 @@ impl ConsensusEngine {
                         let ctx = cm.anchor_builder().build_apply_context(pb);
                         Some((plan, PreparedApply::Leader(ctx)))
                     } else {
-                        let events = plan.follower_events.take().unwrap_or_default();
+                        let pce = plan.follower_events.take().unwrap_or_default();
                         let ctx = cm
                             .anchor_builder()
-                            .build_follower_apply_context(events, &plan.cf);
+                            .build_follower_apply_context(pce.events, pce.event_depths, &plan.cf);
                         Some((plan, PreparedApply::Follower(ctx)))
                     }
                 }

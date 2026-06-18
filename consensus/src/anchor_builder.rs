@@ -180,6 +180,14 @@ pub struct PendingAnchorBuild {
 
     /// 新的 last_fold_vlc (构建后)
     pub new_last_fold_vlc: u64,
+
+    /// Per-event DAG depth (`event_id → dag.get_depth(event)`), captured at
+    /// selection time. Threaded into `apply_committed_events_with_depths` so the
+    /// modification_tracker records the event's DAG depth (same basis as
+    /// resolve_parents) instead of the anchor depth. Empty on synthetic/test
+    /// builds (`force_prepare_build`) → tracker falls back to `finalized_depth`.
+    /// See docs/feat/fix-cold-parent-depth-basis/design.md §6.
+    pub event_depths: HashMap<EventId, u64>,
 }
 
 impl PendingAnchorBuild {
@@ -208,6 +216,8 @@ pub struct ApplyContext {
     /// = builder.anchor_depth + 1 at begin time.
     pub anchor_id: u64,
     pub finalized_depth: u64,
+    /// Per-event DAG depth (depth-basis fix; see PendingAnchorBuild.event_depths).
+    pub event_depths: HashMap<EventId, u64>,
     /// Snapshot captured when the build was prepared.
     pub pre_build_snapshot: BuilderStateSnapshot,
     /// Builder's current scalars at begin (== prepare snapshot iff no CF committed since).
@@ -236,6 +246,9 @@ pub struct FollowerApplyContext {
     pub events: Vec<Event>,
     pub anchor_id: u64,
     pub finalized_depth: u64,
+    /// Per-event DAG depth captured on the follower at `apply_cf_state_changes`
+    /// (depth-basis fix; see PendingAnchorBuild.event_depths / design §6).
+    pub event_depths: HashMap<EventId, u64>,
     pub shared: Arc<SharedStateManager>,
     pub outcomes_sink: Option<Arc<dyn OutcomeSink>>,
 }
@@ -654,7 +667,10 @@ impl AnchorBuilder {
             return Err(AnchorBuildError::NoEvents);
         }
 
-        self.prepare_build_internal(events, vlc, to_depth)
+        // Capture per-event DAG depth from the selected events (R4-1: all fold
+        // entries must capture, else heartbeat/normal CFs fall back to anchor depth).
+        let event_depths = Self::build_event_depths(dag, &events);
+        self.prepare_build_internal(events, vlc, to_depth, event_depths)
     }
 
     /// Force prepare build from specific events (bypasses checks)
@@ -679,15 +695,30 @@ impl AnchorBuilder {
         if events.len() > self.config.max_events_per_cf {
             events.truncate(self.config.max_events_per_cf);
         }
-        self.prepare_build_internal(events, vlc, depth)
+        // Synthetic/test path: no DAG in hand → empty map; the modification_tracker
+        // falls back to `finalized_depth` for these events (test-only, see §6).
+        self.prepare_build_internal(events, vlc, depth, HashMap::new())
     }
 
     /// Internal prepare build implementation
+    /// Build the per-event DAG-depth map for the selected CF events
+    /// (`event_id → dag.get_depth(event)`). Same basis as recent_cache /
+    /// event_store, so the prepare-time cold-parent drop predicts resolve.
+    /// Events missing a depth (should not happen — selected events come from the
+    /// DAG) are simply omitted → tracker falls back to `finalized_depth`.
+    fn build_event_depths(dag: &Dag, events: &[Event]) -> HashMap<EventId, u64> {
+        events
+            .iter()
+            .filter_map(|e| dag.get_depth(&e.id).map(|d| (e.id.clone(), d)))
+            .collect()
+    }
+
     fn prepare_build_internal(
         &self,
         events: Vec<Event>,
         vlc: &VLC,
         to_depth: u64,
+        event_depths: HashMap<EventId, u64>,
     ) -> Result<PendingAnchorBuild, AnchorBuildError> {
         // Take snapshot before any computation
         let pre_build_snapshot = self.take_snapshot();
@@ -758,6 +789,7 @@ impl AnchorBuilder {
             new_anchor_chain_root,
             new_anchor_depth: to_depth + 1,
             new_last_fold_vlc: vlc.logical_time(),
+            event_depths,
         })
     }
 
@@ -846,7 +878,7 @@ impl AnchorBuilder {
             #[cfg(feature = "diag-root-drift")]
             Self::diag_h4_probes(&cf_id, "leader", &guard, &events);
 
-            let summary = guard.apply_committed_events(&events, finalized_depth);
+            let summary = guard.apply_committed_events_with_depths(&events, finalized_depth, &pending.event_depths);
             // M0 commit: WriteBatch persist only (nested inside apply_work; no-op unless m0-profiling).
             let commit_result = {
                 let _m0_commit = setu_timing::Span::start(setu_timing::StageId::Commit, setu_timing::TraceId(0));
@@ -960,6 +992,7 @@ impl AnchorBuilder {
             cf_id: pending.anchor.id.clone(),
             anchor_id: self.anchor_depth + 1,
             finalized_depth: pending.new_anchor_depth,
+            event_depths: pending.event_depths.clone(),
             events: pending.all_events(),
             pre_build_snapshot: pending.pre_build_snapshot.clone(),
             current_state,
@@ -1008,7 +1041,7 @@ impl AnchorBuilder {
         // Transaction: apply + commit + publish under the GSM write lock (RCU; never cm).
         let txn: Result<setu_storage::StateApplySummary, String> = {
             let mut guard = ctx.shared.lock_write();
-            let summary = guard.apply_committed_events(&ctx.events, ctx.finalized_depth);
+            let summary = guard.apply_committed_events_with_depths(&ctx.events, ctx.finalized_depth, &ctx.event_depths);
             match guard.commit(ctx.anchor_id) {
                 Ok(()) => {
                     ctx.shared.publish_snapshot(&guard);
@@ -1068,11 +1101,13 @@ impl AnchorBuilder {
     pub fn build_follower_apply_context(
         &self,
         events: Vec<Event>,
+        event_depths: HashMap<EventId, u64>,
         cf: &ConsensusFrame,
     ) -> FollowerApplyContext {
         FollowerApplyContext {
             anchor_id: self.anchor_depth + 1,
             finalized_depth: cf.anchor.depth + 1,
+            event_depths,
             shared: Arc::clone(&self.shared),
             outcomes_sink: self.outcomes_sink.clone(),
             cf: cf.clone(),
@@ -1090,7 +1125,7 @@ impl AnchorBuilder {
         ctx: FollowerApplyContext,
     ) -> (crate::folder::ApplyResult, Option<Anchor>) {
         use crate::folder::{ApplyFailure, ApplyFailureRole, ApplyResult, FailureKind};
-        let FollowerApplyContext { cf, events, anchor_id, finalized_depth, shared, outcomes_sink } = ctx;
+        let FollowerApplyContext { cf, events, anchor_id, finalized_depth, event_depths, shared, outcomes_sink } = ctx;
         let event_ids = cf.anchor.event_ids.clone();
         let fail = |reason: String, kind: FailureKind| -> (ApplyResult, Option<Anchor>) {
             (
@@ -1119,7 +1154,7 @@ impl AnchorBuilder {
         let txn: Result<StateApplySummary, (String, FailureKind)> = {
             let mut guard = shared.lock_write();
             let do_apply = |guard: &mut GlobalStateManager| -> Result<StateApplySummary, (String, FailureKind)> {
-                let summary = guard.apply_committed_events(&events, finalized_depth);
+                let summary = guard.apply_committed_events_with_depths(&events, finalized_depth, &event_depths);
                 match guard.commit(anchor_id) {
                     Ok(()) => {
                         shared.publish_snapshot(guard);
@@ -1130,7 +1165,7 @@ impl AnchorBuilder {
             };
             if let Some(ref mr) = cf.anchor.merkle_roots {
                 let mut temp = (*guard).clone();
-                let _ = temp.apply_committed_events(&events, finalized_depth);
+                let _ = temp.apply_committed_events_with_depths(&events, finalized_depth, &event_depths);
                 let (expected, _) = temp.compute_global_root_bytes();
                 if expected != mr.global_state_root {
                     Err(("follower root mismatch vs declared".to_string(), FailureKind::PreMutationRecoverable))
@@ -1167,6 +1202,7 @@ impl AnchorBuilder {
         &mut self,
         events: &[Event],
         cf: &ConsensusFrame,
+        event_depths: &HashMap<EventId, u64>,
     ) -> Result<StateApplySummary, AnchorBuildError> {
         // 1. Completeness check
         if events.len() != cf.anchor.event_ids.len() {
@@ -1206,7 +1242,7 @@ impl AnchorBuilder {
             if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
                 // Clone from write GSM under the lock
                 let mut temp_manager = (*guard).clone();
-                let verify_summary = temp_manager.apply_committed_events(events, finalized_depth);
+                let verify_summary = temp_manager.apply_committed_events_with_depths(events, finalized_depth, event_depths);
                 let (expected_root, _) = temp_manager.compute_global_root_bytes();
 
                 if expected_root != merkle_roots.global_state_root {
@@ -1232,7 +1268,7 @@ impl AnchorBuilder {
                     })
                 } else {
                     // 3. Apply state changes and commit (same lock scope)
-                    let summary = guard.apply_committed_events(events, finalized_depth);
+                    let summary = guard.apply_committed_events_with_depths(events, finalized_depth, event_depths);
 
                     // DIAG H5 (R2-ISSUE-8): the verify-clone root matched the
                     // declared root, but the second apply runs on the real
@@ -1279,7 +1315,7 @@ impl AnchorBuilder {
                 }
             } else {
                 // No merkle_roots to verify — apply directly
-                let summary = guard.apply_committed_events(events, finalized_depth);
+                let summary = guard.apply_committed_events_with_depths(events, finalized_depth, event_depths);
                 match guard.commit(anchor_id) {
                     Ok(()) => {
                         // DIAG P5 (cf_apply_progress): see leader-side note.
@@ -1707,7 +1743,11 @@ impl AnchorBuilder {
             return Err(AnchorBuildError::NoEvents);
         }
 
-        self.prepare_build_internal(events, vlc, to_depth)
+        // R4-1: heartbeat is a real fold entry and fires precisely during
+        // low-fold/backlog (highest cold-parent density) — it MUST capture
+        // per-event DAG depth too, else heartbeat CFs record the anchor depth.
+        let event_depths = Self::build_event_depths(dag, &events);
+        self.prepare_build_internal(events, vlc, to_depth, event_depths)
     }
 
     /// Synchronize state after a CF is finalized (Follower path, metadata only)
@@ -1922,23 +1962,22 @@ mod tests {
         assert_eq!(recorded_depth, expected_finalized_depth);
     }
 
-    /// G-SPAN EXPOSURE QUANTIFICATION
-    /// (docs/bugs/20260605-cold-parent-depth-span-gap.md)
+    /// G-SPAN GAP — NOW CLOSED BY THE DEPTH-BASIS FIX
+    /// (docs/bugs/20260605-cold-parent-depth-span-gap.md,
+    ///  docs/feat/fix-cold-parent-depth-basis/design.md)
     ///
-    /// The cold-parent drop compares `floor − recorded_depth` where
-    /// `recorded_depth = anchor.depth + 1` (the CF finalize floor), but
+    /// BEFORE: the cold-parent drop compared `floor − recorded_depth` where
+    /// `recorded_depth = anchor.depth + 1` (the CF finalize floor), while
     /// `resolve_parents` compares `new_event_depth − parent_DAG_depth`. When one
-    /// CF folds events spanning many DAG depths, `recorded_depth` OVER-estimates
+    /// CF folded events spanning many DAG depths, `recorded_depth` over-estimated
     /// the lowest-depth event's true DAG depth by the fold span `g`, so the drop
-    /// logic under-counts that edge's age by `g + 1`.
+    /// logic under-counted that edge's age by `g` (the §C2-D "G≈0" failure).
     ///
-    /// This test proves the gap is NOT bounded by the γ strict-same-key fold
-    /// policy: γ only defers events with intersecting write-keys, never bounds
-    /// the DAG depth span. 55 DISJOINT-key events at depths 1..=55 are all kept
-    /// in one CF, and the depth-1 object then records `finalized_depth = 56`
-    /// (a `g = 55` over-estimate of its true DAG depth 1), a gap exceeding
-    /// `COLD_PARENT_MARGIN` (50). In production CF cadence keeps `g ≪ 50`; this
-    /// test asserts the gap MAGNITUDE, not a live failure.
+    /// AFTER (this fix): the modification_tracker records the event's **DAG depth**
+    /// (same basis as resolve_parents), so `recorded_depth` no longer carries the
+    /// fold span. This test keeps proving γ does NOT bound the CF depth span
+    /// (55 disjoint-key events at depths 1..=55 all kept in one CF), then asserts
+    /// the depth-1 object records DAG depth 1 (not 56) → the g-span gap is 0.
     #[test]
     fn cold_parent_depth_span_gap_is_not_bounded_by_gamma() {
         const SPAN: u64 = 55;
@@ -1977,31 +2016,32 @@ mod tests {
 
         builder.commit_build(pending).expect("commit");
 
-        // (2) The depth-1 event's object recorded finalized_depth = SPAN + 1,
-        // a g = SPAN - 1 over-estimate of its true DAG depth (1).
+        // (2) DEPTH-BASIS FIX (docs/feat/fix-cold-parent-depth-basis): the
+        // depth-1 event's object now records its **DAG depth (1)** — NOT the CF
+        // floor (anchor.depth+1 = SPAN+1). Before the fix this recorded SPAN+1,
+        // a g = SPAN over-estimate that made the prepare-time drop blind to the
+        // event's true age (the "G≈0" assumption that §C2-D disproved).
         let key = test_oid_key("span-coin-1");
         let object_hash = setu_storage::GlobalStateManager::parse_state_change_key(&key);
         let snapshot = builder.shared.load_snapshot();
         let (_recorded_event_id, recorded_depth) = snapshot
             .get_last_modifying_event_depth(object_hash.as_bytes())
             .expect("depth-1 object should have a modifying event");
+        let true_dag_depth = 1u64;
         assert_eq!(
-            recorded_depth,
-            SPAN + 1,
-            "recorded depth is the CF floor (anchor.depth+1), not the event's DAG depth"
+            recorded_depth, true_dag_depth,
+            "FIX: recorded depth must be the event's DAG depth (1), not the CF floor (SPAN+1)"
         );
 
-        // The true DAG depth of that event was 1; the drop logic under-counts
-        // its age by g = SPAN - 1. With SPAN = 55 the gap (55) exceeds
-        // COLD_PARENT_MARGIN (50): a depth-1 parent edge whose real cross-CF
-        // diff is `floor − 1` is judged by the drop logic as `floor − 56`.
-        // This asserts the gap magnitude (latent exposure), not a live failure —
-        // cadence keeps the span ≪ 50 in production (see bug doc Impact).
-        let true_dag_depth = 1u64;
+        // The fold-span gap that previously exceeded COLD_PARENT_MARGIN (50) is
+        // now ELIMINATED: tracker depth == DAG depth == resolve's basis, so the
+        // prepare-time drop sees the event's true age (`floor − 1`), the same
+        // value resolve_parents compares against. The span no longer leaks into
+        // the recorded depth.
         let gap = recorded_depth - true_dag_depth;
-        assert!(
-            gap >= 50,
-            "fold-span gap (g+1 = {gap}) can exceed COLD_PARENT_MARGIN (50)"
+        assert_eq!(
+            gap, 0,
+            "depth-basis fix eliminates the fold-span gap (was g = SPAN, now 0)"
         );
     }
 
@@ -2454,7 +2494,7 @@ mod tests {
         // a different root than our all-0xFF value.
         let cf = fa_make_cf(&events, [0xFFu8; 32], 1);
 
-        let result = builder.apply_follower_finalized_cf(&events, &cf);
+        let result = builder.apply_follower_finalized_cf(&events, &cf, &HashMap::new());
         assert!(
             matches!(result, Err(AnchorBuildError::RootMismatch { .. })),
             "expected RootMismatch, got {result:?}"
@@ -2478,7 +2518,7 @@ mod tests {
         let cf = fa_make_cf(&events, [0u8; 32], 1);
         let partial: Vec<Event> = events[..1].to_vec();
 
-        let result = builder.apply_follower_finalized_cf(&partial, &cf);
+        let result = builder.apply_follower_finalized_cf(&partial, &cf, &HashMap::new());
         assert!(
             matches!(result, Err(AnchorBuildError::MissingEvents { .. })),
             "expected MissingEvents, got {result:?}"
@@ -2573,7 +2613,7 @@ mod tests {
 
         let cf = fa_make_cf(&events_template, expected_root, 1);
         let mut follower = follower;
-        let result = follower.apply_follower_finalized_cf(&events_template, &cf);
+        let result = follower.apply_follower_finalized_cf(&events_template, &cf, &HashMap::new());
         assert!(
             result.is_ok(),
             "follower apply should succeed, got {result:?}"
@@ -3257,6 +3297,100 @@ mod tests {
         );
     }
 
+    // ───── docs/feat/fix-cold-parent-depth-basis (REP leader-capture / T6) ─────
+
+    /// Leader `prepare_build` captures each selected event's **DAG depth**
+    /// (`dag.get_depth`) into `PendingAnchorBuild.event_depths` — NOT the
+    /// new anchor depth. This is the source of the depth-basis fix.
+    #[test]
+    fn prepare_build_captures_per_event_dag_depth() {
+        use crate::dag::Dag as ConsensusDag;
+        let builder = AnchorBuilder::new(gamma_config(100));
+        let mut dag = ConsensusDag::new();
+        // Distinct keys → γ keeps both; distinct DAG depths 5 & 9 (backlog-style,
+        // both far below the new anchor depth = max_depth+1 = 10).
+        let mut e1 = gamma_make_event("evt-5", SubnetId::ROOT, 1, &["K1"]);
+        e1.parent_ids.clear();
+        dag.add_event_with_depth(e1, 5).unwrap();
+        let mut e2 = gamma_make_event("evt-9", SubnetId::ROOT, 2, &["K2"]);
+        e2.parent_ids.clear();
+        dag.add_event_with_depth(e2, 9).unwrap();
+
+        let mut vlc = VLC::new("node1".to_string());
+        vlc.tick(); // delta >= vlc_delta_threshold(1)
+
+        let empty: HashSet<EventId> = HashSet::new();
+        let pending = builder.prepare_build(&dag, &vlc, &empty).expect("prepare");
+        assert_eq!(pending.new_anchor_depth, 10, "sanity: anchor depth is 10");
+        assert_eq!(
+            pending.event_depths.get("evt-5"),
+            Some(&5),
+            "must record DAG depth 5, not anchor depth 10"
+        );
+        assert_eq!(pending.event_depths.get("evt-9"), Some(&9));
+    }
+
+    /// R4-1 guard: the **heartbeat** fold entry must capture per-event DAG depth
+    /// too. Heartbeat fires during low-fold/backlog (highest cold-parent density);
+    /// missing it would leave heartbeat CFs on the anchor-depth basis.
+    #[test]
+    fn heartbeat_captures_per_event_dag_depth_r4_1() {
+        use crate::dag::Dag as ConsensusDag;
+        let builder = AnchorBuilder::new(gamma_config(100));
+        let mut dag = ConsensusDag::new();
+        let mut e1 = gamma_make_event("hb-5", SubnetId::ROOT, 1, &["HK1"]);
+        e1.parent_ids.clear();
+        dag.add_event_with_depth(e1, 5).unwrap();
+        let mut e2 = gamma_make_event("hb-12", SubnetId::ROOT, 2, &["HK2"]);
+        e2.parent_ids.clear();
+        dag.add_event_with_depth(e2, 12).unwrap();
+
+        let mut vlc = VLC::new("node1".to_string());
+        for _ in 0..5 {
+            vlc.tick();
+        }
+        let empty: HashSet<EventId> = HashSet::new();
+        let pending = builder
+            .prepare_build_heartbeat(&dag, &vlc, std::time::Duration::from_millis(0), &empty)
+            .expect("heartbeat prepare");
+        assert_eq!(
+            pending.event_depths.get("hb-5"),
+            Some(&5),
+            "heartbeat must record DAG depth 5, not anchor depth"
+        );
+        assert_eq!(pending.event_depths.get("hb-12"), Some(&12));
+        assert_ne!(
+            pending.new_anchor_depth, 5,
+            "sanity: anchor depth differs from the captured DAG depth"
+        );
+    }
+
+    /// R3-1 guard (decoupled leader): `build_apply_context` must carry
+    /// `event_depths` into the `ApplyContext` so the decoupled apply path
+    /// (the production path) records DAG depth — not a no-op that only the
+    /// legacy `commit_build` would honor.
+    #[cfg(feature = "decoupled-apply")]
+    #[test]
+    fn build_apply_context_carries_event_depths_decoupled() {
+        use crate::dag::Dag as ConsensusDag;
+        let builder = AnchorBuilder::new(gamma_config(100));
+        let mut dag = ConsensusDag::new();
+        let mut e1 = gamma_make_event("dc-5", SubnetId::ROOT, 1, &["DK1"]);
+        e1.parent_ids.clear();
+        dag.add_event_with_depth(e1, 5).unwrap();
+        let mut vlc = VLC::new("node1".to_string());
+        vlc.tick();
+        let empty: HashSet<EventId> = HashSet::new();
+        let pending = builder.prepare_build(&dag, &vlc, &empty).expect("prepare");
+        let expected = pending.event_depths.clone();
+        assert_eq!(expected.get("dc-5"), Some(&5));
+        let ctx = builder.build_apply_context(pending);
+        assert_eq!(
+            ctx.event_depths, expected,
+            "ApplyContext must carry event_depths (else decoupled apply is a no-op)"
+        );
+    }
+
     // --- #16 heartbeat refolds gamma-deferred same-key events without a new VLC tick ---
     #[test]
     fn gamma_heartbeat_refolds_deferred_same_key_without_new_vlc_tick() {
@@ -3442,7 +3576,7 @@ mod tests {
         }
         let cf = fa_make_cf(&events, expected_root, 0);
 
-        let ctx = follower.build_follower_apply_context(events.clone(), &cf);
+        let ctx = follower.build_follower_apply_context(events.clone(), HashMap::new(), &cf);
         let (res, anchor) = AnchorBuilder::apply_follower_context(ctx);
         assert!(matches!(res, ApplyResult::Applied(_)), "follower apply should succeed");
         assert!(anchor.is_some(), "anchor returned for synchronize_finalized_anchor");
@@ -3459,7 +3593,7 @@ mod tests {
         let follower = AnchorBuilder::new(ConsensusConfig::default());
         let events = fa_two_events();
         let cf = fa_make_cf(&events, [9u8; 32], 0); // bogus declared root
-        let ctx = follower.build_follower_apply_context(events.clone(), &cf);
+        let ctx = follower.build_follower_apply_context(events.clone(), HashMap::new(), &cf);
         let (res, anchor) = AnchorBuilder::apply_follower_context(ctx);
         assert!(anchor.is_none(), "no advance on mismatch");
         match res {
@@ -3476,7 +3610,7 @@ mod tests {
         let follower = AnchorBuilder::new(ConsensusConfig::default());
         let events = fa_two_events();
         let cf = fa_make_cf(&events, [0u8; 32], 0); // claims 2 events
-        let ctx = follower.build_follower_apply_context(events[..1].to_vec(), &cf); // provide 1
+        let ctx = follower.build_follower_apply_context(events[..1].to_vec(), HashMap::new(), &cf); // provide 1
         let (res, anchor) = AnchorBuilder::apply_follower_context(ctx);
         assert!(anchor.is_none());
         match res {

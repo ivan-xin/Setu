@@ -1132,6 +1132,30 @@ impl GlobalStateManager {
         events: &[Event],
         finalized_depth: u64,
     ) -> StateApplySummary {
+        // Thin wrapper: no per-event DAG depths supplied → every modification_tracker
+        // entry falls back to `finalized_depth` (the legacy/anchor-depth behavior).
+        // Test/sandbox/root-preview/process_anchor sites use this overload unchanged.
+        // Production CF-apply paths call `apply_committed_events_with_depths` so the
+        // tracker records the event's DAG depth (depth-basis fix; see
+        // docs/feat/fix-cold-parent-depth-basis/design.md).
+        self.apply_committed_events_with_depths(events, finalized_depth, &HashMap::new())
+    }
+
+    /// Same as `apply_committed_events`, but records each modified object's
+    /// last-modifying event at the event's **DAG depth** (`event_depths[event_id]`)
+    /// instead of the finalizing CF's anchor depth (`finalized_depth`).
+    ///
+    /// This aligns the prepare-time cold-parent drop basis with the depth that
+    /// `resolve_parents` compares against (the event's DAG depth, via
+    /// recent_cache / event_store — all `dag.get_depth`). A missing entry falls
+    /// back to `finalized_depth` (only reachable on non-production / test paths,
+    /// where the map is intentionally empty). See design §6.
+    pub fn apply_committed_events_with_depths(
+        &mut self,
+        events: &[Event],
+        finalized_depth: u64,
+        event_depths: &HashMap<String, u64>,
+    ) -> StateApplySummary {
         // Record the anchor depth of this finalizing CF as the sync floor proxy.
         self.last_finalized_depth = self.last_finalized_depth.max(finalized_depth);
         // DIAG: mark this thread as "inside authoritative CF apply" so that
@@ -1289,13 +1313,33 @@ impl GlobalStateManager {
                 // Apply all state changes for this event
                 let new_root = self.apply_execution_result(subnet_id, result);
                 
-                // Update modification_tracker: record (event_id, finalized_depth)
-                // for each modified object. The depth is the finalizing CF's
-                // anchor depth, used later to drop cold parent edges.
+                // Update modification_tracker: record (event_id, dag_depth) for
+                // each modified object. `dag_depth` is the event's DAG depth (same
+                // basis as resolve_parents' recent_cache / event_store), so the
+                // prepare-time cold-parent drop predicts resolve correctly. Missing
+                // entry → fall back to finalized_depth (anchor depth, legacy basis):
+                // only reachable on non-production/test paths (empty map). See design §3/§6.
+                let recorded_depth = match event_depths.get(&event.id) {
+                    Some(d) => *d,
+                    None => {
+                        if !event_depths.is_empty() {
+                            // Map was supplied (production path) but this event is
+                            // missing — should not happen (applied events are in the
+                            // DAG with a depth). Warn so the fallback is observable.
+                            tracing::warn!(
+                                target: "storage::cold_parent_depth_basis",
+                                event_id = %event.id,
+                                finalized_depth,
+                                "event_depths miss — falling back to anchor depth (depth-basis fallback)"
+                            );
+                        }
+                        finalized_depth
+                    }
+                };
                 for change in &result.state_changes {
                     let object_id = Self::parse_state_change_key(&change.key);
                     self.modification_tracker
-                        .insert(*object_id.as_bytes(), (event.id.clone(), finalized_depth));
+                        .insert(*object_id.as_bytes(), (event.id.clone(), recorded_depth));
                 }
                 
                 // Track in summary
@@ -1815,6 +1859,127 @@ mod tests {
         assert_eq!(smt.get(&coin_oid), Some(&new_value_t1), "Coin should have T1's value (500)");
         assert_eq!(smt.get(&bob_oid), Some(&bob_value), "Bob's coin should exist");
         assert_eq!(smt.get(&charlie_oid), None, "Charlie's coin should NOT exist (T2 rejected)");
+    }
+
+    // ───────── docs/feat/fix-cold-parent-depth-basis (REP T1/T2) ─────────
+
+    /// T1: `apply_committed_events_with_depths` records the event's **DAG depth**
+    /// (`event_depths[event_id]`) in `modification_tracker`, NOT the finalizing
+    /// CF's anchor depth (`finalized_depth`). Mimics a finalization backlog where
+    /// the event sat at DAG depth 5 but only folds into a CF at anchor depth 1000.
+    #[test]
+    fn test_apply_with_depths_records_dag_depth_not_anchor_depth() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+        let coin_bytes = [0x11; 32];
+        let coin_key = format!("oid:{}", hex::encode(coin_bytes));
+
+        let mut vlc = VLCSnapshot::new();
+        vlc.logical_time = 1;
+        let mut e = Event::new(EventType::Transfer, vec![], vlc, "v1".to_string());
+        e.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![StateChange::insert(coin_key, vec![7u8; 64])],
+        });
+        e.status = setu_types::event::EventStatus::Executed;
+
+        let mut event_depths = HashMap::new();
+        event_depths.insert(e.id.clone(), 5u64); // DAG depth
+        let summary = manager.apply_committed_events_with_depths(&[e.clone()], 1000, &event_depths);
+        assert_eq!(summary.total_events, 1);
+
+        let (rec_id, rec_depth) = manager
+            .get_last_modifying_event_depth(&coin_bytes)
+            .expect("object must be tracked");
+        assert_eq!(rec_id, &e.id);
+        assert_eq!(
+            rec_depth, 5,
+            "tracker must record DAG depth 5, not anchor depth 1000"
+        );
+    }
+
+    /// T2: a missing `event_depths` entry (empty map = test/sandbox path) falls
+    /// back to `finalized_depth`; the 2-arg `apply_committed_events` wrapper is
+    /// byte-for-byte equivalent to the empty-map fallback (zero behavior change).
+    #[test]
+    fn test_apply_with_depths_missing_entry_falls_back_and_wrapper_matches() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let make_event = || {
+            let mut vlc = VLCSnapshot::new();
+            vlc.logical_time = 1;
+            let coin_key = format!("oid:{}", hex::encode([0x22; 32]));
+            let mut e = Event::new(EventType::Transfer, vec![], vlc, "v1".to_string());
+            e.set_execution_result(ExecutionResult {
+                success: true,
+                message: None,
+                state_changes: vec![StateChange::insert(coin_key, vec![1u8; 64])],
+            });
+            e.status = setu_types::event::EventStatus::Executed;
+            e
+        };
+
+        // Empty map → fallback to finalized_depth (42).
+        let mut m1 = GlobalStateManager::new();
+        let e = make_event();
+        m1.apply_committed_events_with_depths(&[e.clone()], 42, &HashMap::new());
+        let (_, d1) = m1.get_last_modifying_event_depth(&[0x22; 32]).unwrap();
+        assert_eq!(d1, 42, "empty map → fallback to finalized_depth");
+
+        // 2-arg wrapper must record the identical depth.
+        let mut m2 = GlobalStateManager::new();
+        m2.apply_committed_events(&[e], 42);
+        let (_, d2) = m2.get_last_modifying_event_depth(&[0x22; 32]).unwrap();
+        assert_eq!(d2, 42, "2-arg wrapper == empty-map fallback (no behavior change)");
+    }
+
+    /// G1 gate (design §3/§7): the modification_tracker depth value is NOT part
+    /// of the state root. Applying the SAME events with two DIFFERENT recorded
+    /// depths (DAG depth 5 vs anchor-depth fallback 1000) must produce a
+    /// byte-identical global state root — even though the tracker entries differ.
+    #[test]
+    fn test_depth_basis_does_not_affect_state_root_g1() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let coin_bytes = [0x33; 32];
+        let coin_key = format!("oid:{}", hex::encode(coin_bytes));
+        let make_event = || {
+            let mut vlc = VLCSnapshot::new();
+            vlc.logical_time = 1;
+            let mut e = Event::new(EventType::Transfer, vec![], vlc, "v1".to_string());
+            e.set_execution_result(ExecutionResult {
+                success: true,
+                message: None,
+                state_changes: vec![StateChange::insert(coin_key.clone(), vec![9u8; 64])],
+            });
+            e.status = setu_types::event::EventStatus::Executed;
+            e
+        };
+
+        // Manager A: record DAG depth 5.
+        let mut m_dag = GlobalStateManager::new();
+        let e = make_event();
+        let mut depths = HashMap::new();
+        depths.insert(e.id.clone(), 5u64);
+        m_dag.apply_committed_events_with_depths(&[e.clone()], 1000, &depths);
+
+        // Manager B: empty map → records anchor-depth fallback 1000.
+        let mut m_anchor = GlobalStateManager::new();
+        m_anchor.apply_committed_events_with_depths(&[e], 1000, &HashMap::new());
+
+        // Recorded tracker depths differ …
+        assert_eq!(m_dag.get_last_modifying_event_depth(&coin_bytes).unwrap().1, 5);
+        assert_eq!(m_anchor.get_last_modifying_event_depth(&coin_bytes).unwrap().1, 1000);
+
+        // … but the state root is byte-identical (G1: tracker not in root).
+        let (root_dag, _) = m_dag.compute_global_root_bytes();
+        let (root_anchor, _) = m_anchor.compute_global_root_bytes();
+        assert_eq!(
+            root_dag, root_anchor,
+            "G1: modification_tracker depth value must NOT affect the state root"
+        );
     }
 
     /// Marker value bytes matching the validator's `UserTransferNonceV1` JSON

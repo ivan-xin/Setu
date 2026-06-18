@@ -168,6 +168,19 @@ impl CfLifecycleOutcome {
 /// - `try_create_cf()` calls `prepare_build()` which computes but doesn't modify state
 /// - On finalization, `commit_build()` applies the pending state changes
 /// - On rejection/timeout, pending_builds are simply discarded (no rollback needed)
+
+/// Follower-side buffered events for a received CF, carried with their per-event
+/// DAG depths so they cannot drift apart when moved through `begin_finalization`
+/// (docs/feat/fix-cold-parent-depth-basis R4-4). The depths are captured at
+/// `apply_cf_state_changes` (DAG in hand) and threaded into
+/// `apply_committed_events_with_depths` so the modification_tracker records the
+/// event's DAG depth, not the anchor depth.
+#[derive(Debug, Clone, Default)]
+pub struct PendingCfEvents {
+    pub events: Vec<setu_types::Event>,
+    pub event_depths: std::collections::HashMap<setu_types::EventId, u64>,
+}
+
 pub struct ConsensusManager {
     config: ConsensusConfig,
     /// AnchorBuilder handles DAG folding with Merkle tree updates
@@ -182,7 +195,7 @@ pub struct ConsensusManager {
     /// Events collected for each pending CF (cf_id -> events).
     /// Stored on CF arrival so they can be applied at finalization time,
     /// avoiding out-of-order pre-apply issues on Followers.
-    pending_cf_events: HashMap<String, Vec<setu_types::Event>>,
+    pending_cf_events: HashMap<String, PendingCfEvents>,
     /// Votes received before their CF proposal arrived.
     /// In P2P networks, votes can arrive before proposals due to network ordering.
     /// These are replayed when the CF is received via `receive_cf`.
@@ -234,8 +247,8 @@ pub struct ApplyPlan {
     pub is_leader: bool,
     /// Leader: the pending build moved out of `pending_builds`.
     pub pending_build: Option<PendingAnchorBuild>,
-    /// Follower: events buffered when the CF arrived.
-    pub follower_events: Option<Vec<setu_types::Event>>,
+    /// Follower: events (+ per-event DAG depths) buffered when the CF arrived.
+    pub follower_events: Option<PendingCfEvents>,
 }
 
 /// Result of `begin_finalization` (decouple-cf-apply D2/D7.4).
@@ -461,8 +474,8 @@ impl ConsensusManager {
                 set.insert(id.clone());
             }
         }
-        for events in self.pending_cf_events.values() {
-            for ev in events {
+        for pce in self.pending_cf_events.values() {
+            for ev in &pce.events {
                 set.insert(ev.id.clone());
             }
         }
@@ -695,7 +708,7 @@ impl ConsensusManager {
                                     // Another CF was committed first - use Follower path
                                     tracing::warn!(cf_id = %cf_id, "Snapshot mismatch during commit, falling back to follower path");
                                     let events = pending_build.all_events();
-                                    match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                                    match self.anchor_builder.apply_follower_finalized_cf(&events, &cf, &pending_build.event_depths) {
                                         Ok(_) => Ok(()),
                                         Err(e) => {
                                             tracing::error!(
@@ -733,9 +746,9 @@ impl ConsensusManager {
                             // Applying here (not on arrival) guarantees correct ordering:
                             // CFs finalize in Leader commit order, so the write GSM base
                             // state always matches what the Leader computed against.
-                            let events = self.pending_cf_events.remove(cf_id).unwrap_or_default();
-                            tracing::info!(cf_id = %cf_id, event_count = events.len(), "Follower path: applying deferred state");
-                            match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                            let pce = self.pending_cf_events.remove(cf_id).unwrap_or_default();
+                            tracing::info!(cf_id = %cf_id, event_count = pce.events.len(), "Follower path: applying deferred state");
+                            match self.anchor_builder.apply_follower_finalized_cf(&pce.events, &cf, &pce.event_depths) {
                                 Ok(state_summary) => {
                                     tracing::info!(
                                         cf_id = %cf_id,
@@ -1175,15 +1188,24 @@ impl ConsensusManager {
     ///
     /// Always returns true so the CF is received and voted on regardless.
     pub fn apply_cf_state_changes(&mut self, dag: &Dag, cf: &setu_types::ConsensusFrame) -> bool {
-        // Get events from the anchor's event_ids
-        let events: Vec<setu_types::Event> = cf.anchor.event_ids
-            .iter()
-            .filter_map(|id| dag.get_event(id).cloned())
-            .collect();
-        
-        // Store events for deferred application at finalization time
-        self.pending_cf_events.insert(cf.id.clone(), events);
-        
+        // Get events from the anchor's event_ids, capturing each event's DAG depth
+        // at the SAME point (DAG in hand) — same basis as recent_cache/event_store,
+        // so the prepare-time cold-parent drop predicts resolve (depth-basis fix §6).
+        let mut events: Vec<setu_types::Event> = Vec::with_capacity(cf.anchor.event_ids.len());
+        let mut event_depths: HashMap<setu_types::EventId, u64> = HashMap::new();
+        for id in &cf.anchor.event_ids {
+            if let Some(event) = dag.get_event(id) {
+                if let Some(depth) = dag.get_depth(id) {
+                    event_depths.insert(id.clone(), depth);
+                }
+                events.push(event.clone());
+            }
+        }
+
+        // Store events + depths for deferred application at finalization time.
+        self.pending_cf_events
+            .insert(cf.id.clone(), PendingCfEvents { events, event_depths });
+
         true
     }
     
@@ -1425,6 +1447,49 @@ mod tests {
     /// This is the core BUG-010 regression: previously the error branch called
     /// synchronize_finalized_anchor + finalized_cfs.push, lying to the engine
     /// that the CF had finalized despite no state apply.
+    /// docs/feat/fix-cold-parent-depth-basis (REP follower-capture): the follower
+    /// captures each CF event's DAG depth at `apply_cf_state_changes` (DAG in hand)
+    /// and stores it alongside the events in `pending_cf_events`, so the deferred
+    /// apply records DAG depth (same basis as resolve_parents), not the anchor depth.
+    #[test]
+    fn follower_apply_cf_state_changes_captures_dag_depth() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 3,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(3);
+
+        let event_ids: Vec<_> = dag.all_events().map(|e| e.id.clone()).collect();
+        let roots = AnchorMerkleRoots {
+            events_root: [0u8; 32],
+            global_state_root: [0u8; 32],
+            anchor_chain_root: [0u8; 32],
+            subnet_roots: Default::default(),
+        };
+        let anchor =
+            Anchor::with_merkle_roots(event_ids.clone(), vlc.snapshot(), roots, None, 0);
+        let cf = ConsensusFrame::new(0, anchor, "v2".to_string());
+
+        assert!(manager.apply_cf_state_changes(&dag, &cf));
+
+        let pce = manager
+            .pending_cf_events
+            .get(&cf.id)
+            .expect("events captured for the CF");
+        assert_eq!(pce.events.len(), 3, "all 3 events captured");
+        for id in &event_ids {
+            let expected = dag.get_depth(id).expect("event has DAG depth");
+            assert_eq!(
+                pce.event_depths.get(id),
+                Some(&expected),
+                "captured depth must equal dag.get_depth(id) (resolve's basis), not anchor depth"
+            );
+        }
+    }
+
     #[test]
     fn bug010_follower_apply_failure_drops_cf_and_does_not_advance() {
         let config = ConsensusConfig {
