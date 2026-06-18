@@ -43,11 +43,34 @@ pub enum StageId {
     ApplyWork,
     /// 11. Anchor persistence WriteBatch
     Commit,
+    // ───────── P0 finalization-pipeline instrumentation (cf-finalization-cadence) ─────────
+    // All measure the CURRENT inline finalization path (pipeline not yet built), to predict
+    // the post-D1 per-CF serial floor. See docs/feat/cf-finalization-cadence/p0-instrumentation-plan.md.
+    /// Time an event spends queued in the router channel before `route_event` picks it up
+    /// (head-of-line backlog evidence — Q0).
+    RouterWait,
+    /// Single `route_event` handling duration (grows when inline finalization runs — Q0).
+    RouteEvent,
+    /// `ensure_cf_events_available` inline fetch before voting (Q3).
+    EventFetch,
+    /// `post_finalize_*` tail (write pending_* / completion) (Q1 Floor-A).
+    PostFinalize,
+    /// `persist_pending_finalized_cfs` CF-index persist (Q1 / R5-5 global-drain magnitude).
+    PersistCfIndex,
+    /// `anchor_store().store` anchor commit-marker persist (Q1 / R5-4).
+    PersistAnchor,
+    /// Window between CF-index visible and anchor durable (`mark_anchor_persisted`) — R5-4 hazard size.
+    DurabilityGap,
+    /// `complete_pending_finalizations` (broadcast finalized + advance round) (Q1 Floor-A).
+    Complete,
+    /// Leader fold-gate closed duration: finalize trigger → next `can_start_new_pending_build` true (Q0/Q2).
+    GateClosed,
 }
 
 impl StageId {
-    /// All segments, in pipeline order (incl. the 4 submit-breakdown sub-stages).
-    pub const ALL: [StageId; 17] = [
+    /// All segments, in pipeline order (incl. the 4 submit-breakdown sub-stages
+    /// and the 9 P0 finalization-pipeline probes).
+    pub const ALL: [StageId; 26] = [
         StageId::Ingress,
         StageId::Reserve,
         StageId::Prep,
@@ -65,6 +88,15 @@ impl StageId {
         StageId::ApplyWait,
         StageId::ApplyWork,
         StageId::Commit,
+        StageId::RouterWait,
+        StageId::RouteEvent,
+        StageId::EventFetch,
+        StageId::PostFinalize,
+        StageId::PersistCfIndex,
+        StageId::PersistAnchor,
+        StageId::DurabilityGap,
+        StageId::Complete,
+        StageId::GateClosed,
     ];
 
     /// Stable short name (report column / jsonl field).
@@ -87,6 +119,15 @@ impl StageId {
             StageId::ApplyWait => "apply_wait",
             StageId::ApplyWork => "apply_work",
             StageId::Commit => "commit",
+            StageId::RouterWait => "router_wait",
+            StageId::RouteEvent => "route_event",
+            StageId::EventFetch => "event_fetch",
+            StageId::PostFinalize => "post_finalize",
+            StageId::PersistCfIndex => "persist_cf_index",
+            StageId::PersistAnchor => "persist_anchor",
+            StageId::DurabilityGap => "durability_gap",
+            StageId::Complete => "complete",
+            StageId::GateClosed => "gate_closed",
         }
     }
 
@@ -104,11 +145,11 @@ mod tests {
 
     #[test]
     fn all_names_unique_and_total() {
-        assert_eq!(StageId::ALL.len(), 17);
+        assert_eq!(StageId::ALL.len(), 26);
         let mut names: Vec<&str> = StageId::ALL.iter().map(|s| s.name()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 17, "stage names must be unique");
+        assert_eq!(names.len(), 26, "stage names must be unique");
     }
 
     #[test]

@@ -194,6 +194,18 @@ enum PreparedApply {
     Follower(crate::anchor_builder::FollowerApplyContext),
 }
 
+/// Owned, `Send` finalization work captured at Stage-1 (`try_begin_finalization_job`,
+/// cm-lock) and carried — across a channel in the pipeline — to Stage-2
+/// (`apply_finalization_job`, apply_mutex). cf-finalization-cadence R5-1: the by-id
+/// helper `apply_finalized_cf_decoupled` self-called `begin_finalization`, which is
+/// incompatible with "Stage-1 begins, worker applies by job"; carrying the begun
+/// `ApplyPlan` + owned `PreparedApply` decouples the two stages.
+#[cfg(feature = "decoupled-apply")]
+struct FinalizationJob {
+    plan: crate::folder::ApplyPlan,
+    prepared: PreparedApply,
+}
+
 /// The scalar anchor-metadata advance to apply under the short FINISH cm-lock on a
 /// successful apply (decouple-cf-apply D4). Leader advances via `apply_advance`,
 /// follower via `synchronize_finalized_anchor`.
@@ -534,6 +546,8 @@ impl ConsensusEngine {
     ///   peer-driven `receive_finalized_cf` for the same CF on a later tick),
     ///   we do not double-advance.
     pub async fn complete_pending_finalizations(&self) -> SetuResult<()> {
+        // P0 (cf-finalization-cadence): Stage-3 tail (broadcast + round advance).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::Complete, setu_timing::TraceId(0));
         // Collect persisted entries and remove them from queue
         let pending: Vec<CompletionEntry> = {
             let mut q = self.pending_completions.lock().await;
@@ -945,58 +959,84 @@ impl ConsensusEngine {
     /// post-finalizing (D7.1 / R5 #3).
     #[cfg(feature = "decoupled-apply")]
     async fn apply_finalized_cf_decoupled(&self, cf_id: &str) -> SetuResult<DecoupledFinalize> {
-        use crate::anchor_builder::AnchorBuilder;
-        use crate::folder::{BeginOutcome, FinishOutcome};
-
-        // Fail-stop: never start another apply on a dirty in-memory GSM (D7.1 / R5 #3).
+        // Legacy/test by-id wrapper composing the split Stage-1/Stage-2 API
+        // (cf-finalization-cadence R5-1). The decoupled pipeline calls
+        // `try_begin_finalization_job` (Stage-1, router thread) and
+        // `apply_finalization_job` (Stage-2, single apply worker) SEPARATELY across
+        // a channel; this wrapper preserves the original single-call
+        // begin→apply→finish for the non-pipeline / test callers. Behaviorally
+        // identical except `begin` is no longer under `apply_mutex` (begin only
+        // mutates cm; apply is still apply_mutex-serialized), which is required so
+        // the pipeline can begin on the router thread and apply on the worker.
         if !self.is_decoupled_healthy() {
             return Ok(DecoupledFinalize::NotFinalized);
         }
-
-        // Serialize the whole apply sequence. submit never takes this lock.
-        let _apply_guard = self.apply_mutex.lock().await;
-
-        // F2: re-check health AFTER acquiring the serialize lock — a concurrent apply may
-        // have gone PostMutationFatal while we waited on `apply_mutex`, dirtying the GSM.
-        // Without this re-check a queued caller would apply onto dirty state (D7.1 / R5 #3).
-        if !self.is_decoupled_healthy() {
-            return Ok(DecoupledFinalize::NotFinalized);
+        match self.try_begin_finalization_job(cf_id).await {
+            Some(job) => Ok(self.apply_finalization_job(job).await),
+            None => Ok(DecoupledFinalize::NotFinalized),
         }
+    }
 
-        // ── BEGIN (cm.write, O(1)) — no `.await` while cm is held (D7.5). ──
-        let prepared = {
-            let mut cm = self.consensus_manager.write().await;
-            match cm.begin_finalization(cf_id) {
-                BeginOutcome::Apply(plan) => {
-                    let mut plan = *plan;
-                    if plan.is_leader {
-                        let pb = plan
-                            .pending_build
-                            .take()
-                            .expect("leader ApplyPlan carries a pending_build");
-                        // build_apply_context returns OWNED data (no &AnchorBuilder/&cm
-                        // borrow outlives it, D7.2), so cm is free to drop below.
-                        let ctx = cm.anchor_builder().build_apply_context(pb);
-                        Some((plan, PreparedApply::Leader(ctx)))
-                    } else {
-                        let pce = plan.follower_events.take().unwrap_or_default();
-                        let ctx = cm
-                            .anchor_builder()
-                            .build_follower_apply_context(pce.events, pce.event_depths, &plan.cf);
-                        Some((plan, PreparedApply::Follower(ctx)))
-                    }
-                }
-                BeginOutcome::AlreadyApplying
-                | BeginOutcome::Pending
-                | BeginOutcome::Rejected
-                | BeginOutcome::TimedOut => None,
+    /// Stage-1 (cf-finalization-cadence R5-1): under cm.write (O(1), no `.await`
+    /// while held, D7.5), run `begin_finalization` and build the OWNED apply
+    /// context. Returns a `Send` `FinalizationJob` ready to apply off the cm lock,
+    /// or `None` if not finalizable (AlreadyApplying/Pending/Rejected/TimedOut).
+    /// On `Apply` this sets `applying_cf_ids` (fold gate stays closed, cleanup
+    /// skips it) until Stage-2's `finish_finalization`.
+    #[cfg(feature = "decoupled-apply")]
+    async fn try_begin_finalization_job(&self, cf_id: &str) -> Option<FinalizationJob> {
+        use crate::folder::BeginOutcome;
+        if !self.is_decoupled_healthy() {
+            return None;
+        }
+        let mut cm = self.consensus_manager.write().await;
+        match cm.begin_finalization(cf_id) {
+            BeginOutcome::Apply(plan) => {
+                let mut plan = *plan;
+                let prepared = if plan.is_leader {
+                    let pb = plan
+                        .pending_build
+                        .take()
+                        .expect("leader ApplyPlan carries a pending_build");
+                    // build_apply_context returns OWNED data (no &AnchorBuilder/&cm
+                    // borrow outlives it, D7.2), so cm is free to drop below.
+                    PreparedApply::Leader(cm.anchor_builder().build_apply_context(pb))
+                } else {
+                    let pce = plan.follower_events.take().unwrap_or_default();
+                    PreparedApply::Follower(cm.anchor_builder().build_follower_apply_context(
+                        pce.events,
+                        pce.event_depths,
+                        &plan.cf,
+                    ))
+                };
+                Some(FinalizationJob { plan, prepared })
             }
-        }; // cm dropped — the heavy apply below runs OFF the cm lock.
+            BeginOutcome::AlreadyApplying
+            | BeginOutcome::Pending
+            | BeginOutcome::Rejected
+            | BeginOutcome::TimedOut => None,
+        }
+        // cm dropped — the heavy apply runs OFF the cm lock in apply_finalization_job.
+    }
 
-        let (plan, prepared) = match prepared {
-            Some(p) => p,
-            None => return Ok(DecoupledFinalize::NotFinalized),
-        };
+    /// Stage-2 (cf-finalization-cadence R5-1): the heavy GSM apply + FINISH, off the
+    /// cm lock, under `apply_mutex`. In the pipeline this is called ONLY by the single
+    /// apply worker (depth-ordered by its chain-root guard); the legacy wrapper also
+    /// calls it. Re-checks health under apply_mutex (F2: a concurrent fatal may have
+    /// dirtied the GSM while this job was queued).
+    #[cfg(feature = "decoupled-apply")]
+    async fn apply_finalization_job(&self, job: FinalizationJob) -> DecoupledFinalize {
+        use crate::anchor_builder::AnchorBuilder;
+        use crate::folder::FinishOutcome;
+
+        // Serialize the heavy apply. submit never takes this lock.
+        let _apply_guard = self.apply_mutex.lock().await;
+        // F2: re-check health AFTER acquiring the serialize lock — a concurrent apply
+        // may have gone PostMutationFatal while this job waited (D7.1 / R5 #3).
+        if !self.is_decoupled_healthy() {
+            return DecoupledFinalize::NotFinalized;
+        }
+        let FinalizationJob { plan, prepared } = job;
 
         // ── APPLY (NO cm held; apply_mutex held; GSM write-lock taken inside). ──
         let (result, advance) = match prepared {
@@ -1010,54 +1050,45 @@ impl ConsensusEngine {
             }
         };
 
-        // ── FINISH (cm.write, O(1)) — no `.await` while cm is held (D7.5). ──
-        // On success the finalized CF + new anchor depth are captured HERE, under the same
-        // cm guard that pushed them, and returned to the caller (F1: a post-finalize that
-        // re-read `last_finalized_cf()` after this lock released could observe a later CF
-        // pushed by a concurrent finalize). The warn/error + unhealthy store are non-await,
-        // so doing them inside the cm block does not violate D7.5.
-        let result_out = {
-            let mut cm = self.consensus_manager.write().await;
-            // Advance anchor metadata under the short finish lock (D4 / R5 #2). `advance`
-            // is `Some` iff apply succeeded, so this runs only on success.
-            if let Some(advance) = advance {
-                match advance {
-                    EngineFinalizeAdvance::Leader(a) => cm.anchor_builder_mut().apply_advance(a),
-                    EngineFinalizeAdvance::Follower(anchor) => {
-                        cm.anchor_builder_mut().synchronize_finalized_anchor(&anchor)
-                    }
+        // ── FINISH (cm.write, O(1)) — no `.await` while cm is held (D7.5). On success
+        // the finalized CF + new anchor depth are captured HERE under the same cm guard
+        // that pushed them (F1). ──
+        let mut cm = self.consensus_manager.write().await;
+        if let Some(advance) = advance {
+            match advance {
+                EngineFinalizeAdvance::Leader(a) => cm.anchor_builder_mut().apply_advance(a),
+                EngineFinalizeAdvance::Follower(anchor) => {
+                    cm.anchor_builder_mut().synchronize_finalized_anchor(&anchor)
                 }
             }
-            match cm.finish_finalization(plan, result) {
-                FinishOutcome::Finalized { .. } => {
-                    let cf = cm
-                        .last_finalized_cf()
-                        .cloned()
-                        .expect("finalized CF present right after finish_finalization");
-                    let new_anchor_depth = cm.anchor_builder().anchor_depth();
-                    DecoupledFinalize::Finalized { cf: Box::new(cf), new_anchor_depth }
-                }
-                FinishOutcome::FailedRecoverable { cf_id } => {
-                    warn!(
-                        cf_id = %cf_id,
-                        "decoupled apply failed (pre-mutation, recoverable); CF discarded, events stay in DAG for re-fold"
-                    );
-                    DecoupledFinalize::FailedRecoverable
-                }
-                FinishOutcome::Fatal { cf_id } => {
-                    self.decoupled_unhealthy.store(true, Ordering::SeqCst);
-                    tracing::error!(
-                        cf_id = %cf_id,
-                        "decoupled apply FATAL (post-mutation): in-memory GSM mutated then commit/publish failed; \
-                         node marked unhealthy — fail-stop, will not fold/apply further (recover from persisted state)"
-                    );
-                    DecoupledFinalize::Fatal
-                }
+        }
+        match cm.finish_finalization(plan, result) {
+            FinishOutcome::Finalized { .. } => {
+                let cf = cm
+                    .last_finalized_cf()
+                    .cloned()
+                    .expect("finalized CF present right after finish_finalization");
+                let new_anchor_depth = cm.anchor_builder().anchor_depth();
+                DecoupledFinalize::Finalized { cf: Box::new(cf), new_anchor_depth }
             }
-        }; // cm dropped.
-
-        Ok(result_out)
-        // _apply_guard released here.
+            FinishOutcome::FailedRecoverable { cf_id } => {
+                warn!(
+                    cf_id = %cf_id,
+                    "decoupled apply failed (pre-mutation, recoverable); CF discarded, events stay in DAG for re-fold"
+                );
+                DecoupledFinalize::FailedRecoverable
+            }
+            FinishOutcome::Fatal { cf_id } => {
+                self.decoupled_unhealthy.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    cf_id = %cf_id,
+                    "decoupled apply FATAL (post-mutation): in-memory GSM mutated then commit/publish failed; \
+                     node marked unhealthy — fail-stop, will not fold/apply further (recover from persisted state)"
+                );
+                DecoupledFinalize::Fatal
+            }
+        }
+        // cm + _apply_guard dropped here.
     }
 
     /// Single-node post-finalize side effects, OFF the cm lock (decouple-cf-apply
@@ -1071,6 +1102,8 @@ impl ConsensusEngine {
     /// `anchor_depth()` between the finish lock release and this call).
     #[cfg(feature = "decoupled-apply")]
     async fn post_finalize_single_node(&self, cf: ConsensusFrame, new_anchor_depth: u64) {
+        // P0 (cf-finalization-cadence): finalize tail (Floor-A, single-node/leader path).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::PostFinalize, setu_timing::TraceId::from_hex(&cf.id));
         // Update depth floor so new events land above anchor_depth (else old-parent events
         // get a depth below anchor_depth → permanent InsufficientEvents).
         self.dag_manager.update_min_depth(new_anchor_depth);
@@ -1940,6 +1973,8 @@ impl ConsensusEngine {
     }
 
     async fn ensure_cf_events_available(&self, cf: &ConsensusFrame) -> SetuResult<()> {
+        // P0 (cf-finalization-cadence): inline pre-vote event fetch (Q3).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::EventFetch, setu_timing::TraceId::from_hex(&cf.id));
         let mut missing_event_ids = {
             let dag = self.dag.read().await;
             cf.anchor
@@ -2129,6 +2164,8 @@ impl ConsensusEngine {
         &self,
         cf: ConsensusFrame,
     ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
+        // P0 (cf-finalization-cadence): finalize tail (Floor-A, network/follower path).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::PostFinalize, setu_timing::TraceId::from_hex(&cf.id));
         let anchor = cf.anchor.clone();
         self.dag_manager.update_min_depth(anchor.depth + 1);
         self.mark_anchor_events_finalized_in_active_dag(&anchor)

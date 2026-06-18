@@ -202,6 +202,8 @@ where
                 debug!("Received CFProposal from {}: cf_id={}", proposer_id, cf.id);
                 // Use send().await for backpressure instead of try_send to prevent dropping CF proposals
                 // CF proposals are critical for consensus - dropping them causes consensus to stall
+                // P0 (cf-finalization-cadence): stamp router-queue entry for RouterWait.
+                setu_timing::mark(setu_timing::TraceId::from_hex(&cf.id), setu_timing::StageId::RouterWait);
                 if let Err(e) = self.event_tx.send(NetworkEvent::CFProposal {
                     peer_id: proposer_id.clone(),
                     cf: cf.clone(),
@@ -219,6 +221,8 @@ where
                 debug!("Received CFVote: cf_id={}, voter={}", vote.cf_id, vote.validator_id);
                 // Use send().await for backpressure instead of try_send to prevent dropping votes
                 // Votes are critical for reaching quorum - dropping them prevents finalization
+                // P0 (cf-finalization-cadence): stamp router-queue entry for RouterWait.
+                setu_timing::mark(setu_timing::TraceId::from_hex(&vote.cf_id), setu_timing::StageId::RouterWait);
                 if let Err(e) = self.event_tx.send(NetworkEvent::VoteReceived {
                     peer_id: vote.validator_id.clone(),
                     vote: vote.clone(),

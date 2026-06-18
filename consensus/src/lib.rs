@@ -37,6 +37,7 @@ pub mod broadcaster;
 pub mod dag;
 pub mod dag_manager;
 pub mod engine;
+pub mod finalization_pipeline;
 pub mod folder;
 pub mod liveness;
 pub mod merkle_integration;

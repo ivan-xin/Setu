@@ -123,9 +123,17 @@ impl MessageRouter {
                 self.handle_event(peer_id, event).await;
             }
             NetworkEvent::CFProposal { peer_id, cf } => {
+                // P0 (cf-finalization-cadence): RouterWait = queue time since send;
+                // RouteEvent = inline handling (inflates when inline finalization runs).
+                let tid = setu_timing::TraceId::from_hex(&cf.id);
+                setu_timing::measure_from(tid, setu_timing::StageId::RouterWait);
+                let _re = setu_timing::Span::start(setu_timing::StageId::RouteEvent, tid);
                 self.handle_cf_proposal(peer_id, cf).await;
             }
             NetworkEvent::VoteReceived { peer_id, vote } => {
+                let tid = setu_timing::TraceId::from_hex(&vote.cf_id);
+                setu_timing::measure_from(tid, setu_timing::StageId::RouterWait);
+                let _re = setu_timing::Span::start(setu_timing::StageId::RouteEvent, tid);
                 self.handle_vote(peer_id, vote).await;
             }
             NetworkEvent::CFFinalized { peer_id, cf } => {

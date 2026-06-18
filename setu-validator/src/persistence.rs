@@ -123,6 +123,8 @@ pub trait FinalizationPersister: Send + Sync {
     /// Returns Ok(()) when every peeked CF either succeeded (and was drained)
     /// or failed but is still under the retry budget.
     async fn persist_pending_finalized_cfs(&self) -> PersistenceResult<()> {
+        // P0 (cf-finalization-cadence): CF-index persist cost (global-drain magnitude, R5-5).
+        let _m0 = setu_timing::Span::start(setu_timing::StageId::PersistCfIndex, setu_timing::TraceId(0));
         let pending = self.engine().peek_pending_finalized_cfs().await;
         if pending.is_empty() {
             return Ok(());
@@ -300,9 +302,17 @@ pub trait FinalizationPersister: Send + Sync {
         // the next call.
         self.persist_pending_finalized_cfs().await?;
 
+        // P0 (cf-finalization-cadence): DurabilityGap = CF-index visible → anchor durable
+        // (R5-4 hazard window). Marked here, measured at mark_anchor_persisted below.
+        setu_timing::mark(setu_timing::TraceId::from_hex(&anchor.id), setu_timing::StageId::DurabilityGap);
+
         // 5. Persist anchor to AnchorStore (commit marker)
         // Only reached if all events persisted successfully
-        if let Err(e) = self.anchor_store().store(anchor.clone()).await {
+        let anchor_store_res = {
+            let _m0 = setu_timing::Span::start(setu_timing::StageId::PersistAnchor, setu_timing::TraceId::from_hex(&anchor.id));
+            self.anchor_store().store(anchor.clone()).await
+        };
+        if let Err(e) = anchor_store_res {
             error!(
                 anchor_id = %anchor.id,
                 error = %e,
@@ -321,6 +331,8 @@ pub trait FinalizationPersister: Send + Sync {
         );
         
         // 6. Mark the anchor as persisted in engine (allows GC of in-memory data)
+        // P0 (cf-finalization-cadence): close DurabilityGap window (R5-4 measurement).
+        setu_timing::measure_from(setu_timing::TraceId::from_hex(&anchor.id), setu_timing::StageId::DurabilityGap);
         self.engine().mark_anchor_persisted(&anchor.id).await;
         
         // 7. Trigger GC via DagManager.on_anchor_finalized()
